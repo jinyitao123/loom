@@ -2,33 +2,37 @@
   <img src="assets/loom-social-preview.png" alt="LOOM · 织机" width="800">
 </p>
 
+<p align="center">
+  <a href="README.md">English</a> | <a href="README.zh-CN.md">中文</a>
+</p>
+
 ---
 
-织布机只有三个部件——经线、纬线、梭子——却能织出任何图案。
+A loom has only three moving parts — warp, weft, shuttle — yet it can weave any pattern.
 
-Loom 是同样的思路。整个内核 584 行代码，5 个类型定义。但它们组合起来，能表达从单轮聊天到百 Agent 编排的一切模式。
+Loom works the same way. The entire kernel is 584 lines of Go and 5 type definitions. Combined, they express everything from a single chatbot to a hundred-agent orchestration.
 
 ```go
-type State  map[string]any                                           // 数据流
-type Step   func(ctx context.Context, state State) (State, error)    // 计算
-type Router func(ctx context.Context, state State) (string, error)   // 控制流
-type Store  interface { Get; Put; Delete; List; Tx }                 // 持久化
-type Graph  struct { steps; routers; Run(); Resume() }               // 编排
+type State  map[string]any                                           // data
+type Step   func(ctx context.Context, state State) (State, error)    // compute
+type Router func(ctx context.Context, state State) (string, error)   // control flow
+type Store  interface { Get; Put; Delete; List; Tx }                 // persistence
+type Graph  struct { steps; routers; Run(); Resume() }               // orchestration
 ```
 
-没有 `Agent` 类。没有 `Chain` 抽象。没有 `Memory` 基类。
+No `Agent` class. No `Chain` abstraction. No `Memory` base type.
 
-一切高级功能从这五个原语**组合**而来，而不是从框架**继承**而来。
+Every advanced feature is **composed** from these five primitives — not **inherited** from a framework.
 
-## 为什么做 Loom
+## Why Loom
 
-市面上不缺 Agent 框架。缺的是一个你能真正**驾驭**的。
+There is no shortage of agent frameworks. What's missing is one you can actually **own**.
 
-大多数框架做得很完整——几万行代码，完善的抽象层，丰富的内置功能。但如果你想改它的行为、理解它的运行机制、或者把它嵌入到你自己的系统里，你会发现你在跟一个庞然大物搏斗。
+Most frameworks are feature-complete — tens of thousands of lines, rich abstraction layers, batteries included. But when you need to change their behavior, understand their internals, or embed them into your own system, you find yourself wrestling a giant.
 
-Loom 的设计原则是反过来的：**内核小到你能在一个下午读完全部源码。** 不是因为功能少，是因为一个复杂成熟的系统，其内核必然是精悍简洁的。复杂性应该从组合中涌现，而不是在框架里预制。
+Loom's design principle is the inverse: **the kernel is small enough to read in an afternoon.** Not because it does less, but because a mature, complex system must have a lean core. Complexity should emerge from composition, not be pre-baked into the framework.
 
-## 30 秒上手
+## 30-Second Quickstart
 
 ```go
 package main
@@ -56,15 +60,15 @@ func main() {
 go get github.com/jinyitao123/loom
 ```
 
-## 五个原语能做什么
+## What Five Primitives Can Do
 
 <table>
 <tr>
 <td width="50%">
 
-**带工具的 Agent**
+**Tool-calling Agent**
 
-三个 Step 串起来。
+Three Steps, wired together.
 
 </td>
 <td>
@@ -80,10 +84,9 @@ g.AddStep("chat",  toolLoop,  End())
 <tr>
 <td>
 
-**暂停等人类审批**
+**Pause for Human Approval**
 
-Step 返回 `__yield: true`，Graph 自动冻结状态。
-人类批准后 `Resume()` 从断点继续。
+A Step returns `__yield: true` and the Graph freezes state automatically. After approval, `Resume()` picks up right where it left off.
 
 </td>
 <td>
@@ -92,7 +95,7 @@ Step 返回 `__yield: true`，Graph 自动冻结状态。
 result, _ := g.Run(ctx, input, store)
 // result.StopReason == "yielded"
 
-// 人类审批后
+// After human approval
 result, _ = g.Resume(ctx, result.RunID,
     State{"approved": true}, store)
 ```
@@ -102,10 +105,9 @@ result, _ = g.Resume(ctx, result.RunID,
 <tr>
 <td>
 
-**10 个 Agent 协作**
+**10 Agents Collaborating**
 
-每个 Agent 是一个 Graph，嵌进父 Graph。
-共享 checkpoint，共享 step budget。
+Each agent is a Graph, nested inside a parent Graph. Shared checkpoints, shared step budget.
 
 </td>
 <td>
@@ -124,127 +126,126 @@ parent.AddStep("coder",   SubGraphStep(coderGraph),   ...)
 <tr>
 <td>
 
-**进程崩了？**
+**Process Crashed?**
 
-不用做任何事。每步自动 checkpoint 到 PostgreSQL。
-重启后 `Resume()` 从断点继续，不丢一步。
+Nothing to do. Every step auto-checkpoints to PostgreSQL. After restart, `Resume()` continues from the last checkpoint. Not a single step lost.
 
 </td>
 <td>
 
 ```go
-// 崩溃前：A → B → C ✓ → [crash]
-// 重启后：
+// Before crash: A → B → C ✓ → [crash]
+// After restart:
 result, _ = g.Resume(ctx, runID, State{}, pgStore)
-// 从 D 继续，C 的状态完整保留
+// Continues from D, C's state fully preserved
 ```
 
 </td>
 </tr>
 </table>
 
-## 内核刻意不知道的事
+## What the Kernel Deliberately Doesn't Know
 
-这是 Loom 最重要的设计决策。
+This is Loom's most important design decision.
 
-| 内核不知道 | 所以你可以 |
+| The kernel doesn't know | So you can |
 |---|---|
-| LLM 是什么 | 用 OpenAI、Claude、DeepSeek、本地模型——Step 里随便换 |
-| MCP 是什么 | 工具协议随便接，MCP / A2A / 自定义 RPC 都行 |
-| Memory 怎么存 | RAG、图数据库、全文检索——State 里放什么是你的事 |
-| HTTP 怎么服务 | Gin、Echo、net/http 都行——Loom 是库，不是服务 |
+| What an LLM is | Use OpenAI, Claude, DeepSeek, local models — swap freely inside a Step |
+| What MCP is | Plug in any tool protocol — MCP / A2A / custom RPC |
+| How to store memory | RAG, graph DB, full-text search — what goes in State is your call |
+| How to serve HTTP | Gin, Echo, net/http — Loom is a library, not a service |
 
-内核只管一件事：**按 Graph 定义的顺序执行 Step，沿途 checkpoint，遇到 yield 就暂停。**
+The kernel does one thing: **execute Steps in the order defined by the Graph, checkpoint along the way, pause on yield.**
 
-剩下的全是你的事。这是自由，不是缺失。
+Everything else is your domain. That's freedom, not omission.
 
-## 架构
+## Architecture
 
 ```
 ┌──────────────────────────────────────────────────┐
-│  Layer 3 · Your App                              │  ← HTTP / Auth / 多租户 / 你的业务
+│  Layer 3 · Your App                              │  ← HTTP / Auth / Multi-tenancy / Your business
 ├──────────────────────────────────────────────────┤
-│  Layer 2 · Stdlib                    ~1800 LOC   │  ← 预制积木：ToolLoop / Guard / Handoff
+│  Layer 2 · Stdlib                    ~1800 LOC   │  ← Building blocks: ToolLoop / Guard / Handoff
 ├──────────────────────────────────────────────────┤
-│  Layer 1 · Contract                   ~300 LOC   │  ← 纯接口：LLM / ToolDispatcher / Embedder
+│  Layer 1 · Contract                   ~300 LOC   │  ← Pure interfaces: LLM / ToolDispatcher / Embedder
 ├──────────────────────────────────────────────────┤
-│  Layer 0 · Kernel                     ~600 LOC   │  ← 五个原语，仅此而已
+│  Layer 0 · Kernel                     ~600 LOC   │  ← Five primitives. That's it.
 └──────────────────────────────────────────────────┘
 ```
 
-**依赖规则：Layer N 只能 import Layer N-1 及以下。没有例外。**
+**Dependency rule: Layer N may only import Layer N-1 or below. No exceptions.**
 
 ## Stdlib
 
-标准库里的每个组件都是 Step 或 Router 的组合。没有新原语，没有特殊通道。
+Every component in the standard library is a composition of Steps or Routers. No new primitives, no special channels.
 
 ```go
-// ToolLoop：LLM 调用 → 工具执行 → 结果回传 → 循环直到完成
+// ToolLoop: LLM call → tool execution → result → loop until done
 chat := stdlib.NewToolLoopStep(llm, tools, stdlib.ToolLoopOpts{
     MaxIterations: 20,
     Compaction:    &compactionPolicy,
     ToolHooks:     []contract.ToolHook{auditHook},
 })
 
-// 声明式工具权限：deny 优先于 allow
+// Declarative tool permissions: deny takes precedence over allow
 safeTool := stdlib.NewPermissionDispatcher(tools,
-    []string{"rm_rf", "drop_table"},   // 永远禁止
-    []string{"read_*", "search_*"},    // 只允许这些
+    []string{"rm_rf", "drop_table"},   // always blocked
+    []string{"read_*", "search_*"},    // only these allowed
 )
 
-// 跑到 $5 自动停
+// Auto-stop at $5
 g.SetHooks(loom.HookPoints{
     After: []loom.StepHook{stdlib.CostBudgetHook(5.00)},
 })
 ```
 
-Read-only 工具自动并发，stateful 工具严格串行。ToolLoop 读 `ToolDef.ReadOnly` 标记自动判断。
+Read-only tools run in parallel automatically; stateful tools run serially. ToolLoop reads `ToolDef.ReadOnly` to decide.
 
-## 项目结构
+## Project Structure
 
 ```
 loom/
-├── graph.go          执行引擎：State × Step × Router → Run / Resume
-├── state.go          可注册合并策略的类型化 map
+├── graph.go          Execution engine: State × Step × Router → Run / Resume
+├── state.go          Typed map with registrable merge policies
 ├── step.go           type Step func(ctx, State) (State, error)
-├── router.go         控制流原语：Always / Branch / Condition
-├── store.go          5 方法持久化接口
-├── options.go        GraphOption：merge / checkpoint / budget
-├── memstore.go       内存 Store（测试用）
+├── router.go         Control flow: Always / Branch / Condition
+├── store.go          5-method persistence interface
+├── options.go        GraphOption: merge / checkpoint / budget
+├── memstore.go       In-memory Store (for testing)
 │
-├── contract/         纯接口层：LLM / ToolDispatcher / Embedder
-├── stdlib/           预制 Step & Hook
-│   ├── toolloop.go   LLM ↔ Tool 循环
+├── contract/         Pure interfaces: LLM / ToolDispatcher / Embedder
+├── stdlib/           Pre-built Steps & Hooks
+│   ├── toolloop.go   LLM ↔ Tool loop
 │   ├── steps.go      Guard / HumanWait / SubGraph / Handoff
-│   ├── permission.go 声明式工具权限
-│   ├── budget.go     Token & 美元预算控制
-│   ├── prompt.go     分层 prompt 组装
-│   └── session.go    会话历史持久化
+│   ├── permission.go Declarative tool permissions
+│   ├── budget.go     Token & USD budget hooks
+│   ├── prompt.go     Tiered prompt assembly
+│   └── session.go    Session history persistence
 │
 ├── pgstore/          PostgreSQL Store
-└── provider/         LLM Provider（OpenAI / DeepSeek）
+└── provider/         LLM Providers (OpenAI / DeepSeek)
 ```
 
-## 对比
+## Comparison
 
 | | Loom | LangGraph | OpenAI Agents SDK |
 |---|---|---|---|
-| 语言 | Go | Python | Python |
-| 内核 | ~600 LOC | ~15K LOC | ~3K LOC |
-| 持久化 | 自动 checkpoint | 自动 checkpoint | 无 |
-| LLM 耦合 | 零 | 中 | 强（OpenAI 绑定） |
-| 工具协议 | 任意 | LangChain Tools | function calling |
-| 子图嵌套 | 原生 | 原生 | 不支持 |
-| 人机协同 | yield / resume | interrupt | 有限 |
-| 可嵌入 | 是（Go 包） | 否（Python 服务） | 否（Python 服务） |
+| Language | Go | Python | Python |
+| Kernel | ~600 LOC | ~15K LOC | ~3K LOC |
+| Persistence | Auto checkpoint | Auto checkpoint | None |
+| LLM coupling | Zero | Medium | Strong (OpenAI-bound) |
+| Tool protocol | Any | LangChain Tools | function calling |
+| Sub-graph nesting | Native | Native | Not supported |
+| Human-in-the-loop | yield / resume | interrupt | Limited |
+| Embeddable | Yes (Go package) | No (Python service) | No (Python service) |
 
-## 适合谁
+## Who Is This For
 
-- 需要 **crash recovery** 的长时间运行 Agent
-- 需要 **人机协同** 的企业工作流
-- 需要 **多 Agent 编排** 但不想引入重量级框架
-- 需要 **预算控制** 防止 Agent 烧钱失控
-- 需要在 **Go 生态** 中嵌入 Agent 能力
+- Long-running agents that need **crash recovery**
+- Enterprise workflows that need **human-in-the-loop** approval
+- **Multi-agent orchestration** without a heavyweight framework
+- **Budget control** (token / USD) to prevent runaway agents
+- Embedding agent capabilities in the **Go ecosystem**
 
 ## License
 
@@ -253,5 +254,5 @@ Apache-2.0
 ---
 
 <p align="center">
-  <sub>一个复杂成熟的产品，其内核必然是精悍简洁的。</sub>
+  <sub>A mature, complex product must have a lean, precise kernel.</sub>
 </p>
