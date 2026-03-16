@@ -1,12 +1,5 @@
 <p align="center">
-  <b>L O O M · 织 机</b><br/>
-  <sub>五个原语，编织任意 Agent 模式</sub>
-</p>
-
-<p align="center">
-  <a href="https://go.dev"><img src="https://img.shields.io/badge/Go-1.24+-00ADD8?logo=go" alt="Go"></a>
-  <a href="LICENSE"><img src="https://img.shields.io/badge/License-Apache_2.0-blue.svg" alt="License"></a>
-  <img src="https://img.shields.io/badge/Kernel-584_LOC-brightgreen" alt="Kernel LOC">
+  <img src="loom-social-preview.png" alt="LOOM · 织机" width="800">
 </p>
 
 ---
