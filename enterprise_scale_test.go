@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/anthropic/loom"
+	"github.com/jinyitao123/loom"
 )
 
 const (

@@ -6,8 +6,8 @@ import (
 	"fmt"
 	"sync"
 
-	"github.com/anthropic/loom"
-	"github.com/anthropic/loom/contract"
+	"github.com/jinyitao123/loom"
+	"github.com/jinyitao123/loom/contract"
 )
 
 // CompactionPolicy controls automatic context compaction within a ToolLoop.

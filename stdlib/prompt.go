@@ -6,7 +6,7 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/anthropic/loom"
+	"github.com/jinyitao123/loom"
 )
 
 // SkillMatchResult represents a skill matched to the user's message.

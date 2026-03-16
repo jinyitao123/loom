@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="loom-social-preview.png" alt="LOOM · 织机" width="800">
+  <img src="assets/loom-social-preview.png" alt="LOOM · 织机" width="800">
 </p>
 
 ---

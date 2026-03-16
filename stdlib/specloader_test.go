@@ -6,7 +6,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/anthropic/loom/stdlib"
+	"github.com/jinyitao123/loom/stdlib"
 )
 
 func TestSpecLoader_MemohSixPiece(t *testing.T) {

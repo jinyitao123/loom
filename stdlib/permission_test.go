@@ -4,8 +4,8 @@ import (
 	"context"
 	"testing"
 
-	"github.com/anthropic/loom/contract"
-	"github.com/anthropic/loom/stdlib"
+	"github.com/jinyitao123/loom/contract"
+	"github.com/jinyitao123/loom/stdlib"
 )
 
 func TestPermission_DenyBlocks(t *testing.T) {

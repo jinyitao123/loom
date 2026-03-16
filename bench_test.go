@@ -5,7 +5,7 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/anthropic/loom"
+	"github.com/jinyitao123/loom"
 )
 
 func BenchmarkGraph_LinearChain_3Steps(b *testing.B) {

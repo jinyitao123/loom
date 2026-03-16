@@ -5,8 +5,8 @@ import (
 	"os"
 	"testing"
 
-	"github.com/anthropic/loom"
-	"github.com/anthropic/loom/pgstore"
+	"github.com/jinyitao123/loom"
+	"github.com/jinyitao123/loom/pgstore"
 )
 
 func getTestStore(t *testing.T) *pgstore.PGStore {

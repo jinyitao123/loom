@@ -5,7 +5,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/anthropic/loom"
+	"github.com/jinyitao123/loom"
 )
 
 // echoStep returns a step that sets a key to a fixed value.

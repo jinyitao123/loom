@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/anthropic/loom/contract"
+	"github.com/jinyitao123/loom/contract"
 )
 
 // PermissionDispatcher wraps a ToolDispatcher with declarative deny/allow rules.

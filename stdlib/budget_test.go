@@ -4,9 +4,9 @@ import (
 	"context"
 	"testing"
 
-	"github.com/anthropic/loom"
-	"github.com/anthropic/loom/contract"
-	"github.com/anthropic/loom/stdlib"
+	"github.com/jinyitao123/loom"
+	"github.com/jinyitao123/loom/contract"
+	"github.com/jinyitao123/loom/stdlib"
 )
 
 func TestCostBudgetHook_UnderBudget(t *testing.T) {

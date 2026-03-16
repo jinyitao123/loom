@@ -4,8 +4,8 @@ import (
 	"context"
 	"encoding/json"
 
-	"github.com/anthropic/loom"
-	"github.com/anthropic/loom/contract"
+	"github.com/jinyitao123/loom"
+	"github.com/jinyitao123/loom/contract"
 )
 
 // SaveSession persists the conversation messages for a session.

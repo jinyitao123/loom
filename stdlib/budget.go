@@ -6,8 +6,8 @@ import (
 	"sync"
 	"sync/atomic"
 
-	"github.com/anthropic/loom"
-	"github.com/anthropic/loom/contract"
+	"github.com/jinyitao123/loom"
+	"github.com/jinyitao123/loom/contract"
 )
 
 // CostBudgetHook returns an AfterStep hook that tracks cumulative cost.

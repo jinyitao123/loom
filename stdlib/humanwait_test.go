@@ -4,8 +4,8 @@ import (
 	"context"
 	"testing"
 
-	"github.com/anthropic/loom"
-	"github.com/anthropic/loom/stdlib"
+	"github.com/jinyitao123/loom"
+	"github.com/jinyitao123/loom/stdlib"
 )
 
 func TestHumanWait_YieldsWhenNoResponse(t *testing.T) {

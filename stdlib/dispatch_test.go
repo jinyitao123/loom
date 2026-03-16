@@ -8,8 +8,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/anthropic/loom/contract"
-	"github.com/anthropic/loom/stdlib"
+	"github.com/jinyitao123/loom/contract"
+	"github.com/jinyitao123/loom/stdlib"
 )
 
 // --- ToolHook tests ---

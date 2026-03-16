@@ -12,7 +12,7 @@ import (
 	"net/http"
 	"strings"
 
-	"github.com/anthropic/loom/contract"
+	"github.com/jinyitao123/loom/contract"
 )
 
 // Client implements contract.LLM for any OpenAI-compatible endpoint.

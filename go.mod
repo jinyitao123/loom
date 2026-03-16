@@ -1,4 +1,4 @@
-module github.com/anthropic/loom
+module github.com/jinyitao123/loom
 
 go 1.24.0
 

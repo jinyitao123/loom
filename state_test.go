@@ -3,7 +3,7 @@ package loom_test
 import (
 	"testing"
 
-	"github.com/anthropic/loom"
+	"github.com/jinyitao123/loom"
 )
 
 func TestState_Merge_Overwrite(t *testing.T) {

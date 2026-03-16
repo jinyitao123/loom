@@ -5,7 +5,7 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/anthropic/loom"
+	"github.com/jinyitao123/loom"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )

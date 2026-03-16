@@ -6,8 +6,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/anthropic/loom"
-	"github.com/anthropic/loom/stdlib"
+	"github.com/jinyitao123/loom"
+	"github.com/jinyitao123/loom/stdlib"
 )
 
 func TestPromptAssemble_TierZero_AlwaysLoaded(t *testing.T) {

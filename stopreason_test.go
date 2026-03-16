@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"testing"
 
-	"github.com/anthropic/loom"
+	"github.com/jinyitao123/loom"
 )
 
 func assertStopReason(t *testing.T, result *loom.RunResult, want loom.StopReason) {

@@ -3,8 +3,8 @@ package stdlib
 import (
 	"fmt"
 
-	"github.com/anthropic/loom"
-	"github.com/anthropic/loom/contract"
+	"github.com/jinyitao123/loom"
+	"github.com/jinyitao123/loom/contract"
 )
 
 // GetMessages retrieves conversation history with type checking.
