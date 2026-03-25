@@ -27,6 +27,7 @@ type ToolLoopOpts struct {
 	Model         string
 	SystemPrompt  string
 	MaxIterations int
+	MaxTokens     int                   // per-request max output tokens (0 = provider default)
 	OutputSchema  *json.RawMessage
 	Effort        contract.EffortLevel  // v1.4: default EffortMedium
 	ToolHooks     []contract.ToolHook   // v1.4: per-tool pre/post hooks
@@ -83,11 +84,12 @@ func NewToolLoopStep(llm contract.LLM, tools contract.ToolDispatcher, opts ToolL
 			}
 
 			resp, err := llm.Chat(ctx, contract.ChatRequest{
-				Model:    opts.Model,
-				Messages: msgs,
-				Tools:    availableTools,
-				Schema:   opts.OutputSchema,
-				Effort:   effort,
+				Model:     opts.Model,
+				Messages:  msgs,
+				Tools:     availableTools,
+				MaxTokens: opts.MaxTokens,
+				Schema:    opts.OutputSchema,
+				Effort:    effort,
 			})
 			if err != nil {
 				return loom.State{"__error": err.Error()}, err

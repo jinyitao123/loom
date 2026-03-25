@@ -17,10 +17,11 @@ import (
 
 // Client implements contract.LLM for any OpenAI-compatible endpoint.
 type Client struct {
-	apiKey       string
-	baseURL      string
-	defaultModel string
-	client       *http.Client
+	apiKey         string
+	baseURL        string
+	defaultModel   string
+	client         *http.Client
+	jsonObjectMode bool // use json_object instead of json_schema for Schema requests
 }
 
 // Option configures a Client.
@@ -34,6 +35,13 @@ func WithBaseURL(url string) Option {
 // WithDefaultModel sets the default model when none is specified in the request.
 func WithDefaultModel(model string) Option {
 	return func(c *Client) { c.defaultModel = model }
+}
+
+// WithJSONObjectMode uses the simpler json_object response_format instead of
+// json_schema for structured output. Required for providers (e.g. DeepSeek)
+// that don't support OpenAI's json_schema mode.
+func WithJSONObjectMode() Option {
+	return func(c *Client) { c.jsonObjectMode = true }
 }
 
 // New creates a new OpenAI-compatible client.
@@ -53,13 +61,25 @@ func New(apiKey string, opts ...Option) *Client {
 // openAI-compatible request/response types.
 
 type oaiRequest struct {
-	Model         string             `json:"model"`
-	Messages      []oaiMessage       `json:"messages"`
-	Tools         []oaiTool          `json:"tools,omitempty"`
-	MaxTokens     int                `json:"max_tokens,omitempty"`
-	Temperature   *float64           `json:"temperature,omitempty"`
-	Stream        bool               `json:"stream,omitempty"`
-	StreamOptions *oaiStreamOptions  `json:"stream_options,omitempty"`
+	Model          string             `json:"model"`
+	Messages       []oaiMessage       `json:"messages"`
+	Tools          []oaiTool          `json:"tools,omitempty"`
+	MaxTokens      int                `json:"max_tokens,omitempty"`
+	Temperature    *float64           `json:"temperature,omitempty"`
+	Stream         bool               `json:"stream,omitempty"`
+	StreamOptions  *oaiStreamOptions  `json:"stream_options,omitempty"`
+	ResponseFormat *oaiResponseFormat `json:"response_format,omitempty"`
+}
+
+type oaiResponseFormat struct {
+	Type       string          `json:"type"`
+	JSONSchema *oaiJSONSchema  `json:"json_schema,omitempty"`
+}
+
+type oaiJSONSchema struct {
+	Name   string          `json:"name"`
+	Strict bool            `json:"strict"`
+	Schema json.RawMessage `json:"schema"`
 }
 
 type oaiStreamOptions struct {
@@ -165,6 +185,20 @@ func (c *Client) Chat(ctx context.Context, req contract.ChatRequest) (*contract.
 		MaxTokens:   req.MaxTokens,
 		Temperature: req.Temperature,
 	}
+	if req.Schema != nil {
+		if c.jsonObjectMode {
+			oaiReq.ResponseFormat = &oaiResponseFormat{Type: "json_object"}
+		} else {
+			oaiReq.ResponseFormat = &oaiResponseFormat{
+				Type: "json_schema",
+				JSONSchema: &oaiJSONSchema{
+					Name:   "output",
+					Strict: true,
+					Schema: *req.Schema,
+				},
+			}
+		}
+	}
 
 	body, err := json.Marshal(oaiReq)
 	if err != nil {
@@ -252,6 +286,20 @@ func (c *Client) Stream(ctx context.Context, req contract.ChatRequest) (<-chan c
 		Temperature:   req.Temperature,
 		Stream:        true,
 		StreamOptions: &oaiStreamOptions{IncludeUsage: true},
+	}
+	if req.Schema != nil {
+		if c.jsonObjectMode {
+			oaiReq.ResponseFormat = &oaiResponseFormat{Type: "json_object"}
+		} else {
+			oaiReq.ResponseFormat = &oaiResponseFormat{
+				Type: "json_schema",
+				JSONSchema: &oaiJSONSchema{
+					Name:   "output",
+					Strict: true,
+					Schema: *req.Schema,
+				},
+			}
+		}
 	}
 
 	body, err := json.Marshal(oaiReq)

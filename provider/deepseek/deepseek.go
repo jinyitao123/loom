@@ -34,13 +34,18 @@ func New(apiKey string) *Client {
 // openAI-compatible request/response types.
 
 type oaiRequest struct {
-	Model         string             `json:"model"`
-	Messages      []oaiMessage       `json:"messages"`
-	Tools         []oaiTool          `json:"tools,omitempty"`
-	MaxTokens     int                `json:"max_tokens,omitempty"`
-	Temperature   *float64           `json:"temperature,omitempty"`
-	Stream        bool               `json:"stream,omitempty"`
-	StreamOptions *oaiStreamOptions  `json:"stream_options,omitempty"`
+	Model          string             `json:"model"`
+	Messages       []oaiMessage       `json:"messages"`
+	Tools          []oaiTool          `json:"tools,omitempty"`
+	MaxTokens      int                `json:"max_tokens,omitempty"`
+	Temperature    *float64           `json:"temperature,omitempty"`
+	Stream         bool               `json:"stream,omitempty"`
+	StreamOptions  *oaiStreamOptions  `json:"stream_options,omitempty"`
+	ResponseFormat *oaiResponseFormat `json:"response_format,omitempty"`
+}
+
+type oaiResponseFormat struct {
+	Type string `json:"type"`
 }
 
 type oaiStreamOptions struct {
@@ -139,6 +144,9 @@ func (c *Client) Chat(ctx context.Context, req contract.ChatRequest) (*contract.
 		Tools:       tools,
 		MaxTokens:   req.MaxTokens,
 		Temperature: req.Temperature,
+	}
+	if req.Schema != nil {
+		oaiReq.ResponseFormat = &oaiResponseFormat{Type: "json_object"}
 	}
 
 	body, err := json.Marshal(oaiReq)
@@ -264,6 +272,9 @@ func (c *Client) Stream(ctx context.Context, req contract.ChatRequest) (<-chan c
 		Temperature:   req.Temperature,
 		Stream:        true,
 		StreamOptions: &oaiStreamOptions{IncludeUsage: true},
+	}
+	if req.Schema != nil {
+		oaiReq.ResponseFormat = &oaiResponseFormat{Type: "json_object"}
 	}
 
 	body, err := json.Marshal(oaiReq)
