@@ -2,8 +2,11 @@ package stdlib
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"sync"
 
 	"github.com/jinyitao123/loom"
@@ -24,14 +27,15 @@ type CompactionPolicy struct {
 
 // ToolLoopOpts configures the tool loop step.
 type ToolLoopOpts struct {
-	Model         string
-	SystemPrompt  string
-	MaxIterations int
-	MaxTokens     int                   // per-request max output tokens (0 = provider default)
-	OutputSchema  *json.RawMessage
-	Effort        contract.EffortLevel  // v1.4: default EffortMedium
-	ToolHooks     []contract.ToolHook   // v1.4: per-tool pre/post hooks
-	Compaction    *CompactionPolicy     // v1.4: auto-summarize when context grows
+	Model            string
+	SystemPrompt     string
+	MaxIterations    int
+	MaxTokens        int                   // per-request max output tokens (0 = provider default)
+	MaxToolRepeats   int                   // break if same tool call batch repeats N times (0 = default 3)
+	OutputSchema     *json.RawMessage
+	Effort           contract.EffortLevel  // v1.4: default EffortMedium
+	ToolHooks        []contract.ToolHook   // v1.4: per-tool pre/post hooks
+	Compaction       *CompactionPolicy     // v1.4: auto-summarize when context grows
 }
 
 // NewToolLoopStep creates the LLM → tool call → result → LLM loop step.
@@ -68,6 +72,14 @@ func NewToolLoopStep(llm contract.LLM, tools contract.ToolDispatcher, opts ToolL
 			effort = contract.EffortMedium
 		}
 
+		// Cycle detection: track tool call batch signatures.
+		maxRepeats := opts.MaxToolRepeats
+		if maxRepeats <= 0 {
+			maxRepeats = 3
+		}
+		var lastBatchHash string
+		repeatCount := 0
+
 		for i := 0; i < opts.MaxIterations; i++ {
 			// Context compaction check.
 			if opts.Compaction != nil {
@@ -97,6 +109,20 @@ func NewToolLoopStep(llm contract.LLM, tools contract.ToolDispatcher, opts ToolL
 
 			if len(resp.ToolCalls) == 0 {
 				return SetOutput(resp.Content, resp.Usage), nil
+			}
+
+			// Cycle detection: hash current tool call batch and compare to previous.
+			batchHash := hashToolCalls(resp.ToolCalls)
+			if batchHash == lastBatchHash {
+				repeatCount++
+				if repeatCount >= maxRepeats {
+					slog.Warn("loom/toolloop: cycle detected, breaking",
+						"repeat_count", repeatCount, "batch_hash", batchHash[:8])
+					return SetOutput(resp.Content, resp.Usage), nil
+				}
+			} else {
+				lastBatchHash = batchHash
+				repeatCount = 1
 			}
 
 			// Dispatch with hooks and read/write awareness.
@@ -218,6 +244,16 @@ func DispatchWithHooks(ctx context.Context, tools contract.ToolDispatcher,
 	}
 
 	return results
+}
+
+// hashToolCalls creates a deterministic hash of a tool call batch for cycle detection.
+func hashToolCalls(calls []contract.ToolCall) string {
+	h := sha256.New()
+	for _, c := range calls {
+		h.Write([]byte(c.Name))
+		h.Write([]byte(c.Args))
+	}
+	return hex.EncodeToString(h.Sum(nil))
 }
 
 // estimateMessagesTokens provides a rough token count (~4 chars per token).
