@@ -96,7 +96,7 @@ func TestToolLoop_MaxIterations(t *testing.T) {
 	llm := &mockLLM{responses: make([]contract.ChatResponse, 100)}
 	for i := range llm.responses {
 		llm.responses[i] = contract.ChatResponse{
-			ToolCalls: []contract.ToolCall{{ID: fmt.Sprintf("%d", i), Name: "loop", Args: "{}"}},
+			ToolCalls: []contract.ToolCall{{ID: fmt.Sprintf("%d", i), Name: "loop", Args: fmt.Sprintf(`{"i":%d}`, i)}},
 		}
 	}
 	tools := &mockTools{

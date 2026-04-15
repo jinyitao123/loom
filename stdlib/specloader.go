@@ -15,22 +15,34 @@ type IdentitySpec struct {
 	Raw      string `json:"raw,omitempty"`      // full original content
 }
 
+// ProfileEntry defines per-role behavior: system prompt addition and optional greeting.
+type ProfileEntry struct {
+	// SystemAddition is appended to the system prompt when this profile is active.
+	// For backward compatibility, if a profile value is a plain string in JSON,
+	// it is treated as SystemAddition.
+	SystemAddition string `json:"system_addition,omitempty"`
+	// Greeting is the initial message sent when a new session starts with this profile.
+	// The application reads this from the agent config and sends it as the first message.
+	Greeting string `json:"greeting,omitempty"`
+}
+
 // AgentSpec is the unified agent specification loaded from files or constructed programmatically.
 type AgentSpec struct {
-	SystemPrompt string            `json:"system_prompt,omitempty"` // v1.2 compat — equals Identity.Raw
-	Identity     IdentitySpec      `json:"identity,omitempty"`      // v1.3: tiered identity
-	Profiles     map[string]string `json:"profiles,omitempty"`
-	Skills       []SkillDef        `json:"skills,omitempty"`
-	HealthCheck  *HealthCheckDef   `json:"health_check,omitempty"`
+	SystemPrompt string                    `json:"system_prompt,omitempty"` // v1.2 compat — equals Identity.Raw
+	Identity     IdentitySpec              `json:"identity,omitempty"`      // v1.3: tiered identity
+	Profiles     map[string]ProfileEntry   `json:"profiles,omitempty"`
+	Skills       []SkillDef                `json:"skills,omitempty"`
+	HealthCheck  *HealthCheckDef           `json:"health_check,omitempty"`
 }
 
 // SkillDef represents a skill loaded from a SKILL.md file.
 type SkillDef struct {
-	Name        string   `json:"name"`
-	Description string   `json:"description"`
-	Body        string   `json:"body,omitempty"`
-	Scripts     []string `json:"scripts,omitempty"`
-	References  []string `json:"references,omitempty"`
+	Name         string   `json:"name"`
+	Description  string   `json:"description"`
+	Body         string   `json:"body,omitempty"`
+	AlwaysActive bool     `json:"always_active,omitempty"` // if true, body is always injected (no matching needed)
+	Scripts      []string `json:"scripts,omitempty"`
+	References   []string `json:"references,omitempty"`
 }
 
 // HealthCheckDef holds heartbeat/health-check configuration.
@@ -59,7 +71,7 @@ func splitTiered(content string) (core, extended string) {
 //  3. SOUL.md + IDENTITY.md — SOUL → Core, IDENTITY → Extended
 func LoadFromDirectory(dir string) (*AgentSpec, error) {
 	spec := &AgentSpec{
-		Profiles: make(map[string]string),
+		Profiles: make(map[string]ProfileEntry),
 	}
 
 	// Priority 1: CLAUDE.md overrides everything.
@@ -223,15 +235,17 @@ func parseFrontmatter(content string) (map[string]string, string) {
 }
 
 // parseProfileSections splits content by ## headers into a map.
-func parseProfileSections(content string) map[string]string {
-	profiles := make(map[string]string)
+func parseProfileSections(content string) map[string]ProfileEntry {
+	profiles := make(map[string]ProfileEntry)
 	scanner := bufio.NewScanner(strings.NewReader(content))
 	var currentName string
 	var currentLines []string
 
 	flush := func() {
 		if currentName != "" {
-			profiles[currentName] = strings.TrimSpace(strings.Join(currentLines, "\n"))
+			profiles[currentName] = ProfileEntry{
+				SystemAddition: strings.TrimSpace(strings.Join(currentLines, "\n")),
+			}
 		}
 	}
 

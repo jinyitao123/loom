@@ -33,10 +33,10 @@ func TestSpecLoader_MemohSixPiece(t *testing.T) {
 	}
 
 	// PROFILES
-	if spec.Profiles["engineer"] == "" {
+	if spec.Profiles["engineer"].SystemAddition == "" {
 		t.Error("engineer profile not loaded")
 	}
-	if spec.Profiles["manager"] == "" {
+	if spec.Profiles["manager"].SystemAddition == "" {
 		t.Error("manager profile not loaded")
 	}
 

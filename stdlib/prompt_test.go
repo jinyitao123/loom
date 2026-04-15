@@ -116,7 +116,7 @@ func TestPromptAssemble_ProfileOverlay(t *testing.T) {
 	cfg := stdlib.PromptConfig{
 		Identity:              stdlib.IdentitySpec{Core: "Agent."},
 		Profile:               "engineer",
-		ProfilesMap:           map[string]string{"engineer": "Be precise and technical.", "manager": "Be strategic."},
+		ProfilesMap:           map[string]stdlib.ProfileEntry{"engineer": {SystemAddition: "Be precise and technical."}, "manager": {SystemAddition: "Be strategic."}},
 		MaxSystemPromptTokens: 4000,
 		SkillMatcher:          &stdlib.KeywordMatcher{},
 	}

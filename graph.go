@@ -16,6 +16,7 @@ type Graph struct {
 	Name             string
 	steps            map[string]Step
 	routers          map[string]Router
+	topology         []StepInfo // declared by graph builder for visualization
 	entry            string
 	hooks            HookPoints
 	mergeConfig      *MergeConfig
@@ -82,6 +83,24 @@ func (g *Graph) AddStep(name string, step Step, after Router) {
 	if after != nil {
 		g.routers[name] = after
 	}
+}
+
+// StepInfo describes a step and its outgoing edges for topology export.
+type StepInfo struct {
+	Name   string `json:"name"`
+	Detail string `json:"detail,omitempty"` // human-readable annotation
+	Edges  []Edge `json:"edges"`
+}
+
+// SetTopology declares the graph's topology for visualization.
+// Called by graph builders (CompileAgent, newMirrorGraph, etc.) after constructing the graph.
+func (g *Graph) SetTopology(topo []StepInfo) {
+	g.topology = topo
+}
+
+// Topology returns the declared topology, or nil if not set.
+func (g *Graph) Topology() []StepInfo {
+	return g.topology
 }
 
 // SetHooks attaches before/after hooks.

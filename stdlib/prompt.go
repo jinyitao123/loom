@@ -48,16 +48,40 @@ func (m *KeywordMatcher) Match(userMessage string, skills []SkillDef) []SkillMat
 	return results
 }
 
-// extractKeywords splits text into lowercase words > 3 chars.
+// extractKeywords splits text into keywords.
+// English: space-separated words > 3 chars.
+// CJK: individual characters and 2-char bigrams (since CJK has no spaces).
 func extractKeywords(text string) map[string]bool {
 	words := make(map[string]bool)
-	for _, w := range strings.Fields(strings.ToLower(text)) {
-		w = strings.Trim(w, ".,!?;:\"'()[]{}") // strip punctuation
+	lower := strings.ToLower(text)
+
+	// English words (space-separated, > 3 chars)
+	for _, w := range strings.Fields(lower) {
+		w = strings.Trim(w, `.,!?;:"'()[]{}` + "\uff0c\u3002\uff01\uff1f\u3001\uff1b\uff1a\u201c\u201d\u2018\u2019\uff08\uff09\u3010\u3011")
 		if len(w) > 3 {
 			words[w] = true
 		}
 	}
+
+	// CJK characters and bigrams
+	runes := []rune(lower)
+	for i, r := range runes {
+		if isCJK(r) {
+			words[string(r)] = true // single char
+			if i+1 < len(runes) && isCJK(runes[i+1]) {
+				words[string(runes[i:i+2])] = true // bigram
+			}
+		}
+	}
+
 	return words
+}
+
+func isCJK(r rune) bool {
+	return (r >= 0x4E00 && r <= 0x9FFF) || // CJK Unified Ideographs
+		(r >= 0x3040 && r <= 0x309F) || // Hiragana
+		(r >= 0x30A0 && r <= 0x30FF) || // Katakana
+		(r >= 0xAC00 && r <= 0xD7AF) // Hangul
 }
 
 // overlapScore counts the fraction of skill keywords found in the message.
@@ -78,8 +102,9 @@ func overlapScore(msgWords, skillWords map[string]bool) float64 {
 type PromptConfig struct {
 	Identity              IdentitySpec
 	Skills                []SkillDef
-	Profile               string            // active profile name
-	ProfilesMap           map[string]string  // profile name → content
+	Profile               string                      // active profile name
+	ProfilesMap           map[string]ProfileEntry     // profile name → entry
+	Context               map[string]any              // runtime context (appended as suffix)
 	MaxSystemPromptTokens int               // token budget for system prompt
 	MaxSkillBodyTokens    int               // max tokens per skill body (0 = unlimited)
 	SkillMatcher          SkillMatcher
@@ -128,16 +153,31 @@ func NewPromptAssembleStep(cfg PromptConfig) loom.Step {
 
 		// 4. Profile overlay.
 		if cfg.Profile != "" {
-			if profileContent, ok := cfg.ProfilesMap[cfg.Profile]; ok {
-				profileTokens := estimateTokens(profileContent)
+			if entry, ok := cfg.ProfilesMap[cfg.Profile]; ok && entry.SystemAddition != "" {
+				profileTokens := estimateTokens(entry.SystemAddition)
 				if used+profileTokens <= budget {
-					parts = append(parts, "\n## Profile: "+cfg.Profile+"\n"+profileContent)
+					parts = append(parts, "\n## Profile: "+cfg.Profile+"\n"+entry.SystemAddition)
 					used += profileTokens
 				}
 			}
 		}
 
-		// 5. Matched skill bodies (max 2 per turn).
+		// 5. Runtime context (appended as suffix).
+		if len(cfg.Context) > 0 {
+			var ctxLines []string
+			ctxLines = append(ctxLines, "\n## 当前上下文")
+			for k, v := range cfg.Context {
+				ctxLines = append(ctxLines, fmt.Sprintf("- %s: %v", k, v))
+			}
+			ctxStr := strings.Join(ctxLines, "\n")
+			ctxTokens := estimateTokens(ctxStr)
+			if used+ctxTokens <= budget {
+				parts = append(parts, ctxStr)
+				used += ctxTokens
+			}
+		}
+
+		// 6. Matched skill bodies (max 2 per turn).
 		var activeSkills []string
 		if cfg.SkillMatcher != nil {
 			userMsg := GetString(state, "last_user_message", "")

@@ -9,6 +9,12 @@ import (
 // Returns the name of the next step, or "" to halt.
 type Router func(ctx context.Context, state State) (string, error)
 
+// Edge describes a possible transition from one step to another (for topology export).
+type Edge struct {
+	To    string `json:"to"`              // target step name ("" = end)
+	Label string `json:"label,omitempty"` // condition label
+}
+
 // Always returns the same next step.
 func Always(next string) Router {
 	return func(_ context.Context, _ State) (string, error) { return next, nil }
