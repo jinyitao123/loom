@@ -26,6 +26,33 @@ func TestParsePromptInstruction(t *testing.T) {
 	}
 }
 
+func TestParsePromptReadsRecalledMemory(t *testing.T) {
+	p, err := parsePrompt([]byte(`{"type":"chat","instruction":"do X","recalled_memory":["user prefers brevity","ticket #42 was urgent"]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(p.RecalledMemory) != 2 || p.RecalledMemory[0] != "user prefers brevity" {
+		t.Fatalf("recalled_memory not parsed: %v", p.RecalledMemory)
+	}
+}
+
+func TestRunAgentFoldsRecalledMemoryIntoSystemPrompt(t *testing.T) {
+	var buf bytes.Buffer
+	llm := &fakeLLM{responses: []contract.ChatResponse{{Content: "ok"}}}
+	deps := runDeps{llm: llm, tools: noTools{}, out: NewEmitter(&buf)}
+	p := promptInput{Instruction: "hi", RecalledMemory: []string{"MEMORY_MARKER_42"}}
+
+	if err := runAgent(context.Background(), deps, p, runConfig{model: "deepseek-chat"}); err != nil {
+		t.Fatal(err)
+	}
+	if len(llm.lastMessages) == 0 || llm.lastMessages[0].Role != "system" {
+		t.Fatalf("expected a leading system message, got %+v", llm.lastMessages)
+	}
+	if !strings.Contains(llm.lastMessages[0].Content, "MEMORY_MARKER_42") {
+		t.Fatalf("recalled memory not folded into system prompt: %q", llm.lastMessages[0].Content)
+	}
+}
+
 func TestParsePromptPlainTextFallback(t *testing.T) {
 	p, err := parsePrompt([]byte("just a plain instruction"))
 	if err != nil {

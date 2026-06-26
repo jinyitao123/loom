@@ -65,6 +65,10 @@ type promptInput struct {
 	Type        string `json:"type"`
 	Instruction string `json:"instruction"`
 	Notice      string `json:"notice"`
+	// RecalledMemory is semantic memory the weave daemon recalled for this task
+	// (memory recall/remember runs daemon-side, around the spawn, for every
+	// provider). loom just folds it into the system prompt.
+	RecalledMemory []string `json:"recalled_memory"`
 }
 
 // parsePrompt reads the stdin payload. A JSON object must carry "instruction";
@@ -206,13 +210,20 @@ func runAgent(ctx context.Context, d runDeps, p promptInput, cfg runConfig) erro
 			}
 		}
 	}
-	// Fold the prompt's notice (e.g. "use the email tool") into the system prompt.
+	// Fold recalled memory + the prompt's notice into the system prompt.
+	var extras []string
+	if len(p.RecalledMemory) > 0 {
+		extras = append(extras, "## Relevant memory from past tasks\n"+strings.Join(p.RecalledMemory, "\n"))
+	}
 	if p.Notice != "" {
+		extras = append(extras, p.Notice)
+	}
+	if len(extras) > 0 {
+		parts := extras
 		if sp, _ := state["__system_prompt"].(string); sp != "" {
-			state["__system_prompt"] = sp + "\n\n" + p.Notice
-		} else {
-			state["__system_prompt"] = p.Notice
+			parts = append([]string{sp}, extras...)
 		}
+		state["__system_prompt"] = strings.Join(parts, "\n\n")
 	}
 
 	streaming := &streamingLLM{inner: d.llm, out: d.out}
