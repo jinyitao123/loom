@@ -278,9 +278,17 @@ func newSink(format string, w io.Writer) sink {
 	return NewEmitter(w)
 }
 
-// runCmd implements `loom run`.
+// runCmd implements `loom run`, wired to the process's real stdio/env.
 func runCmd(args []string) int {
+	return runCmdIO(args, os.Stdin, os.Stdout, os.Getenv)
+}
+
+// runCmdIO is the testable core of `loom run` — stdio and env are injected so it
+// can be driven in-process (the subprocess E2E tests cover the real binary; this
+// covers the orchestration logic).
+func runCmdIO(args []string, stdin io.Reader, stdout io.Writer, getenv func(string) string) int {
 	fs := flag.NewFlagSet("run", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
 	format := fs.String("format", "stream-json", "output format: stream-json | text")
 	cwd := fs.String("cwd", "", "working directory for the agent")
 	model := fs.String("model", "", "model id (e.g. deepseek-chat, gpt-4o)")
@@ -294,7 +302,7 @@ func runCmd(args []string) int {
 	}
 	cfg := runConfig{format: *format, cwd: *cwd, model: *model, resume: *resume, bypass: *bypass, mcpConfig: *mcpConfig, agentConfig: *agentConfig, profile: *profile}
 
-	out := newSink(cfg.format, os.Stdout)
+	out := newSink(cfg.format, stdout)
 
 	fail := func(msg string) int {
 		_ = out.Error(msg)
@@ -302,7 +310,7 @@ func runCmd(args []string) int {
 		return 1
 	}
 
-	raw, err := io.ReadAll(os.Stdin)
+	raw, err := io.ReadAll(stdin)
 	if err != nil {
 		return fail(fmt.Sprintf("read stdin: %v", err))
 	}
@@ -310,7 +318,7 @@ func runCmd(args []string) int {
 	if err != nil {
 		return fail(err.Error())
 	}
-	llm, err := buildLLM(cfg.model, os.Getenv)
+	llm, err := buildLLM(cfg.model, getenv)
 	if err != nil {
 		return fail(err.Error())
 	}

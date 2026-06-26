@@ -7,6 +7,7 @@ require (
 	github.com/google/uuid v1.6.0
 	github.com/jackc/pgx/v5 v5.8.0
 	github.com/labstack/echo/v4 v4.13.3
+	go.uber.org/goleak v1.3.0
 	golang.org/x/crypto v0.31.0
 )
 

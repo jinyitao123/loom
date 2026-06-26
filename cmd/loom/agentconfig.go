@@ -18,6 +18,8 @@ func loadAgentSpec(path string) (*stdlib.AgentSpec, error) {
 	if path == "" {
 		return nil, nil
 	}
+	// #nosec G304 -- path is the operator/daemon-supplied .loom-agent.json in the
+	// agent workdir, not untrusted remote input.
 	data, err := os.ReadFile(path)
 	if errors.Is(err, fs.ErrNotExist) {
 		return nil, nil

@@ -36,6 +36,8 @@ type mcpServerConfig struct {
 // loadMCPDispatcher reads path and returns a tool dispatcher. A missing file is
 // not an error — it yields noTools (the agent simply has no tools).
 func loadMCPDispatcher(path string) (contract.ToolDispatcher, error) {
+	// #nosec G304 -- path is the operator/daemon-supplied .loom-mcp.json in the
+	// agent workdir, not untrusted remote input.
 	data, err := os.ReadFile(path)
 	if errors.Is(err, fs.ErrNotExist) {
 		return noTools{}, nil

@@ -1,0 +1,21 @@
+# Lint config for the loom CLI (cmd/loom). Run scoped: golangci-lint run ./cmd/loom/...
+# Defaults (errcheck, govet, staticcheck, ineffassign, unused) are on; we add the
+# security + correctness linters that matter for a spawn-harness CLI.
+run:
+  timeout: 5m
+
+linters:
+  enable:
+    - gosec      # security (path traversal, weak crypto, unhandled errors near IO)
+    - misspell   # doc/comment typos
+    - unconvert  # redundant conversions
+    - bodyclose  # HTTP response bodies must be closed (we make MCP/LLM calls)
+
+issues:
+  exclude-rules:
+    # Test files use httptest, fixtures, and t.TempDir paths — gosec's G304/G104
+    # taint analysis is noise there.
+    - path: _test\.go
+      linters:
+        - gosec
+        - bodyclose
