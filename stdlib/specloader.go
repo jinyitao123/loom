@@ -33,6 +33,23 @@ type AgentSpec struct {
 	Profiles     map[string]ProfileEntry   `json:"profiles,omitempty"`
 	Skills       []SkillDef                `json:"skills,omitempty"`
 	HealthCheck  *HealthCheckDef           `json:"health_check,omitempty"`
+	// SubAgents declares deterministic orchestration: the agent routes to a
+	// named sub-agent by writing its RouteKey into state. Empty = no
+	// orchestration → the run uses the plain tool loop (back-compat). (P3)
+	SubAgents []SubAgentRef `json:"sub_agents,omitempty"`
+	// GraphType selects the compiled topology. "" / "standard" = the default
+	// (prompt → chat → [route → sub-agents]); other values are reserved for
+	// registered custom factories. (P3)
+	GraphType string `json:"graph_type,omitempty"`
+}
+
+// SubAgentRef references another agent for deterministic orchestration. The
+// parent routes to it when its RouteKey appears in state (set by the model via
+// __delegate_to, or by a step). (P3)
+type SubAgentRef struct {
+	Name        string `json:"name"`
+	Description string `json:"description,omitempty"` // when to route here (for the model)
+	RouteKey    string `json:"route_key,omitempty"`   // state value that routes here (defaults to Name)
 }
 
 // SkillDef represents a skill loaded from a SKILL.md file.
