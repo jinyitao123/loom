@@ -17,6 +17,7 @@ import (
 	"github.com/jinyitao123/loom/provider/deepseek"
 	"github.com/jinyitao123/loom/provider/openai"
 	"github.com/jinyitao123/loom/stdlib"
+	"github.com/jinyitao123/loom/stdlib/compiler"
 )
 
 // sink is the event output surface. *Emitter (stream-json) and textEmitter
@@ -195,7 +196,40 @@ func runAgent(ctx context.Context, d runDeps, p promptInput, cfg runConfig) erro
 	messages := append(priorMsgs, contract.Message{Role: "user", Content: p.Instruction})
 	state := loom.State{"messages": messages, "last_user_message": p.Instruction}
 
-	// Rich config: assemble the system prompt from identity / skills / profile.
+	streaming := &streamingLLM{inner: d.llm, out: d.out}
+
+	// Orchestrating specs (declared sub_agents) run a compiled deterministic-
+	// routing graph; everything else keeps the original single tool-loop path
+	// byte-for-byte (zero regression).
+	var output string
+	var rerr error
+	if orchestrating(d.spec) {
+		output, rerr = runOrchestrated(ctx, d, p, cfg, streaming, state)
+	} else {
+		output, rerr = runSingle(ctx, d, p, cfg, streaming, state)
+	}
+	if rerr != nil {
+		_ = d.out.Error(rerr.Error())
+		_ = d.out.Result("failed", output, sessionID)
+		return rerr
+	}
+
+	if d.store != nil {
+		finalMsgs := append(messages, contract.Message{Role: "assistant", Content: output})
+		_ = stdlib.SaveSession(d.store, sessionID, finalMsgs)
+	}
+	_ = d.out.Result("completed", output, sessionID)
+	return nil
+}
+
+// orchestrating reports whether the spec declares deterministic sub-agent routing.
+func orchestrating(spec *stdlib.AgentSpec) bool {
+	return spec != nil && len(spec.SubAgents) > 0
+}
+
+// runSingle is the original single-agent path: inline prompt assembly + recalled
+// memory/notice fold + one tool loop. Kept byte-identical to the pre-O3 behavior.
+func runSingle(ctx context.Context, d runDeps, p promptInput, cfg runConfig, streaming contract.LLM, state loom.State) (string, error) {
 	if d.spec != nil {
 		assemble := stdlib.NewPromptAssembleStep(stdlib.PromptConfig{
 			Identity:     specIdentity(d.spec),
@@ -210,7 +244,64 @@ func runAgent(ctx context.Context, d runDeps, p promptInput, cfg runConfig) erro
 			}
 		}
 	}
-	// Fold recalled memory + the prompt's notice into the system prompt.
+	foldMemoryNotice(state, p)
+	step := stdlib.NewToolLoopStep(streaming, d.tools, stdlib.ToolLoopOpts{
+		Model:     cfg.model,
+		ToolHooks: []contract.ToolHook{toolEventHook(d.out)},
+	})
+	result, err := step(ctx, state)
+	if err != nil {
+		return "", err
+	}
+	return stdlib.GetString(result, "output", ""), nil
+}
+
+// runOrchestrated compiles the spec into a deterministic-routing graph and runs
+// it. The graph owns prompt assembly, so recalled_memory + notice ride in via
+// CompileOpts.Context (not an inline fold). A model `delegate` tool call is
+// captured into __delegate_to so the router branches to the chosen sub-agent.
+func runOrchestrated(ctx context.Context, d runDeps, p promptInput, cfg runConfig, streaming contract.LLM, state loom.State) (string, error) {
+	sig := &delegateSignal{}
+	tools := newDelegateDispatcher(d.tools, d.spec.SubAgents, sig)
+	g, err := compiler.CompileAgent(d.spec, streaming, tools, compiler.CompileOpts{
+		Name:             "agent",
+		Model:            cfg.model,
+		Profile:          cfg.profile,
+		Context:          memoryNoticeContext(p),
+		ToolHooks:        []contract.ToolHook{toolEventHook(d.out)},
+		ChatStepFactory:  delegateChatStepFactory(sig),
+		SubAgentResolver: cliSubAgentResolver(cfg, streaming, d.tools, d.out),
+	})
+	if err != nil {
+		return "", err
+	}
+	// nil store → no checkpoint files in .loom-sessions; the session transcript
+	// is persisted separately by the caller under ns="session".
+	result, err := g.Run(ctx, state, nil)
+	if err != nil {
+		if result != nil {
+			return stdlib.GetString(result.State, "output", ""), err
+		}
+		return "", err
+	}
+	return stdlib.GetString(result.State, "output", ""), nil
+}
+
+// foldMemoryNotice appends recalled memory + notice AFTER the assembled
+// identity/skills block (identity first), preserving the pre-O3 ordering.
+func foldMemoryNotice(state loom.State, p promptInput) {
+	extras := memoryNoticeLines(p)
+	if len(extras) == 0 {
+		return
+	}
+	parts := extras
+	if sp, _ := state["__system_prompt"].(string); sp != "" {
+		parts = append([]string{sp}, extras...)
+	}
+	state["__system_prompt"] = strings.Join(parts, "\n\n")
+}
+
+func memoryNoticeLines(p promptInput) []string {
 	var extras []string
 	if len(p.RecalledMemory) > 0 {
 		extras = append(extras, "## Relevant memory from past tasks\n"+strings.Join(p.RecalledMemory, "\n"))
@@ -218,33 +309,24 @@ func runAgent(ctx context.Context, d runDeps, p promptInput, cfg runConfig) erro
 	if p.Notice != "" {
 		extras = append(extras, p.Notice)
 	}
-	if len(extras) > 0 {
-		parts := extras
-		if sp, _ := state["__system_prompt"].(string); sp != "" {
-			parts = append([]string{sp}, extras...)
-		}
-		state["__system_prompt"] = strings.Join(parts, "\n\n")
-	}
+	return extras
+}
 
-	streaming := &streamingLLM{inner: d.llm, out: d.out}
-	step := stdlib.NewToolLoopStep(streaming, d.tools, stdlib.ToolLoopOpts{
-		Model:     cfg.model,
-		ToolHooks: []contract.ToolHook{toolEventHook(d.out)},
-	})
-	result, err := step(ctx, state)
-	if err != nil {
-		_ = d.out.Error(err.Error())
-		_ = d.out.Result("failed", "", sessionID)
-		return err
+// memoryNoticeContext surfaces recalled memory + notice to the compiled graph's
+// prompt_assemble (rendered under "## 当前上下文") so the orchestrating path gets
+// them without a second inline assembly.
+func memoryNoticeContext(p promptInput) map[string]any {
+	if len(p.RecalledMemory) == 0 && p.Notice == "" {
+		return nil
 	}
-
-	output := stdlib.GetString(result, "output", "")
-	if d.store != nil {
-		finalMsgs := append(messages, contract.Message{Role: "assistant", Content: output})
-		_ = stdlib.SaveSession(d.store, sessionID, finalMsgs)
+	c := map[string]any{}
+	if len(p.RecalledMemory) > 0 {
+		c["recalled_memory"] = strings.Join(p.RecalledMemory, "\n")
 	}
-	_ = d.out.Result("completed", output, sessionID)
-	return nil
+	if p.Notice != "" {
+		c["notice"] = p.Notice
+	}
+	return c
 }
 
 // textEmitter is the human-readable sink for `--format text`.

@@ -108,6 +108,47 @@ func TestCompileAgent_ResolverErrorPropagates(t *testing.T) {
 	}
 }
 
+func TestCompileAgent_ChatStepFactoryUsed(t *testing.T) {
+	spec := &stdlib.AgentSpec{Identity: stdlib.IdentitySpec{Core: "x"}}
+	used := false
+	g, err := CompileAgent(spec, nilLLM{}, nilTools{}, CompileOpts{
+		ChatStepFactory: func(_ contract.LLM, _ contract.ToolDispatcher, _ stdlib.ToolLoopOpts) loom.Step {
+			return func(_ context.Context, _ loom.State) (loom.State, error) {
+				used = true
+				return loom.State{"output": "FROM_FACTORY"}, nil
+			}
+		},
+	})
+	if err != nil {
+		t.Fatalf("compile: %v", err)
+	}
+	res, err := g.Run(context.Background(), loom.State{
+		"messages":          []contract.Message{{Role: "user", Content: "hi"}},
+		"last_user_message": "hi",
+	}, nil)
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if !used {
+		t.Fatalf("ChatStepFactory step was not used")
+	}
+	if got := stdlib.GetString(res.State, "output", ""); got != "FROM_FACTORY" {
+		t.Fatalf("output = %q, want FROM_FACTORY", got)
+	}
+}
+
+// nil factory must keep the default tool-loop chat step (zero regression).
+func TestCompileAgent_NilChatStepFactoryIsDefault(t *testing.T) {
+	spec := &stdlib.AgentSpec{Identity: stdlib.IdentitySpec{Core: "x"}}
+	g, err := CompileAgent(spec, nilLLM{}, nilTools{}, CompileOpts{})
+	if err != nil {
+		t.Fatalf("compile: %v", err)
+	}
+	if !stepNames(g.Topology())["chat"] {
+		t.Fatalf("default build must still have a chat step")
+	}
+}
+
 func TestSubAgentRouter_DeterministicRouting(t *testing.T) {
 	router := buildSubAgentRouter([]stdlib.SubAgentRef{
 		{Name: "billing", RouteKey: "bill"},

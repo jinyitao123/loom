@@ -34,6 +34,11 @@ type CompileOpts struct {
 	MaxToolRepeats   int                                 // >0 wires a loop detector on the chat step
 	Store            loom.Store                          // for sub-graph checkpointing
 	SubAgentResolver func(name string) (*loom.Graph, error) // resolve a sub-agent name → child graph
+	// ChatStepFactory, when non-nil, builds the "chat" step instead of the
+	// default stdlib.NewToolLoopStep — letting a caller wrap the tool loop (e.g.
+	// to capture a delegation signal and surface it as state["__delegate_to"] so
+	// the deterministic router fires). nil = identical to the default build.
+	ChatStepFactory func(llm contract.LLM, tools contract.ToolDispatcher, opts stdlib.ToolLoopOpts) loom.Step
 }
 
 // CompileAgent converts an AgentSpec into a runnable loom Graph.
@@ -109,13 +114,20 @@ func CompileAgent(spec *stdlib.AgentSpec, llm contract.LLM, tools contract.ToolD
 	if hasSubAgents {
 		chatRouter = buildSubAgentRouter(spec.SubAgents)
 	}
-	g.AddStep("chat", stdlib.NewToolLoopStep(llm, tools, stdlib.ToolLoopOpts{
+	chatOpts := stdlib.ToolLoopOpts{
 		Model:         model,
 		SystemPrompt:  spec.SystemPrompt,
 		MaxIterations: 20,
 		Effort:        effort,
 		ToolHooks:     toolHooks,
-	}), chatRouter)
+	}
+	var chatStep loom.Step
+	if opts.ChatStepFactory != nil {
+		chatStep = opts.ChatStepFactory(llm, tools, chatOpts)
+	} else {
+		chatStep = stdlib.NewToolLoopStep(llm, tools, chatOpts)
+	}
+	g.AddStep("chat", chatStep, chatRouter)
 
 	// --- Steps: sub-agent delegation (optional) ---
 	if hasSubAgents {
