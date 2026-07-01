@@ -19,6 +19,7 @@ import (
 type Client struct {
 	apiKey         string
 	baseURL        string
+	chatPath       string // path appended to baseURL for chat completions
 	defaultModel   string
 	client         *http.Client
 	jsonObjectMode bool // use json_object instead of json_schema for Schema requests
@@ -44,11 +45,20 @@ func WithJSONObjectMode() Option {
 	return func(c *Client) { c.jsonObjectMode = true }
 }
 
+// WithChatPath overrides the path appended to the base URL for chat completions
+// (default: /v1/chat/completions). Needed by OpenAI-compatible providers whose
+// base URL already carries a version segment, e.g. Zhipu GLM, whose endpoint is
+// https://open.bigmodel.cn/api/paas/v4/chat/completions.
+func WithChatPath(path string) Option {
+	return func(c *Client) { c.chatPath = path }
+}
+
 // New creates a new OpenAI-compatible client.
 func New(apiKey string, opts ...Option) *Client {
 	c := &Client{
 		apiKey:       apiKey,
 		baseURL:      "https://api.openai.com",
+		chatPath:     "/v1/chat/completions",
 		defaultModel: "gpt-4o",
 		client:       http.DefaultClient,
 	}
@@ -72,8 +82,8 @@ type oaiRequest struct {
 }
 
 type oaiResponseFormat struct {
-	Type       string          `json:"type"`
-	JSONSchema *oaiJSONSchema  `json:"json_schema,omitempty"`
+	Type       string         `json:"type"`
+	JSONSchema *oaiJSONSchema `json:"json_schema,omitempty"`
 }
 
 type oaiJSONSchema struct {
@@ -205,7 +215,7 @@ func (c *Client) Chat(ctx context.Context, req contract.ChatRequest) (*contract.
 		return nil, fmt.Errorf("openai: marshal request: %w", err)
 	}
 
-	httpReq, err := http.NewRequestWithContext(ctx, "POST", c.baseURL+"/v1/chat/completions", bytes.NewReader(body))
+	httpReq, err := http.NewRequestWithContext(ctx, "POST", c.baseURL+c.chatPath, bytes.NewReader(body))
 	if err != nil {
 		return nil, err
 	}
@@ -307,7 +317,7 @@ func (c *Client) Stream(ctx context.Context, req contract.ChatRequest) (<-chan c
 		return nil, fmt.Errorf("openai: marshal request: %w", err)
 	}
 
-	httpReq, err := http.NewRequestWithContext(ctx, "POST", c.baseURL+"/v1/chat/completions", bytes.NewReader(body))
+	httpReq, err := http.NewRequestWithContext(ctx, "POST", c.baseURL+c.chatPath, bytes.NewReader(body))
 	if err != nil {
 		return nil, err
 	}
