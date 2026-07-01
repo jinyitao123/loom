@@ -41,13 +41,16 @@ builds the topology:
 No sub-agents (default):
     prompt_assemble → chat → END
 Orchestrator (sub_agents + a SubAgentResolver):
-    prompt_assemble → chat → route → sub_<name> → END
+    prompt_assemble → chat ──[Branch on __delegate_to]──> sub_<name> → END
+                                        └──(no match)──> END
 ```
 
-`route` is a deterministic `BranchFunc`: the chat step (or a tool) writes
-`__delegate_to` into state; the router maps that value (or a sub-agent's
-`RouteKey`, or its raw `sub_<name>` step name) to the matching step. No match →
-the graph ends (no delegation).
+The `chat` step's router is a deterministic `BranchFunc` on
+`state["__delegate_to"]` (not a separate node): it maps that value (a sub-agent's
+`RouteKey`, defaulting to its name, or the raw `sub_<name>` step name) to the
+matching sub-graph step. Empty / no match → the graph ends (no delegation). What
+*sets* `__delegate_to` is the `delegate` tool + chat-step wrapper described under
+[How delegation fires](#how-delegation-fires).
 
 ### Lean by intent
 
@@ -64,32 +67,42 @@ things that belong to a host or were cut elsewhere, to keep the engine generic:
 These can be layered back as opt-in `CompileOpts` later without changing the
 topology.
 
-## Status
+## How delegation fires
+
+The router branches on `state["__delegate_to"]`, but a tool result cannot write
+graph state — so something has to put the model's choice there. `loom run` does
+it with a **model-callable `delegate(agent, task)` tool** (in `cmd/loom`):
+
+1. A dispatcher wraps the real tools and adds a synthetic `delegate` tool whose
+   `agent` enum is the declared sub-agents. When the model calls it, the choice
+   is captured in a signal and a benign result is returned.
+2. A chat-step wrapper (injected via `CompileOpts.ChatStepFactory`) runs the
+   normal tool loop, then — if `delegate` fired — returns
+   `state{__delegate_to, last_user_message}` so the compiler's deterministic
+   `Branch` routes to `sub_<agent>`; otherwise it returns the model's own answer.
+
+This needs **no new NDJSON event** — the `delegate` call surfaces through the
+existing `tool_use`/`tool_result` events, and routing rides existing graph state
++ the `output` key. The cross-repo wire contract is untouched.
+
+## Status — implemented
 
 - ✅ `AgentSpec.SubAgents` + `GraphType` (`stdlib/specloader.go`).
-- ✅ `stdlib/compiler` — `CompileAgent`, deterministic router, `loop_detector`.
-  Unit tests: standard vs orchestrator topology, resolver-less sub-agents stay
-  standard, nil-spec / resolver-error paths, router (RouteKey / step name /
-  no-match → halt), loop detector. `go build ./... && go test ./...` green.
+- ✅ `stdlib/compiler` — `CompileAgent`, deterministic router, `loop_detector`,
+  optional `ChatStepFactory` hook (nil = default tool-loop build).
+- ✅ Wired into `loom run` (`cmd/loom`): `runAgent` forks — orchestration declared
+  (`len(SubAgents) > 0`) → `CompileAgent` → `Graph.Run`; else the original single
+  tool-loop path, byte-for-byte (zero regression). `recalled_memory` + `notice`
+  reach the graph via `CompileOpts.Context`; the streaming LLM + tool-event hooks
+  pass through so child tokens/tool calls stream. Sub-agents resolve from
+  `<cwd>/.loom-agents/<name>.json` as leaf graphs (single-hop, no recursion).
+- ✅ Verified end-to-end against a real model: a two-sub-agent orchestrator routes
+  selectively (each request reaches the matching sub-agent, which applies its own
+  identity), stream carries only the known event types.
+
+`go build ./... && go vet ./... && go test ./...` green.
 
 ## Roadmap
-
-### Wire into `loom run`
-
-`runAgent` chooses the execution model: orchestration declared
-(`GraphType != "" || len(SubAgents) > 0`) → `CompileAgent` → `Graph.Run`; else
-the current `NewToolLoopStep` (zero regression for non-orchestrating agents).
-
-Two integration points to get right:
-
-1. **Prompt composition.** The compiled graph owns its `prompt_assemble` step,
-   so the run path must not pre-assemble. Externally injected context
-   (`recalled_memory`, `notice`) should reach the graph via `CompileOpts.Context`
-   (surfaced by the prompt assembler) rather than a pre-set `__system_prompt`
-   the assembler would overwrite.
-2. **`SubAgentResolver`.** Resolves a sub-agent name → a compiled child graph.
-   The minimal first form builds a single-purpose child from the `SubAgentRef`
-   (its description as identity); richer forms can resolve a nested child spec.
 
 ### Sub-agent observability (optional, additive)
 
