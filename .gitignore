@@ -20,3 +20,6 @@ weave/bin/
 # Built CLI binary + per-run session/state artifacts
 /loom
 .loom-sessions/
+
+# goreleaser build output
+dist/

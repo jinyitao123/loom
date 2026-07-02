@@ -1,0 +1,29 @@
+name: release
+
+# Cut a loom CLI release: push a tag `vX.Y.Z` → goreleaser cross-compiles
+# cmd/loom for linux/darwin/windows × amd64/arm64 and publishes a GitHub Release
+# with checksums.
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  goreleaser:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+      - uses: goreleaser/goreleaser-action@v6
+        with:
+          version: "~> v2"
+          args: release --clean
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

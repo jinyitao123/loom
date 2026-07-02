@@ -16,7 +16,9 @@ import (
 	"os"
 )
 
-const version = "0.1.0"
+// version is injected at release time via -ldflags "-X main.version=...".
+// Defaults to "dev" for local builds.
+var version = "dev"
 
 func main() {
 	if len(os.Args) < 2 {
