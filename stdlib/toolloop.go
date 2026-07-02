@@ -132,7 +132,30 @@ func NewToolLoopStep(llm contract.LLM, tools contract.ToolDispatcher, opts ToolL
 				msgs = append(msgs, r.AsMessage())
 			}
 		}
-		return loom.State{"__error": "max tool iterations"}, fmt.Errorf("loom/toolloop: max iterations (%d) reached", opts.MaxIterations)
+
+		// Tool budget exhausted. Don't fail the whole turn (which surfaces to the
+		// end user as a raw error) — inject a wrap-up note and make one final call
+		// with NO tools offered, so the model must close out in text: summarize
+		// what it has, and say how the remainder should be handled.
+		slog.Warn("loom/toolloop: tool budget exhausted, wrapping up",
+			"max_iterations", opts.MaxIterations)
+		msgs = append(msgs, contract.Message{
+			Role: "user",
+			Content: fmt.Sprintf("[loom] The tool-call budget for this turn is exhausted (%d rounds used). "+
+				"Do not request any more tool calls. In the language of this conversation: summarize what you "+
+				"have found so far, state clearly what remains unfinished, and suggest how the remaining work "+
+				"should be handled (for example, delegating it as a background task).", opts.MaxIterations),
+		})
+		resp, err := llm.Chat(ctx, contract.ChatRequest{
+			Model:     opts.Model,
+			Messages:  msgs,
+			MaxTokens: opts.MaxTokens,
+			Effort:    effort,
+		})
+		if err != nil {
+			return loom.State{"__error": err.Error()}, err
+		}
+		return SetOutput(resp.Content, resp.Usage), nil
 	}
 }
 

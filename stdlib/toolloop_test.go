@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/jinyitao123/loom"
@@ -92,29 +93,45 @@ func TestToolLoop_SingleToolCall(t *testing.T) {
 }
 
 func TestToolLoop_MaxIterations(t *testing.T) {
-	// LLM always returns tool calls — should hit max iterations.
-	llm := &mockLLM{responses: make([]contract.ChatResponse, 100)}
-	for i := range llm.responses {
-		llm.responses[i] = contract.ChatResponse{
-			ToolCalls: []contract.ToolCall{{ID: fmt.Sprintf("%d", i), Name: "loop", Args: fmt.Sprintf(`{"i":%d}`, i)}},
-		}
-	}
+	// LLM keeps returning tool calls until the budget runs out. Exhaustion must
+	// NOT error the turn — the loop injects a wrap-up note and makes one final
+	// no-tools call so the model closes out in text (summary + hand-off hint).
+	llm := &mockLLM{responses: []contract.ChatResponse{
+		{ToolCalls: []contract.ToolCall{{ID: "0", Name: "loop", Args: `{"i":0}`}}},
+		{ToolCalls: []contract.ToolCall{{ID: "1", Name: "loop", Args: `{"i":1}`}}},
+		{ToolCalls: []contract.ToolCall{{ID: "2", Name: "loop", Args: `{"i":2}`}}},
+		{Content: "partial findings; the rest should be delegated"},
+	}}
 	tools := &mockTools{
 		tools:   []contract.ToolDef{{Name: "loop", Description: "Loop"}},
 		handler: func(call contract.ToolCall) *contract.ToolResult { return &contract.ToolResult{CallID: call.ID, Content: "ok"} },
 	}
 
-	step := stdlib.NewToolLoopStep(llm, tools, stdlib.ToolLoopOpts{
+	var lastReq contract.ChatRequest
+	wrapper := &chatCapture{inner: llm, captured: &lastReq}
+
+	step := stdlib.NewToolLoopStep(wrapper, tools, stdlib.ToolLoopOpts{
 		Model: "test", MaxIterations: 3,
 	})
 
-	_, err := step(context.Background(), loom.State{
+	state, err := step(context.Background(), loom.State{
 		"messages": []contract.Message{{Role: "user", Content: "go"}},
 	})
-	if err == nil {
-		t.Fatal("expected max iterations error")
+	if err != nil {
+		t.Fatalf("budget exhaustion must wrap up, not error: %v", err)
 	}
-	assertError(t, err, "max iterations")
+	out, _ := state["output"].(string)
+	if out != "partial findings; the rest should be delegated" {
+		t.Fatalf("expected wrap-up content, got %q", out)
+	}
+	// The wrap-up call must offer NO tools and end with the budget note.
+	if len(lastReq.Tools) != 0 {
+		t.Fatalf("wrap-up call must not offer tools, got %d", len(lastReq.Tools))
+	}
+	last := lastReq.Messages[len(lastReq.Messages)-1]
+	if last.Role != "user" || !strings.Contains(last.Content, "budget") {
+		t.Fatalf("expected budget wrap-up note as final user message, got role=%s content=%q", last.Role, last.Content)
+	}
 }
 
 func TestToolLoop_SystemPrompt(t *testing.T) {
