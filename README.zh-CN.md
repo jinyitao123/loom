@@ -10,7 +10,7 @@
 
 织布机只有三个部件——经线、纬线、梭子——却能织出任何图案。
 
-Loom 是同样的思路。整个内核 584 行代码，5 个类型定义。但它们组合起来，能表达从单轮聊天到百 Agent 编排的一切模式。
+Loom 是同样的思路。整个内核约 700 行代码，5 个类型定义。但它们组合起来，能表达从单轮聊天到百 Agent 编排的一切模式。
 
 ```go
 type State  map[string]any                                           // 数据流
@@ -40,7 +40,7 @@ package main
 import (
     "context"
     "fmt"
-    "github.com/anthropic/loom"
+    "github.com/jinyitao123/loom"
 )
 
 func main() {
@@ -57,7 +57,7 @@ func main() {
 ```
 
 ```bash
-go get github.com/anthropic/loom
+go get github.com/jinyitao123/loom
 ```
 
 ## 五个原语能做什么
@@ -168,11 +168,11 @@ result, _ = g.Resume(ctx, runID, State{}, pgStore)
 ┌──────────────────────────────────────────────────┐
 │  Layer 3 · Your App                              │  ← HTTP / Auth / 多租户 / 你的业务
 ├──────────────────────────────────────────────────┤
-│  Layer 2 · Stdlib                    ~1800 LOC   │  ← 预制积木：ToolLoop / Guard / Handoff
+│  Layer 2 · Stdlib                    ~1500 LOC   │  ← 预制积木：ToolLoop / Guard / Handoff
 ├──────────────────────────────────────────────────┤
-│  Layer 1 · Contract                   ~300 LOC   │  ← 纯接口：LLM / ToolDispatcher / Embedder
+│  Layer 1 · Contract                   ~150 LOC   │  ← 纯接口：LLM / ToolDispatcher / Embedder
 ├──────────────────────────────────────────────────┤
-│  Layer 0 · Kernel                     ~600 LOC   │  ← 五个原语，仅此而已
+│  Layer 0 · Kernel                     ~700 LOC   │  ← 五个原语，仅此而已
 └──────────────────────────────────────────────────┘
 ```
 
@@ -190,10 +190,11 @@ chat := stdlib.NewToolLoopStep(llm, tools, stdlib.ToolLoopOpts{
     ToolHooks:     []contract.ToolHook{auditHook},
 })
 
-// 声明式工具权限：deny 优先于 allow
-safeTool := stdlib.NewPermissionDispatcher(tools,
-    []string{"rm_rf", "drop_table"},   // 永远禁止
-    []string{"read_*", "search_*"},    // 只允许这些
+// 声明式工具权限，三级：deny → ask → allow
+safeTool := stdlib.NewPermissionDispatcherWithAsk(tools,
+    []string{"rm_rf", "drop_table"},   // deny：永远禁止
+    []string{"send_email"},            // ask：执行前提示用户确认
+    []string{"read_*", "search_*"},    // allow：白名单
 )
 
 // 跑到 $5 自动停
@@ -203,6 +204,20 @@ g.SetHooks(loom.HookPoints{
 ```
 
 Read-only 工具自动并发，stateful 工具严格串行。ToolLoop 读 `ToolDef.ReadOnly` 标记自动判断。
+
+## `loom` CLI
+
+Loom 首先是一个库——但仓库也附带了 `loom` 二进制：一个基于这个库构建的独立 Agent 引擎。它是 [weave](https://github.com/jinyitao123/Weave) daemon 的 spawn-harness 后端：stdin 读入 prompt JSON，跑一轮 Agent，stdout 输出 NDJSON 事件流——支持 MCP 工具服务、会话 resume、语义记忆，以及从 Agent Spec 编译出的确定性子代理编排。
+
+```bash
+# 从 GitHub Release 安装（linux / macOS）：
+curl -fsSL https://raw.githubusercontent.com/jinyitao123/loom/main/install.sh | sh
+
+# 或用 Go（任意平台）：
+go install github.com/jinyitao123/loom/cmd/loom@latest
+```
+
+用法和事件协议见 [cmd/loom/README.md](cmd/loom/README.md)，宿主进程如何驱动它见 [docs/host-integration.md](docs/host-integration.md)。
 
 ## 项目结构
 
@@ -220,13 +235,17 @@ loom/
 ├── stdlib/           预制 Step & Hook
 │   ├── toolloop.go   LLM ↔ Tool 循环
 │   ├── steps.go      Guard / HumanWait / SubGraph / Handoff
-│   ├── permission.go 声明式工具权限
+│   ├── permission.go 声明式工具权限（deny / ask / allow）
 │   ├── budget.go     Token & 美元预算控制
 │   ├── prompt.go     分层 prompt 组装
-│   └── session.go    会话历史持久化
+│   ├── session.go    会话历史持久化
+│   ├── specloader.go Agent Spec 加载（identity / skills / 子代理）
+│   └── compiler/     AgentSpec → Graph：确定性子代理编排
 │
 ├── pgstore/          PostgreSQL Store
-└── provider/         LLM Provider（OpenAI / DeepSeek）
+├── provider/         LLM Provider（OpenAI 兼容 / DeepSeek）
+├── cmd/loom/         `loom` CLI —— stdin JSON → Agent 轮次 → NDJSON 流
+└── docs/             宿主集成契约 & 编排设计
 ```
 
 ## 对比
@@ -234,7 +253,7 @@ loom/
 | | Loom | LangGraph | OpenAI Agents SDK |
 |---|---|---|---|
 | 语言 | Go | Python | Python |
-| 内核 | ~600 LOC | ~15K LOC | ~3K LOC |
+| 内核 | ~700 LOC | ~15K LOC | ~3K LOC |
 | 持久化 | 自动 checkpoint | 自动 checkpoint | 无 |
 | LLM 耦合 | 零 | 中 | 强（OpenAI 绑定） |
 | 工具协议 | 任意 | LangChain Tools | function calling |
@@ -252,7 +271,7 @@ loom/
 
 ## License
 
-Apache-2.0
+MIT
 
 ---
 

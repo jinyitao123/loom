@@ -10,7 +10,7 @@
 
 A loom has only three moving parts — warp, weft, shuttle — yet it can weave any pattern.
 
-Loom works the same way. The entire kernel is 584 lines of Go and 5 type definitions. Combined, they express everything from a single chatbot to a hundred-agent orchestration.
+Loom works the same way. The entire kernel is ~700 lines of Go and 5 type definitions. Combined, they express everything from a single chatbot to a hundred-agent orchestration.
 
 ```go
 type State  map[string]any                                           // data
@@ -165,11 +165,11 @@ Everything else is your domain. That's freedom, not omission.
 ┌──────────────────────────────────────────────────┐
 │  Layer 3 · Your App                              │  ← HTTP / Auth / Multi-tenancy / Your business
 ├──────────────────────────────────────────────────┤
-│  Layer 2 · Stdlib                    ~1800 LOC   │  ← Building blocks: ToolLoop / Guard / Handoff
+│  Layer 2 · Stdlib                    ~1500 LOC   │  ← Building blocks: ToolLoop / Guard / Handoff
 ├──────────────────────────────────────────────────┤
-│  Layer 1 · Contract                   ~300 LOC   │  ← Pure interfaces: LLM / ToolDispatcher / Embedder
+│  Layer 1 · Contract                   ~150 LOC   │  ← Pure interfaces: LLM / ToolDispatcher / Embedder
 ├──────────────────────────────────────────────────┤
-│  Layer 0 · Kernel                     ~600 LOC   │  ← Five primitives. That's it.
+│  Layer 0 · Kernel                     ~700 LOC   │  ← Five primitives. That's it.
 └──────────────────────────────────────────────────┘
 ```
 
@@ -187,10 +187,11 @@ chat := stdlib.NewToolLoopStep(llm, tools, stdlib.ToolLoopOpts{
     ToolHooks:     []contract.ToolHook{auditHook},
 })
 
-// Declarative tool permissions: deny takes precedence over allow
-safeTool := stdlib.NewPermissionDispatcher(tools,
-    []string{"rm_rf", "drop_table"},   // always blocked
-    []string{"read_*", "search_*"},    // only these allowed
+// Declarative tool permissions, three levels: deny → ask → allow
+safeTool := stdlib.NewPermissionDispatcherWithAsk(tools,
+    []string{"rm_rf", "drop_table"},   // deny: always blocked
+    []string{"send_email"},            // ask: executed with a user-confirmation hint
+    []string{"read_*", "search_*"},    // allow: whitelist
 )
 
 // Auto-stop at $5
@@ -200,6 +201,20 @@ g.SetHooks(loom.HookPoints{
 ```
 
 Read-only tools run in parallel automatically; stateful tools run serially. ToolLoop reads `ToolDef.ReadOnly` to decide.
+
+## The `loom` CLI
+
+Loom is a library first — but the repo also ships `loom`, a standalone agent engine built on that library. It is the [weave](https://github.com/jinyitao123/Weave) daemon's spawn-harness backend: prompt JSON on stdin, one agent turn, NDJSON events on stdout — with MCP tool servers, session resume, semantic memory, and deterministic sub-agent orchestration compiled from an agent spec.
+
+```bash
+# from a GitHub Release (linux / macOS):
+curl -fsSL https://raw.githubusercontent.com/jinyitao123/loom/main/install.sh | sh
+
+# or with Go (any platform):
+go install github.com/jinyitao123/loom/cmd/loom@latest
+```
+
+See [cmd/loom/README.md](cmd/loom/README.md) for usage and the event wire format, and [docs/host-integration.md](docs/host-integration.md) for how any host process can drive it.
 
 ## Project Structure
 
@@ -217,13 +232,17 @@ loom/
 ├── stdlib/           Pre-built Steps & Hooks
 │   ├── toolloop.go   LLM ↔ Tool loop
 │   ├── steps.go      Guard / HumanWait / SubGraph / Handoff
-│   ├── permission.go Declarative tool permissions
+│   ├── permission.go Declarative tool permissions (deny / ask / allow)
 │   ├── budget.go     Token & USD budget hooks
 │   ├── prompt.go     Tiered prompt assembly
-│   └── session.go    Session history persistence
+│   ├── session.go    Session history persistence
+│   ├── specloader.go Agent-spec loading (identity / skills / sub-agents)
+│   └── compiler/     AgentSpec → Graph: deterministic sub-agent orchestration
 │
 ├── pgstore/          PostgreSQL Store
-└── provider/         LLM Providers (OpenAI / DeepSeek)
+├── provider/         LLM Providers (OpenAI-compatible / DeepSeek)
+├── cmd/loom/         The `loom` CLI — stdin JSON → agent turn → NDJSON stream
+└── docs/             Host-integration contract & orchestration design
 ```
 
 ## Comparison
@@ -231,7 +250,7 @@ loom/
 | | Loom | LangGraph | OpenAI Agents SDK |
 |---|---|---|---|
 | Language | Go | Python | Python |
-| Kernel | ~600 LOC | ~15K LOC | ~3K LOC |
+| Kernel | ~700 LOC | ~15K LOC | ~3K LOC |
 | Persistence | Auto checkpoint | Auto checkpoint | None |
 | LLM coupling | Zero | Medium | Strong (OpenAI-bound) |
 | Tool protocol | Any | LangChain Tools | function calling |
@@ -249,7 +268,7 @@ loom/
 
 ## License
 
-Apache-2.0
+MIT
 
 ---
 
