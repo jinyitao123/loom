@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"log/slog"
 	"net/http"
 	"os"
 	"sync"
@@ -68,10 +69,12 @@ func loadMCPDispatcher(path string) (contract.ToolDispatcher, error) {
 // mcpHost is a single-server JSON-RPC MCP client implementing the tools/list +
 // tools/call methods, with an optional tool allowlist.
 type mcpHost struct {
-	name    string
-	baseURL string
-	client  *http.Client
-	filter  map[string]bool
+	name     string
+	baseURL  string
+	client   *http.Client
+	filter   map[string]bool
+	initOnce sync.Once
+	initErr  error
 }
 
 func newMCPHost(name, baseURL string, allow []string) *mcpHost {
@@ -89,7 +92,7 @@ type jsonRPCRequest struct {
 	JSONRPC string `json:"jsonrpc"`
 	Method  string `json:"method"`
 	Params  any    `json:"params,omitempty"`
-	ID      int    `json:"id"`
+	ID      int    `json:"id,omitempty"`
 }
 
 type jsonRPCResponse struct {
@@ -119,6 +122,9 @@ func (h *mcpHost) call(ctx context.Context, method string, params any) (json.Raw
 	if err != nil {
 		return nil, err
 	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("mcp %s call %s: http %d: %s", h.name, method, resp.StatusCode, bytes.TrimSpace(body))
+	}
 	var rpc jsonRPCResponse
 	if err := json.Unmarshal(body, &rpc); err != nil {
 		return nil, fmt.Errorf("mcp %s response parse: %w", h.name, err)
@@ -129,7 +135,57 @@ func (h *mcpHost) call(ctx context.Context, method string, params any) (json.Raw
 	return rpc.Result, nil
 }
 
+func (h *mcpHost) notify(ctx context.Context, method string, params any) error {
+	data, err := json.Marshal(jsonRPCRequest{JSONRPC: "2.0", Method: method, Params: params})
+	if err != nil {
+		return err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, h.baseURL, bytes.NewReader(data))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := h.client.Do(req)
+	if err != nil {
+		return fmt.Errorf("mcp %s notify %s: %w", h.name, method, err)
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return err
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("mcp %s notify %s: http %d: %s", h.name, method, resp.StatusCode, bytes.TrimSpace(body))
+	}
+	return nil
+}
+
+func (h *mcpHost) ensureInit(ctx context.Context) error {
+	h.initOnce.Do(func() {
+		params := map[string]any{
+			"protocolVersion": "2024-11-05",
+			"capabilities":    map[string]any{},
+			"clientInfo": map[string]any{
+				"name":    "loom",
+				"version": version,
+			},
+		}
+		if _, err := h.call(ctx, "initialize", params); err != nil {
+			h.initErr = err
+			return
+		}
+		if err := h.notify(ctx, "notifications/initialized", nil); err != nil {
+			h.initErr = err
+			return
+		}
+	})
+	return h.initErr
+}
+
 func (h *mcpHost) listTools(ctx context.Context) ([]contract.ToolDef, error) {
+	if err := h.ensureInit(ctx); err != nil {
+		return nil, err
+	}
 	result, err := h.call(ctx, "tools/list", nil)
 	if err != nil {
 		return nil, err
@@ -153,6 +209,9 @@ func (h *mcpHost) listTools(ctx context.Context) ([]contract.ToolDef, error) {
 }
 
 func (h *mcpHost) dispatch(ctx context.Context, call contract.ToolCall) *contract.ToolResult {
+	if err := h.ensureInit(ctx); err != nil {
+		return &contract.ToolResult{CallID: call.ID, Content: err.Error(), IsError: true}
+	}
 	if h.filter != nil && !h.filter[call.Name] {
 		return &contract.ToolResult{CallID: call.ID, Content: fmt.Sprintf("tool %q is not available for this agent", call.Name), IsError: true}
 	}
@@ -199,11 +258,17 @@ func (d *mcpDispatcher) ensureListed(ctx context.Context) error {
 	}
 	route := make(map[string]*mcpHost)
 	var all []contract.ToolDef
+	var loadedServers int
+	var failedServers int
 	for _, s := range d.servers {
 		ts, err := s.listTools(ctx)
 		if err != nil {
-			return err
+			failedServers++
+			slog.Warn("loom/mcp: server skipped", "server", s.name, "error", err)
+			continue
 		}
+		loadedServers++
+		slog.Info("loom/mcp: server tools loaded", "server", s.name, "tools", len(ts))
 		for _, t := range ts {
 			if _, dup := route[t.Name]; dup {
 				continue
@@ -211,6 +276,18 @@ func (d *mcpDispatcher) ensureListed(ctx context.Context) error {
 			route[t.Name] = s
 			all = append(all, t)
 		}
+	}
+	configuredServers := len(d.servers)
+	slog.Info("loom/mcp: loaded tools",
+		"tools", len(all),
+		"servers_loaded", loadedServers,
+		"servers_configured", configuredServers,
+		"servers_failed", failedServers)
+	if configuredServers > 0 && len(all) == 0 {
+		slog.Error("loom/mcp: configured servers loaded zero tools",
+			"servers_configured", configuredServers,
+			"servers_loaded", loadedServers,
+			"servers_failed", failedServers)
 	}
 	d.route, d.tools, d.listed = route, all, true
 	return nil
