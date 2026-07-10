@@ -23,15 +23,16 @@ import (
 // and the Spare-parts backend).
 //
 //	{ "mcpServers": { "<name>": { "url": "http://…", "type": "http",
-//	                              "tools": ["allow1","allow2"] } } }
+//	                              "tools": ["allow1","allow2"], "required": true } } }
 type mcpConfig struct {
 	MCPServers map[string]mcpServerConfig `json:"mcpServers"`
 }
 
 type mcpServerConfig struct {
-	URL   string   `json:"url"`
-	Type  string   `json:"type"`
-	Tools []string `json:"tools"` // optional allowlist
+	URL      string   `json:"url"`
+	Type     string   `json:"type"`
+	Tools    []string `json:"tools"` // optional allowlist
+	Required bool     `json:"required"`
 }
 
 // loadMCPDispatcher reads path and returns a tool dispatcher. A missing file is
@@ -58,7 +59,7 @@ func loadMCPDispatcher(path string) (contract.ToolDispatcher, error) {
 		if sc.Type != "" && sc.Type != "http" {
 			return nil, fmt.Errorf("mcp server %q: unsupported type %q (v1 supports http)", name, sc.Type)
 		}
-		servers = append(servers, newMCPHost(name, sc.URL, sc.Tools))
+		servers = append(servers, newMCPHost(name, sc.URL, sc.Tools, sc.Required))
 	}
 	if len(servers) == 0 {
 		return noTools{}, nil
@@ -73,12 +74,18 @@ type mcpHost struct {
 	baseURL  string
 	client   *http.Client
 	filter   map[string]bool
+	required bool
 	initOnce sync.Once
 	initErr  error
 }
 
-func newMCPHost(name, baseURL string, allow []string) *mcpHost {
-	h := &mcpHost{name: name, baseURL: baseURL, client: &http.Client{Timeout: 30 * time.Second}}
+func newMCPHost(name, baseURL string, allow []string, required bool) *mcpHost {
+	h := &mcpHost{
+		name:     name,
+		baseURL:  baseURL,
+		client:   &http.Client{Timeout: 30 * time.Second},
+		required: required,
+	}
 	if len(allow) > 0 {
 		h.filter = make(map[string]bool, len(allow))
 		for _, n := range allow {
@@ -260,11 +267,18 @@ func (d *mcpDispatcher) ensureListed(ctx context.Context) error {
 	var all []contract.ToolDef
 	var loadedServers int
 	var failedServers int
+	var failures []error
+	var requiredFailures []error
 	for _, s := range d.servers {
 		ts, err := s.listTools(ctx)
 		if err != nil {
 			failedServers++
 			slog.Warn("loom/mcp: server skipped", "server", s.name, "error", err)
+			failure := fmt.Errorf("server %q failed: %w", s.name, err)
+			failures = append(failures, failure)
+			if s.required {
+				requiredFailures = append(requiredFailures, fmt.Errorf("required %w", failure))
+			}
 			continue
 		}
 		loadedServers++
@@ -289,8 +303,18 @@ func (d *mcpDispatcher) ensureListed(ctx context.Context) error {
 			"servers_loaded", loadedServers,
 			"servers_failed", failedServers)
 	}
+	if len(requiredFailures) > 0 {
+		return errors.Join(requiredFailures...)
+	}
+	if configuredServers > 0 && loadedServers == 0 {
+		return fmt.Errorf("all configured MCP servers failed: %w", errors.Join(failures...))
+	}
 	d.route, d.tools, d.listed = route, all, true
 	return nil
+}
+
+func (d *mcpDispatcher) Preflight(ctx context.Context) error {
+	return d.ensureListed(ctx)
 }
 
 func (d *mcpDispatcher) ListTools(ctx context.Context) ([]contract.ToolDef, error) {

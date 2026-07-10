@@ -39,7 +39,7 @@ func FuzzMCPDispatchParse(f *testing.F) {
 	f.Add([]byte(``))
 
 	f.Fuzz(func(t *testing.T, body []byte) {
-		h := newMCPHost("fuzz", "http://example.invalid", nil)
+		h := newMCPHost("fuzz", "http://example.invalid", nil, false)
 		// route the response through the parser by faking the call result path:
 		// build a result directly to avoid network — exercise extractContent logic
 		// via the public dispatch on a stub by unmarshaling like dispatch does.

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -32,9 +33,27 @@ func (t handlerTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	return rec.Result(), nil
 }
 
+type errorTransport struct {
+	err error
+}
+
+func (t errorTransport) RoundTrip(*http.Request) (*http.Response, error) {
+	return nil, t.err
+}
+
 func newMockMCPHost(name string, mock *mockMCP, allow []string) *mcpHost {
-	h := newMCPHost(name, "http://"+name+".test/mcp", allow)
+	return newMockMCPHostRequired(name, mock, allow, false)
+}
+
+func newMockMCPHostRequired(name string, mock *mockMCP, allow []string, required bool) *mcpHost {
+	h := newMCPHost(name, "http://"+name+".test/mcp", allow, required)
 	h.client = &http.Client{Transport: handlerTransport{handler: mock.handler()}}
+	return h
+}
+
+func newUnreachableMCPHost(name string, required bool) *mcpHost {
+	h := newMCPHost(name, "http://127.0.0.1:1/mcp", nil, required)
+	h.client = &http.Client{Transport: errorTransport{err: errors.New("dial tcp 127.0.0.1:1: connect: connection refused")}}
 	return h
 }
 
@@ -155,12 +174,62 @@ func captureSlog(t *testing.T) *bytes.Buffer {
 }
 
 func TestLoadMCPDispatcherMissingFileReturnsNoTools(t *testing.T) {
-	d, err := loadMCPDispatcher(filepath.Join(t.TempDir(), "nope.json"))
+	assertNoMCPTools(t, filepath.Join(t.TempDir(), "nope.json"))
+}
+
+func TestLoadMCPDispatcherEmptyConfigReturnsNoTools(t *testing.T) {
+	assertNoMCPTools(t, writeMCPConfig(t, `{"mcpServers":{}}`))
+}
+
+func assertNoMCPTools(t *testing.T, path string) {
+	t.Helper()
+	d, err := loadMCPDispatcher(path)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if _, ok := d.(noTools); !ok {
 		t.Fatalf("missing config should yield noTools, got %T", d)
+	}
+	tools, err := d.ListTools(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(tools) != 0 {
+		t.Fatalf("tools = %+v, want none", tools)
+	}
+	if _, ok := d.(interface{ Preflight(context.Context) error }); ok {
+		t.Fatalf("noTools must not implement Preflight")
+	}
+}
+
+func TestLoadMCPDispatcherParsesRequired(t *testing.T) {
+	tests := []struct {
+		name         string
+		serverConfig string
+		wantRequired bool
+	}{
+		{name: "required", serverConfig: `{"url":"http://sp.test/mcp","required":true}`, wantRequired: true},
+		{name: "defaults optional", serverConfig: `{"url":"http://sp.test/mcp"}`, wantRequired: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			p := writeMCPConfig(t, `{"mcpServers":{"sp":`+tt.serverConfig+`}}`)
+			d, err := loadMCPDispatcher(p)
+			if err != nil {
+				t.Fatal(err)
+			}
+			md, ok := d.(*mcpDispatcher)
+			if !ok {
+				t.Fatalf("dispatcher = %T, want *mcpDispatcher", d)
+			}
+			if len(md.servers) != 1 {
+				t.Fatalf("server count = %d, want 1", len(md.servers))
+			}
+			if got := md.servers[0].required; got != tt.wantRequired {
+				t.Fatalf("required = %v, want %v", got, tt.wantRequired)
+			}
+		})
 	}
 }
 
@@ -311,30 +380,134 @@ func TestMCPDispatcherSkipsFailedServers(t *testing.T) {
 	}
 }
 
-func TestMCPDispatcherLogsErrorWhenConfiguredServersLoadZeroTools(t *testing.T) {
+func TestMCPDispatcherRequiredFailureIsError(t *testing.T) {
 	tests := []struct {
-		name string
-		mock *mockMCP
+		name       string
+		newHost    func() *mcpHost
+		wantReason string
 	}{
-		{name: "all fail", mock: &mockMCP{failList: true}},
-		{name: "empty list", mock: &mockMCP{}},
+		{
+			name:       "connection refused",
+			newHost:    func() *mcpHost { return newUnreachableMCPHost("weave-dispatch", true) },
+			wantReason: "connection refused",
+		},
+		{
+			name: "initialize JSON-RPC error",
+			newHost: func() *mcpHost {
+				return newMockMCPHostRequired("weave-dispatch", &mockMCP{failInitialize: true}, nil, true)
+			},
+			wantReason: "initialize failed",
+		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			logs := captureSlog(t)
+			captureSlog(t)
+			d := &mcpDispatcher{servers: []*mcpHost{
+				tt.newHost(),
+				newMockMCPHost("healthy", &mockMCP{tools: []contract.ToolDef{{Name: "healthy_tool"}}}, nil),
+			}}
+			_, err := d.ListTools(context.Background())
+			assertMCPServerError(t, err, "weave-dispatch", tt.wantReason)
+			if d.listed {
+				t.Fatal("failed listing must not be cached")
+			}
 
-			d := &mcpDispatcher{servers: []*mcpHost{newMockMCPHost("empty", tt.mock, nil)}}
-			tools, err := d.ListTools(context.Background())
-			if err != nil {
-				t.Fatal(err)
+			preflight, ok := any(d).(interface{ Preflight(context.Context) error })
+			if !ok {
+				t.Fatal("mcpDispatcher must implement Preflight")
 			}
-			if len(tools) != 0 {
-				t.Fatalf("tools = %+v, want none", tools)
-			}
-			if got := logs.String(); !strings.Contains(got, "level=ERROR") || !strings.Contains(got, "loaded zero tools") {
-				t.Fatalf("logs missing zero-tools error: %s", got)
-			}
+			assertMCPServerError(t, preflight.Preflight(context.Background()), "weave-dispatch", tt.wantReason)
 		})
+	}
+}
+
+func TestMCPDispatcherSkipsUnreachableOptionalServerWhenAnotherLoads(t *testing.T) {
+	logs := captureSlog(t)
+	good := &mockMCP{tools: []contract.ToolDef{{Name: "lookup_part"}}}
+	d := &mcpDispatcher{servers: []*mcpHost{
+		newUnreachableMCPHost("optional", false),
+		newMockMCPHost("healthy", good, nil),
+	}}
+
+	tools, err := d.ListTools(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(tools) != 1 || tools[0].Name != "lookup_part" {
+		t.Fatalf("tools = %+v, want only lookup_part", tools)
+	}
+	if got := logs.String(); !strings.Contains(got, "server skipped") || !strings.Contains(got, "optional") {
+		t.Fatalf("logs missing skipped optional server: %s", got)
+	}
+}
+
+func TestMCPDispatcherAllOptionalServersFailedIsError(t *testing.T) {
+	captureSlog(t)
+	d := &mcpDispatcher{servers: []*mcpHost{
+		newUnreachableMCPHost("one", false),
+		newUnreachableMCPHost("two", false),
+	}}
+
+	_, err := d.ListTools(context.Background())
+	if err == nil {
+		t.Fatal("want error when all configured servers fail")
+	}
+	for _, want := range []string{"all configured MCP servers failed", "one", "two", "connection refused"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("error = %q, want substring %q", err, want)
+		}
+	}
+	if d.listed {
+		t.Fatal("all-failed listing must not be cached")
+	}
+}
+
+func TestMCPDispatcherLoadedEmptyServersAreNotAllFailed(t *testing.T) {
+	logs := captureSlog(t)
+	d := &mcpDispatcher{servers: []*mcpHost{
+		newMockMCPHostRequired("required-empty", &mockMCP{}, nil, true),
+		newMockMCPHost("optional-empty", &mockMCP{}, nil),
+	}}
+
+	tools, err := d.ListTools(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(tools) != 0 {
+		t.Fatalf("tools = %+v, want none", tools)
+	}
+	if got := logs.String(); !strings.Contains(got, "level=ERROR") || !strings.Contains(got, "loaded zero tools") {
+		t.Fatalf("logs missing zero-tools error: %s", got)
+	}
+}
+
+func TestMCPDispatcherFailureIsRetried(t *testing.T) {
+	captureSlog(t)
+	mock := &mockMCP{tools: []contract.ToolDef{{Name: "recovered"}}, failList: true}
+	d := &mcpDispatcher{servers: []*mcpHost{newMockMCPHost("recovering", mock, nil)}}
+
+	if _, err := d.ListTools(context.Background()); err == nil {
+		t.Fatal("want initial all-failed error")
+	}
+	mock.failList = false
+	tools, err := d.ListTools(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(tools) != 1 || tools[0].Name != "recovered" {
+		t.Fatalf("tools = %+v, want recovered", tools)
+	}
+}
+
+func assertMCPServerError(t *testing.T, err error, server, reason string) {
+	t.Helper()
+	if err == nil {
+		t.Fatalf("want error for server %q", server)
+	}
+	for _, want := range []string{`required server "` + server + `" failed`, reason} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("error = %q, want substring %q", err, want)
+		}
 	}
 }

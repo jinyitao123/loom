@@ -236,6 +236,35 @@ func TestResolveMCPPath(t *testing.T) {
 	}
 }
 
+func TestRunCmdMCPPreflightFailureEmitsFailedBeforeSession(t *testing.T) {
+	p := writeMCPConfig(t, `{"mcpServers":{"weave-dispatch":{"url":"http://[::1","required":true}}}`)
+	var buf bytes.Buffer
+
+	exit := runCmdIO(
+		[]string{"--model", "test", "--mcp-config", p},
+		strings.NewReader(`{"instruction":"dispatch work"}`),
+		&buf,
+		envFunc(map[string]string{"LOOM_BASE_URL": "http://llm.invalid", "LOOM_API_KEY": "test"}),
+	)
+	if exit != 1 {
+		t.Fatalf("exit = %d, want 1", exit)
+	}
+	lines := parseLines(t, &buf)
+	if hasType(lines, "session_init") {
+		t.Fatalf("preflight failure must happen before session_init: %v", lines)
+	}
+	if len(lines) != 2 {
+		t.Fatalf("events = %v, want error + result only", lines)
+	}
+	message, _ := lines[0]["message"].(string)
+	if lines[0]["type"] != "error" || !strings.Contains(message, `mcp preflight: required server "weave-dispatch" failed:`) {
+		t.Fatalf("first event = %v, want mcp preflight error", lines[0])
+	}
+	if lines[1]["type"] != "result" || lines[1]["status"] != "failed" {
+		t.Fatalf("last event = %v, want failed result", lines[1])
+	}
+}
+
 func TestRunAgentGeneratesSessionIdWhenNoResume(t *testing.T) {
 	var buf bytes.Buffer
 	llm := &fakeLLM{responses: []contract.ChatResponse{{Content: "hi"}}}

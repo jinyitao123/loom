@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jinyitao123/loom"
@@ -407,6 +408,14 @@ func runCmdIO(args []string, stdin io.Reader, stdout io.Writer, getenv func(stri
 	tools, err := loadMCPDispatcher(resolveMCPPath(cfg.mcpConfig, cfg.cwd))
 	if err != nil {
 		return fail(err.Error())
+	}
+	if preflight, ok := tools.(interface{ Preflight(context.Context) error }); ok {
+		preflightCtx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+		err := preflight.Preflight(preflightCtx)
+		cancel()
+		if err != nil {
+			return fail("mcp preflight: " + err.Error())
+		}
 	}
 	spec, err := loadAgentSpec(resolveCwdFile(cfg.agentConfig, cfg.cwd, ".loom-agent.json"))
 	if err != nil {
