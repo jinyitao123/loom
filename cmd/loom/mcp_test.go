@@ -120,13 +120,13 @@ func (m *mockMCP) handler() http.HandlerFunc {
 		switch method {
 		case "initialize":
 			if m.failInitialize {
-				json.NewEncoder(w).Encode(map[string]any{
+				_ = json.NewEncoder(w).Encode(map[string]any{
 					"jsonrpc": "2.0", "id": id,
 					"error": map[string]any{"code": -32000, "message": "initialize failed"},
 				})
 				return
 			}
-			json.NewEncoder(w).Encode(map[string]any{
+			_ = json.NewEncoder(w).Encode(map[string]any{
 				"jsonrpc": "2.0", "id": id,
 				"result": map[string]any{
 					"protocolVersion": "2024-11-05",
@@ -138,20 +138,20 @@ func (m *mockMCP) handler() http.HandlerFunc {
 			w.WriteHeader(http.StatusAccepted)
 		case "tools/list":
 			if m.failList {
-				json.NewEncoder(w).Encode(map[string]any{
+				_ = json.NewEncoder(w).Encode(map[string]any{
 					"jsonrpc": "2.0", "id": id,
 					"error": map[string]any{"code": -32000, "message": "list failed"},
 				})
 				return
 			}
-			json.NewEncoder(w).Encode(map[string]any{
+			_ = json.NewEncoder(w).Encode(map[string]any{
 				"jsonrpc": "2.0", "id": id,
 				"result": map[string]any{"tools": m.tools},
 			})
 		case "tools/call":
 			_ = json.Unmarshal(raw["params"], &m.lastCall)
 			name, _ := m.lastCall["name"].(string)
-			json.NewEncoder(w).Encode(map[string]any{
+			_ = json.NewEncoder(w).Encode(map[string]any{
 				"jsonrpc": "2.0", "id": id,
 				"result": map[string]any{
 					"content": []map[string]any{{"type": "text", "text": "ran " + name}},
