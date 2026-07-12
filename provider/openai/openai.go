@@ -79,6 +79,10 @@ type oaiRequest struct {
 	Stream         bool               `json:"stream,omitempty"`
 	StreamOptions  *oaiStreamOptions  `json:"stream_options,omitempty"`
 	ResponseFormat *oaiResponseFormat `json:"response_format,omitempty"`
+	// ReasoningEffort maps contract.ChatRequest.Effort for reasoning models
+	// (gpt-5.x / o-series). Omitted when unset; models that don't support the
+	// parameter reject it, so callers opt in per request.
+	ReasoningEffort string `json:"reasoning_effort,omitempty"`
 }
 
 type oaiResponseFormat struct {
@@ -189,11 +193,12 @@ func (c *Client) buildTools(tools []contract.ToolDef) []oaiTool {
 // Chat implements contract.LLM.
 func (c *Client) Chat(ctx context.Context, req contract.ChatRequest) (*contract.ChatResponse, error) {
 	oaiReq := oaiRequest{
-		Model:       c.resolveModel(req.Model),
-		Messages:    c.buildMessages(req.Messages),
-		Tools:       c.buildTools(req.Tools),
-		MaxTokens:   req.MaxTokens,
-		Temperature: req.Temperature,
+		Model:           c.resolveModel(req.Model),
+		Messages:        c.buildMessages(req.Messages),
+		Tools:           c.buildTools(req.Tools),
+		MaxTokens:       req.MaxTokens,
+		Temperature:     req.Temperature,
+		ReasoningEffort: string(req.Effort),
 	}
 	if req.Schema != nil {
 		if c.jsonObjectMode {
@@ -289,13 +294,14 @@ type oaiStreamChunk struct {
 // Stream implements contract.LLM with SSE streaming.
 func (c *Client) Stream(ctx context.Context, req contract.ChatRequest) (<-chan contract.StreamChunk, error) {
 	oaiReq := oaiRequest{
-		Model:         c.resolveModel(req.Model),
-		Messages:      c.buildMessages(req.Messages),
-		Tools:         c.buildTools(req.Tools),
-		MaxTokens:     req.MaxTokens,
-		Temperature:   req.Temperature,
-		Stream:        true,
-		StreamOptions: &oaiStreamOptions{IncludeUsage: true},
+		Model:           c.resolveModel(req.Model),
+		Messages:        c.buildMessages(req.Messages),
+		Tools:           c.buildTools(req.Tools),
+		MaxTokens:       req.MaxTokens,
+		Temperature:     req.Temperature,
+		ReasoningEffort: string(req.Effort),
+		Stream:          true,
+		StreamOptions:   &oaiStreamOptions{IncludeUsage: true},
 	}
 	if req.Schema != nil {
 		if c.jsonObjectMode {

@@ -2,6 +2,7 @@ package openai
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -31,6 +32,34 @@ func TestDefaultChatPath(t *testing.T) {
 	}
 	if path != "/v1/chat/completions" {
 		t.Fatalf("default path = %q, want /v1/chat/completions", path)
+	}
+}
+
+func TestEffortForwarded(t *testing.T) {
+	var body map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body = map[string]any{} // fresh per request: Decode into a reused map keeps stale keys
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Errorf("decode request: %v", err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1}}`))
+	}))
+	defer srv.Close()
+
+	c := New("k", WithBaseURL(srv.URL))
+	if _, err := c.Chat(context.Background(), contract.ChatRequest{Model: "m", Effort: contract.EffortLow}); err != nil {
+		t.Fatal(err)
+	}
+	if got := body["reasoning_effort"]; got != "low" {
+		t.Fatalf("reasoning_effort = %v, want low", got)
+	}
+
+	if _, err := c.Chat(context.Background(), contract.ChatRequest{Model: "m"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, present := body["reasoning_effort"]; present {
+		t.Fatal("reasoning_effort should be omitted when Effort is unset")
 	}
 }
 
