@@ -34,6 +34,14 @@ Loom's design principle is the inverse: **the kernel is small enough to read in 
 
 This is more than an engineering aesthetic. A kernel you can read is a kernel you can **govern**. Because an agent in Loom is a graph of explicit steps over an inspectable `State` — not a loose prompt loop — its execution is **deterministic and replayable**. And you can only safely hold someone accountable for what you can foresee and reconstruct. That property is the precondition for putting an agent to real work under human oversight: a steady, legible hand is the thing a governance layer can actually hold onto. [Weave](https://github.com/jinyitao123/Weave) is that layer — it builds the write-approval gate, the audit trail, and the addressable runtime on top of this kernel. Loom makes the hand steady; Weave decides which of its acts may reach the world.
 
+## The control flow is data, not a guess
+
+Most agent frameworks run a **prompt loop**: the model re-decides, every turn, what to do next. Flexible — but you can't foresee the path and you can't replay it; the same input can take two different routes.
+
+In Loom the control flow is a **Graph** — an explicit structure of steps and routers, fixed *before* the run, not improvised during it. The graph owns the **how** (what runs, in what order); the prompt only supplies the **what** (the content, and the criteria for "good"). That single separation is what makes a Loom agent deterministic and replayable: same graph, same state, same path — with every step checkpointed, so you can reconstruct exactly what happened.
+
+And because the flow is a *structure*, not a script, it is also **data**. A graph can be written in Go, or compiled from an agent spec that carries no code (`cmd/loom` does exactly this). Tools can then treat an agent as a versioned, diffable, portable document — while its execution stays exactly as predictable. That is the line between an agent you can put to supervised, consequential work and a chatbot that improvises: when a wrong turn can't be undone, you want the path decided, inspectable, and repeatable — you want a graph.
+
 ## 30-Second Quickstart
 
 ```go
