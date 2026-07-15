@@ -32,6 +32,8 @@ Most frameworks are feature-complete — tens of thousands of lines, rich abstra
 
 Loom's design principle is the inverse: **the kernel is small enough to read in an afternoon.** Not because it does less, but because a mature, complex system must have a lean core. Complexity should emerge from composition, not be pre-baked into the framework.
 
+This is more than an engineering aesthetic. A kernel you can read is a kernel you can **govern**. Because an agent in Loom is a graph of explicit steps over an inspectable `State` — not a loose prompt loop — its execution is **deterministic and replayable**. And you can only safely hold someone accountable for what you can foresee and reconstruct. That property is the precondition for putting an agent to real work under human oversight: a steady, legible hand is the thing a governance layer can actually hold onto. [Weave](https://github.com/jinyitao123/Weave) is that layer — it builds the write-approval gate, the audit trail, and the addressable runtime on top of this kernel. Loom makes the hand steady; Weave decides which of its acts may reach the world.
+
 ## 30-Second Quickstart
 
 ```go
