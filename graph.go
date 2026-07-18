@@ -174,14 +174,31 @@ func resolveRunID(input State) string {
 func (g *Graph) Run(ctx context.Context, input State, store Store) (*RunResult, error) {
 	runID := resolveRunID(input) // 沿用或生成运行标识：整个运行（含后续 Resume）共用同一 ID
 
-	// Initialize global step budget if set on this graph (root only).
-	// 仅根图初始化全局预算：把初值装进 atomic 计数器并挂到 context 上；
-	// 子图（以及 withEntry 拷贝）经 context 自动继承同一个计数器，
-	// 从而构成与 maxIter 并行的第二层熔断——跨子图共享、总量受控。
-	if g.stepBudget != nil {
-		remaining := atomic.Int64{}
-		remaining.Store(*g.stepBudget)                        // 装入预算初值
-		ctx = context.WithValue(ctx, budgetKey{}, &remaining) // 存指针：所有子图递减的是同一个计数器
+	// Load the global step budget exactly once, in context > persisted state > graph option order.
+	// 全局预算只装载一次，优先级固定为 context > 持久化余额 > 图配置初值：父图 context
+	// 中的共享计数器永远压过子图状态，避免产生第二个计数器；全新 context 的 Resume/ResumeAt
+	// 则从 __budget_remaining 恢复余额而非初值，绝不因恢复而重置扩容。只有全新根图运行既无
+	// context 计数器、状态也无余额时，才使用 g.stepBudget 配置初值。
+	if _, ok := ctx.Value(budgetKey{}).(*atomic.Int64); !ok {
+		var initial int64
+		var fromState bool
+		switch value := input["__budget_remaining"].(type) {
+		case int64:
+			initial, fromState = value, true
+		case int:
+			initial, fromState = int64(value), true
+		case float64:
+			initial, fromState = int64(value), true
+		}
+		if fromState {
+			remaining := atomic.Int64{}
+			remaining.Store(initial)                              // 恢复检查点余额；0 也是有效值，下一步立即 StopBudget
+			ctx = context.WithValue(ctx, budgetKey{}, &remaining) // 存指针：后续父子图递减同一个计数器
+		} else if g.stepBudget != nil {
+			remaining := atomic.Int64{}
+			remaining.Store(*g.stepBudget)                        // 全新根图才装入配置初值
+			ctx = context.WithValue(ctx, budgetKey{}, &remaining) // 存指针：所有子图递减的是同一个计数器
+		}
 	}
 
 	state := input // 直接以输入为初始状态（后续 Merge 每次都产出新 map，不会回写 input 之外的内容）
@@ -313,7 +330,8 @@ func (g *Graph) Resume(ctx context.Context, runID string, input State, store Sto
 		return nil, fmt.Errorf("loom: corrupt checkpoint for run %s: %w", runID, err)
 	}
 
-	// 恢复现场：以检查点快照为底、人工输入为增量做合并——人工反馈按正常合并语义并入状态。
+	// 恢复现场：以检查点快照为底、人工输入为增量做合并——人工反馈按正常合并语义并入状态；
+	// 随快照落盘的 __budget_remaining 会在下方 Run 中为全新 context 重新装载共享计数器。
 	state := cp.State.Merge(input, g.mergeConfig)
 	state["__run_id"] = runID // 显式回写运行标识：后续 Run 沿用同一 ID，检查点继续覆盖同一键
 
@@ -348,7 +366,8 @@ func (g *Graph) Resume(ctx context.Context, runID string, input State, store Sto
 // ResumeAt forks a new run from an immutable historical checkpoint.
 // ResumeAt 从任意历史检查点分叉出全新运行：读取源快照但只向新 UUID 写检查点，源存档树绝不改写。
 // 与 Resume 的 v1.0 兼容语义不同，空 yield phase 在这里按 after_step 处理；历史条目记录的是步骤完成
-// 后的状态，若按 mid_step 重跑原步骤，外部副作用与状态增量都可能重复发生。
+// 后的状态，若按 mid_step 重跑原步骤，外部副作用与状态增量都可能重复发生。fork 默认继承源快照
+// 在分叉点的 __budget_remaining；宿主可在 input 中显式提供同名键，借由下方 Merge 覆盖该余额。
 func (g *Graph) ResumeAt(ctx context.Context, runID string, seq int64, input State, store Store) (*RunResult, error) {
 	historyKey := fmt.Sprintf("%s/%012d", runID, seq) // 零填充格式与 doCheckpoint 的历史键协议完全一致
 	data, err := store.Get(ctx, "checkpoint:"+g.Name, historyKey)
@@ -458,6 +477,11 @@ func (g *Graph) doCheckpoint(ctx context.Context, store Store, runID, step strin
 	}
 	seq++
 	state["__seq"] = seq // 先写回状态再序列化，确保 cp.State 与 cp.Seq 始终一致
+	// 预算在步骤执行前已扣减；仅当本次运行确有共享计数器时才把扣减后余额写入同一份快照。
+	// 未启用预算的图不创建协议键，保持既有状态与检查点零污染。
+	if budget, ok := ctx.Value(budgetKey{}).(*atomic.Int64); ok {
+		state["__budget_remaining"] = budget.Load()
+	}
 
 	// fork 溯源键随 State 跨后续 Resume 传播；ParentSeq 同样兼容 JSON 的 float64 数字表示。
 	parentRun, _ := state["__parent_run"].(string)
@@ -532,11 +556,11 @@ func (g *Graph) doCheckpoint(ctx context.Context, store Store, runID, step strin
 
 // withEntry creates a shallow copy of the graph with a different entry point.
 // The copy shares steps, routers, hooks, and mergeConfig but does NOT
-// re-initialize the step budget (budget is inherited via context).
+// re-initialize the configured step budget (the balance comes from context or persisted state).
 // withEntry 以不同入口浅拷贝出一个图，供 Resume 从任意步骤重入。
-// 关键取舍：stepBudget 置 nil 而非复制——预算早在根图 Run 时装入了 context，
-// 拷贝若再带预算，Run 会重新初始化计数器、把已消耗的额度清零，等于绕过全局熔断；
-// 置 nil 后拷贝图经 context 继承根图的同一个计数器，预算跨恢复持续生效。
+// 关键取舍：stepBudget 置 nil 而非复制——同一调用链从父图 context 继承原计数器；跨进程或
+// 新请求的 Resume/ResumeAt 则由检查点状态恢复余额。若拷贝配置初值，缺少余额的旧快照可能
+// 在恢复时重新扩容，等于绕过全局熔断；置 nil 与“恢复余额而非初值”的协议共同防止重置额度。
 func (g *Graph) withEntry(newEntry string) *Graph {
 	return &Graph{
 		Name:             g.Name,             // 图名不变：检查点仍写同一命名空间
@@ -548,6 +572,6 @@ func (g *Graph) withEntry(newEntry string) *Graph {
 		checkpointPolicy: g.checkpointPolicy, // 沿用检查点失败策略
 		historyKeep:      g.historyKeep,      // 沿用历史保留策略，Resume/fork 后继续追加同一配置的链
 		maxIter:          g.maxIter,          // 沿用单图熔断上限（Resume 后步数从 0 重新计）
-		stepBudget:       nil,                // 刻意不复制预算：预算经 context 继承，避免重复初始化重置额度
+		stepBudget:       nil,                // 刻意不复制初值：预算经 context 继承或从快照余额恢复，禁止重置扩容
 	}
 }
