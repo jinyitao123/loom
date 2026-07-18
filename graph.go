@@ -27,6 +27,7 @@ type Graph struct {
 	// mergeConfig：合并配置，挂到图上即被 NewGraph 冻结，保证运行期合并语义稳定。
 	mergeConfig      *MergeConfig
 	checkpointPolicy CheckpointPolicy // 检查点失败策略：尽力而为（默认）或强制落盘
+	historyKeep      int              // 按步历史保留数：0=关闭，-1=全留，正数=保留最近 N 条
 	maxIter          int              // 单图迭代上限：第一层熔断（默认 100）
 	// stepBudget：全局步数预算初值，第二层熔断；nil 表示未启用，仅根图设置，
 	// 运行时装入 atomic 计数器并经 context 传给所有子图共享。
@@ -64,16 +65,28 @@ type RunResult struct {
 }
 
 // checkpoint 是落盘到 Store 的检查点结构：一步执行并合并之后的自洽快照。
-// 存储位置：命名空间 "checkpoint:"+Graph、键为 RunID——同一运行只保留最新一份，覆盖写。
+// latest 位于键 RunID；启用历史后，同一份字节还会追加到 RunID/零填充序号，形成只增不改的存档链。
 type checkpoint struct {
-	RunID    string `json:"run_id"`    // 运行标识（__run_id），检查点主键
-	Graph    string `json:"graph"`     // 图名，冗余记录便于排障
-	LastStep string `json:"last_step"` // 快照对应的步骤名：Resume 由此决定从哪一步重入
-	State    State  `json:"state"`     // 合并后的完整状态快照（自洽，可独立恢复现场）
+	RunID     string `json:"run_id"`               // 运行标识（__run_id），latest 检查点主键
+	Graph     string `json:"graph"`                // 图名，冗余记录便于排障
+	Seq       int64  `json:"seq"`                  // 步序号：从 1 起，由 State 携带并跨 Resume/fork 连续
+	ParentRun string `json:"parent_run,omitempty"` // fork 溯源：源 runID；非 fork 运行为空
+	ParentSeq int64  `json:"parent_seq,omitempty"` // fork 溯源：源运行的历史步序号
+	LastStep  string `json:"last_step"`            // 快照对应的步骤名：Resume 由此决定从哪一步重入
+	State     State  `json:"state"`                // 合并后的完整状态快照（自洽，可独立恢复现场）
 	// YieldPhase：暂停阶段协议——"mid_step"=恢复时重跑该步骤；"after_step"=恢复时跳过该步骤直接走路由；
 	// 空串兼容 v1.0 旧检查点（按 mid_step 处理）。
 	YieldPhase string    `json:"yield_phase"`
 	SavedAt    time.Time `json:"saved_at"` // 落盘时间戳，便于审计与过期清理
+}
+
+// CheckpointInfo is the public metadata view of one historical checkpoint.
+// CheckpointInfo 是单条历史检查点的公开元数据视图：不暴露完整 State，供列表与审计使用。
+type CheckpointInfo struct {
+	Seq        int64     `json:"seq"`                   // 步序号：History 按此对应的零填充键升序返回
+	LastStep   string    `json:"last_step"`             // 该快照完成（或暂停于）的步骤名
+	YieldPhase string    `json:"yield_phase,omitempty"` // 暂停阶段；普通步骤完成快照为空
+	SavedAt    time.Time `json:"saved_at"`              // 检查点成功写入 latest 前生成的时间戳
 }
 
 // budgetKey 是 context 中存放全局步数预算的私有键类型：
@@ -286,6 +299,8 @@ func (g *Graph) Run(ctx context.Context, input State, store Store) (*RunResult, 
 // Resume 从检查点恢复一次已暂停（HITL）的运行：
 // 读检查点 → 把人工提供的 input 增量合并进快照状态 → 按 yield_phase 决定重入方式
 // （mid_step=重跑暂停的那一步；after_step=跳过该步直接走它的路由）。
+// 兼容差异：Resume 对空 phase 按 mid_step 处理，因为 v1.0 latest 表示“暂停中”的恢复点；
+// ResumeAt 则对空 phase 按 after_step 处理，因为历史条目是步骤完成后的快照，重跑会造成双重作用。
 func (g *Graph) Resume(ctx context.Context, runID string, input State, store Store) (*RunResult, error) {
 	// 按 runID 读取检查点：命名空间与 Run 落盘时一致（"checkpoint:"+图名）。
 	data, err := store.Get(ctx, "checkpoint:"+g.Name, runID)
@@ -330,6 +345,96 @@ func (g *Graph) Resume(ctx context.Context, runID string, input State, store Sto
 	}
 }
 
+// ResumeAt forks a new run from an immutable historical checkpoint.
+// ResumeAt 从任意历史检查点分叉出全新运行：读取源快照但只向新 UUID 写检查点，源存档树绝不改写。
+// 与 Resume 的 v1.0 兼容语义不同，空 yield phase 在这里按 after_step 处理；历史条目记录的是步骤完成
+// 后的状态，若按 mid_step 重跑原步骤，外部副作用与状态增量都可能重复发生。
+func (g *Graph) ResumeAt(ctx context.Context, runID string, seq int64, input State, store Store) (*RunResult, error) {
+	historyKey := fmt.Sprintf("%s/%012d", runID, seq) // 零填充格式与 doCheckpoint 的历史键协议完全一致
+	data, err := store.Get(ctx, "checkpoint:"+g.Name, historyKey)
+	if err != nil {
+		// Store 的具体未找到错误不稳定；对外统一包裹内核哨兵，调用方可用 errors.Is 分支。
+		return nil, fmt.Errorf("loom: checkpoint not found for run %s at seq %d: %w (%v)",
+			runID, seq, ErrCheckpointNotFound, err)
+	}
+	var cp checkpoint
+	if err := json.Unmarshal(data, &cp); err != nil {
+		// 历史键存在但内容不可解析即视为损坏；不得从不可信快照启动新分支。
+		return nil, fmt.Errorf("loom: corrupt checkpoint for run %s at seq %d: %w (%v)",
+			runID, seq, ErrCorruptCheckpoint, err)
+	}
+
+	// fork 现场以源快照为底合并调用方输入，然后强制覆盖三个身份/溯源协议键：
+	// 新运行绝不复用源 runID；__seq 保留在合并状态中，使首次 fork 检查点从源 seq+1 续编。
+	newID := uuid.New().String()
+	state := cp.State.Merge(input, g.mergeConfig)
+	state["__run_id"] = newID
+	state["__parent_run"] = runID
+	state["__parent_seq"] = seq
+
+	if cp.YieldPhase == "mid_step" {
+		// 显式 mid_step 表示步骤尚未完成：从原步骤重入，让它消费 fork 输入并重跑。
+		return g.withEntry(cp.LastStep).Run(ctx, state, store)
+	}
+
+	// 其余 phase（包括空串与 after_step）均把历史节点视为“该步骤已完成”，直接执行其路由。
+	router := g.routers[cp.LastStep]
+	if router == nil {
+		// 源节点没有出边即为终端：fork 已创建身份，但没有新步骤需要执行，因此不产生新检查点。
+		return &RunResult{
+			State: state, LastStep: cp.LastStep, RunID: newID, StopReason: StopCompleted,
+		}, nil
+	}
+	nextStep, err := router(ctx, state)
+	if err != nil {
+		return &RunResult{
+			State: state, LastStep: cp.LastStep, RunID: newID, StopReason: StopError,
+		}, err
+	}
+	if nextStep == "" {
+		// 路由器显式返回空串同样是正常完成，不执行任何源步骤，也不落 fork 检查点。
+		return &RunResult{
+			State: state, LastStep: cp.LastStep, RunID: newID, StopReason: StopCompleted,
+		}, nil
+	}
+	return g.withEntry(nextStep).Run(ctx, state, store) // 后续所有写入由新 __run_id 隔离到 fork 存档树
+}
+
+// History lists valid historical checkpoint metadata for a run in ascending step order.
+// History 列出某次运行的有效历史元数据：依赖 Store.List 的字典序契约与零填充键，天然按步升序返回。
+// 单条键读取失败或 JSON 损坏只记 Warn 并跳过，不能让局部坏档阻断其余历史的审计与恢复。
+func (g *Graph) History(ctx context.Context, store Store, runID string) ([]CheckpointInfo, error) {
+	if store == nil {
+		return nil, fmt.Errorf("loom: checkpoint history requires a non-nil store")
+	}
+	ns := "checkpoint:" + g.Name
+	keys, err := store.List(ctx, ns, runID+"/")
+	if err != nil {
+		return nil, fmt.Errorf("loom: list checkpoint history for run %s: %w", runID, err)
+	}
+
+	history := make([]CheckpointInfo, 0, len(keys))
+	for _, key := range keys {
+		data, err := store.Get(ctx, ns, key)
+		if err != nil {
+			// List 与 Get 之间可能发生并发淘汰；把这种单条读取失败按损坏条目同样尽力跳过。
+			slog.Warn("loom: checkpoint history entry unreadable",
+				"graph", g.Name, "run_id", runID, "key", key, "error", err)
+			continue
+		}
+		var cp checkpoint
+		if err := json.Unmarshal(data, &cp); err != nil {
+			slog.Warn("loom: corrupt checkpoint history entry skipped",
+				"graph", g.Name, "run_id", runID, "key", key, "error", err)
+			continue
+		}
+		history = append(history, CheckpointInfo{
+			Seq: cp.Seq, LastStep: cp.LastStep, YieldPhase: cp.YieldPhase, SavedAt: cp.SavedAt,
+		})
+	}
+	return history, nil
+}
+
 // doCheckpoint handles persistence with configurable policy.
 // doCheckpoint 按配置策略把当前执行现场落成检查点。
 // 两种策略的取舍：CheckpointRequired 落盘失败即中止（保可恢复性，宁停不丢恢复点）；
@@ -339,10 +444,40 @@ func (g *Graph) doCheckpoint(ctx context.Context, store Store, runID, step strin
 	if store == nil {
 		return nil
 	}
-	// 组装检查点：完整状态 + 步骤位置 + 暂停阶段 + 时间戳，构成可独立恢复的自洽快照。
+
+	// 序号由 State 携带而非 Graph 内存字段，因而 JSON Resume 与 ResumeAt fork 都会自动续编；
+	// int/float64 兼容调用方直接构造状态及 JSON 往返后数字被解码成 float64 的两种来源。
+	var seq int64
+	switch value := state["__seq"].(type) {
+	case int64:
+		seq = value
+	case int:
+		seq = int64(value)
+	case float64:
+		seq = int64(value)
+	}
+	seq++
+	state["__seq"] = seq // 先写回状态再序列化，确保 cp.State 与 cp.Seq 始终一致
+
+	// fork 溯源键随 State 跨后续 Resume 传播；ParentSeq 同样兼容 JSON 的 float64 数字表示。
+	parentRun, _ := state["__parent_run"].(string)
+	var parentSeq int64
+	switch value := state["__parent_seq"].(type) {
+	case int64:
+		parentSeq = value
+	case int:
+		parentSeq = int64(value)
+	case float64:
+		parentSeq = int64(value)
+	}
+
+	// 组装检查点：完整状态 + 序号/溯源 + 步骤位置 + 暂停阶段 + 时间戳，构成可独立恢复的自洽快照。
 	cp := checkpoint{
 		RunID:      runID,
 		Graph:      g.Name,
+		Seq:        seq,
+		ParentRun:  parentRun,
+		ParentSeq:  parentSeq,
 		LastStep:   step,
 		State:      state,
 		YieldPhase: yieldPhase,
@@ -368,7 +503,31 @@ func (g *Graph) doCheckpoint(ctx context.Context, store Store, runID, step strin
 			return nil
 		}
 	}
-	return nil // 落盘成功
+
+	// historyKeep=0 保持原有 latest-only 行为：不创建任何 runID/ 前缀键。
+	if g.historyKeep == 0 {
+		return nil
+	}
+	historyKey := fmt.Sprintf("%s/%012d", runID, seq) // 固定宽度使 List 字典序与步序完全一致
+	if err := store.Put(ctx, "checkpoint:"+g.Name, historyKey, data); err != nil {
+		// 历史是审计增强而非关键恢复指针：失败一律 Warn，CheckpointRequired 也不得因此中止运行。
+		slog.Warn("loom: checkpoint history write failed (best-effort)",
+			"graph", g.Name, "run_id", runID, "seq", seq, "error", err)
+		return nil
+	}
+
+	// 正数保留窗口在成功追加后淘汰恰好滑出窗口的旧键；Delete 幂等且失败不影响 latest/新历史。
+	if g.historyKeep > 0 {
+		evictSeq := seq - int64(g.historyKeep)
+		if evictSeq >= 1 {
+			evictKey := fmt.Sprintf("%s/%012d", runID, evictSeq)
+			if err := store.Delete(ctx, "checkpoint:"+g.Name, evictKey); err != nil {
+				slog.Warn("loom: checkpoint history eviction failed (best-effort)",
+					"graph", g.Name, "run_id", runID, "seq", evictSeq, "error", err)
+			}
+		}
+	}
+	return nil // latest 与本步历史均已落盘（淘汰为 best-effort）
 }
 
 // withEntry creates a shallow copy of the graph with a different entry point.
@@ -387,6 +546,7 @@ func (g *Graph) withEntry(newEntry string) *Graph {
 		hooks:            g.hooks,            // 共享钩子
 		mergeConfig:      g.mergeConfig,      // 共享已冻结的合并配置，保证合并语义一致
 		checkpointPolicy: g.checkpointPolicy, // 沿用检查点失败策略
+		historyKeep:      g.historyKeep,      // 沿用历史保留策略，Resume/fork 后继续追加同一配置的链
 		maxIter:          g.maxIter,          // 沿用单图熔断上限（Resume 后步数从 0 重新计）
 		stepBudget:       nil,                // 刻意不复制预算：预算经 context 继承，避免重复初始化重置额度
 	}

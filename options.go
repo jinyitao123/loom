@@ -44,6 +44,13 @@ func WithCheckpointPolicy(p CheckpointPolicy) GraphOption {
 	return func(g *Graph) { g.checkpointPolicy = p } // 覆盖默认的尽力而为策略
 }
 
+// WithCheckpointHistory configures optional per-step checkpoint history retention.
+// WithCheckpointHistory(keep) 配置可选的按步检查点历史：0=关闭（默认，保持 latest 覆盖写）；
+// -1=全部保留；n>0=只保留最近 n 条。历史写入始终是尽力而为，不改变 checkpointPolicy。
+func WithCheckpointHistory(keep int) GraphOption {
+	return func(g *Graph) { g.historyKeep = keep } // 原样保存保留策略：doCheckpoint 据此决定追加与淘汰
+}
+
 // WithMaxIterations 设置单图迭代上限（per-graph 熔断，默认 100），防止路由环路导致死循环。
 func WithMaxIterations(n int) GraphOption {
 	return func(g *Graph) { g.maxIter = n } // 覆盖 NewGraph 里的默认值 100
