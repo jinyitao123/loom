@@ -49,6 +49,22 @@ type ToolLoopOpts struct {
 	// Compaction：上下文压缩策略，nil 表示不做压缩。
 }
 
+// toolLoopPendingCall is the checkpoint-safe description of one parked tool call.
+// toolLoopPendingCall 是单个被暂停工具调用的检查点形态；工具名与参数来自原始 assistant tool_calls。
+type toolLoopPendingCall struct {
+	CallID  string `json:"call_id"`
+	Tool    string `json:"tool"`
+	Args    string `json:"args"`
+	ParkRef string `json:"park_ref"`
+}
+
+// resumedToolResult is the host-supplied real result for a previously parked call.
+// resumedToolResult 是宿主在批准或驳回后回灌的真实结果；驳回以 IsError=true 表达。
+type resumedToolResult struct {
+	Content string `json:"content"`
+	IsError bool   `json:"is_error"`
+}
+
 // NewToolLoopStep creates the LLM → tool call → result → LLM loop step.
 // NewToolLoopStep 构造 agent 的核心循环步骤：问 LLM → 若回复携带工具调用则执行 →
 // 把工具结果回填进消息历史 → 再问 LLM，如此往复，直到模型给出纯文本答案、
@@ -60,24 +76,77 @@ func NewToolLoopStep(llm contract.LLM, tools contract.ToolDispatcher, opts ToolL
 	}
 
 	return func(ctx context.Context, state loom.State) (loom.State, error) {
-		// 从状态取出会话消息历史；取不到属于协议错误，直接失败。
-		msgs, err := GetMessages(state)
+		pending, err := decodeToolLoopPending(state["__toolloop_pending"])
 		if err != nil {
 			return nil, err
 		}
+		resumedFromPark := len(pending) > 0
 
-		// Use __system_prompt from state if available, else fallback to opts.
-		// 系统提示词的优先级协议：状态键 __system_prompt（通常由上游提示词组装步骤写入）
-		// 覆盖静态配置 opts.SystemPrompt——这让提示词可以逐轮动态生成而无需改动本步骤。
-		systemPrompt := opts.SystemPrompt
-		if sp, ok := state["__system_prompt"].(string); ok && sp != "" {
-			systemPrompt = sp
-		}
+		var msgs []contract.Message
+		if resumedFromPark {
+			// Resume starts from the private full snapshot, never from "messages": compiler graphs append-merge
+			// that public key, which would duplicate the transcript. Checkpoint JSON may have erased Go types.
+			// 恢复只读取私有完整快照，绝不读取/写入会被 AppendSlice 合并的 messages；同时兼容 JSON 类型退化。
+			msgs, err = decodeToolLoopMessages(state["__toolloop_msgs"])
+			if err != nil {
+				return nil, err
+			}
+			resumedResults, err := decodeResumedToolResults(state["__resumed_tool_results"])
+			if err != nil {
+				return nil, err
+			}
 
-		// Prepend system prompt if configured.
-		// 仅当消息首位还没有 system 消息时才前插，避免与历史中已有的系统消息重复。
-		if systemPrompt != "" && (len(msgs) == 0 || msgs[0].Role != "system") {
-			msgs = append([]contract.Message{{Role: "system", Content: systemPrompt}}, msgs...)
+			remaining := make([]toolLoopPendingCall, 0, len(pending))
+			for _, call := range pending {
+				result, ok := resumedResults[call.CallID]
+				if !ok {
+					remaining = append(remaining, call)
+					continue
+				}
+				toolResult := contract.ToolResult{
+					CallID: call.CallID, Content: result.Content,
+					IsError: result.IsError, ToolName: call.Tool,
+				}
+				msgs = append(msgs, toolResult.AsMessage())
+			}
+
+			if len(remaining) > 0 {
+				return loom.State{
+					"__yield":                true,
+					"yield_type":             "await_approval",
+					"__toolloop_msgs":        msgs,
+					"__toolloop_pending":     remaining,
+					"__resumed_tool_results": nil,
+				}, nil
+			}
+
+			// Resume invariant: after the assistant tool_calls message, every call_id has exactly one real
+			// tool result. Approval and rejection both arrive as ToolResult (rejection uses IsError=true),
+			// never as injected system narration.
+			// 恢复不变量：assistant tool_calls 之后每个 call_id 恰有一条真实 tool 结果；批准与驳回都以
+			// ToolResult 回灌（驳回 IsError=true），绝不注入系统旁白。
+			// MaxIterations intentionally restarts here: a resumed run receives a fresh loop budget.
+			// MaxIterations 在恢复后从头重计：恢复后的 run 获得一份新的循环预算。
+		} else {
+			// 从状态取出会话消息历史；取不到属于协议错误，直接失败。
+			msgs, err = GetMessages(state)
+			if err != nil {
+				return nil, err
+			}
+
+			// Use __system_prompt from state if available, else fallback to opts.
+			// 系统提示词的优先级协议：状态键 __system_prompt（通常由上游提示词组装步骤写入）
+			// 覆盖静态配置 opts.SystemPrompt——这让提示词可以逐轮动态生成而无需改动本步骤。
+			systemPrompt := opts.SystemPrompt
+			if sp, ok := state["__system_prompt"].(string); ok && sp != "" {
+				systemPrompt = sp
+			}
+
+			// Prepend system prompt if configured.
+			// 仅当消息首位还没有 system 消息时才前插，避免与历史中已有的系统消息重复。
+			if systemPrompt != "" && (len(msgs) == 0 || msgs[0].Role != "system") {
+				msgs = append([]contract.Message{{Role: "system", Content: systemPrompt}}, msgs...)
+			}
 		}
 
 		// Cache tool list outside loop.
@@ -139,7 +208,7 @@ func NewToolLoopStep(llm contract.LLM, tools contract.ToolDispatcher, opts ToolL
 
 			// 模型没有再请求工具 ⇒ 任务在本轮完成，把文本答案与用量写入输出状态，正常收官。
 			if len(resp.ToolCalls) == 0 {
-				return SetOutput(resp.Content, resp.Usage), nil
+				return finishToolLoop(resp.Content, resp.Usage, resumedFromPark), nil
 			}
 
 			// Cycle detection: hash current tool call batch and compare to previous.
@@ -152,7 +221,7 @@ func NewToolLoopStep(llm contract.LLM, tools contract.ToolDispatcher, opts ToolL
 				if repeatCount >= maxRepeats {
 					slog.Warn("loom/toolloop: cycle detected, breaking",
 						"repeat_count", repeatCount, "batch_hash", batchHash[:8]) // 哈希只记前 8 位，够日志检索用
-					return SetOutput(resp.Content, resp.Usage), nil
+					return finishToolLoop(resp.Content, resp.Usage, resumedFromPark), nil
 				}
 			} else {
 				// 出现新的调用组合：更新基准签名，计数从 1 重新累计。
@@ -163,6 +232,33 @@ func NewToolLoopStep(llm contract.LLM, tools contract.ToolDispatcher, opts ToolL
 			// Dispatch with hooks and read/write awareness.
 			// 执行本批工具调用（带钩子、按只读/有状态分流，见 DispatchWithHooks）。
 			results := DispatchWithHooks(ctx, tools, resp.ToolCalls, availableTools, opts.ToolHooks)
+			if hasParkedToolResult(results) {
+				// The assistant tool_calls message is checkpointed once. Executed siblings keep their real
+				// results; parked placeholders are omitted and represented only by the pending protocol.
+				// assistant 工具调用消息只入快照一次；同批已执行结果照常入史，park 占位文本绝不入史。
+				msgs = append(msgs, resp.AsMessage())
+				callsByID := make(map[string]contract.ToolCall, len(resp.ToolCalls))
+				for _, call := range resp.ToolCalls {
+					callsByID[call.ID] = call
+				}
+				parked := make([]toolLoopPendingCall, 0, len(results))
+				for _, result := range results {
+					if !result.Park {
+						msgs = append(msgs, result.AsMessage())
+						continue
+					}
+					call := callsByID[result.CallID]
+					parked = append(parked, toolLoopPendingCall{
+						CallID: result.CallID, Tool: call.Name, Args: call.Args, ParkRef: result.ParkRef,
+					})
+				}
+				return loom.State{
+					"__yield":            true,
+					"yield_type":         "await_approval",
+					"__toolloop_msgs":    msgs,
+					"__toolloop_pending": parked,
+				}, nil
+			}
 			// 结果回填协议：先追加 assistant 的工具调用消息，再逐条追加对应的工具结果消息，
 			// 保持"调用在前、结果在后"的顺序供下一轮 LLM 阅读。
 			msgs = append(msgs, resp.AsMessage())
@@ -200,8 +296,91 @@ func NewToolLoopStep(llm contract.LLM, tools contract.ToolDispatcher, opts ToolL
 			return loom.State{"__error": err.Error()}, err
 		}
 		// 把收尾总结作为本轮的最终输出返回。
-		return SetOutput(resp.Content, resp.Usage), nil
+		return finishToolLoop(resp.Content, resp.Usage, resumedFromPark), nil
 	}
+}
+
+// decodeToolLoopMessages restores a private message snapshot after checkpoint JSON round-tripping.
+// decodeToolLoopMessages 将检查点中退化为 []any/map[string]any 的私有消息快照还原为强类型消息。
+func decodeToolLoopMessages(raw any) ([]contract.Message, error) {
+	if messages, ok := raw.([]contract.Message); ok {
+		return messages, nil
+	}
+	if raw == nil {
+		return nil, fmt.Errorf("loom/toolloop: missing __toolloop_msgs for pending tool calls")
+	}
+	data, err := json.Marshal(raw)
+	if err != nil {
+		return nil, fmt.Errorf("loom/toolloop: encode __toolloop_msgs: %w", err)
+	}
+	var messages []contract.Message
+	if err := json.Unmarshal(data, &messages); err != nil {
+		return nil, fmt.Errorf("loom/toolloop: decode __toolloop_msgs: %w", err)
+	}
+	return messages, nil
+}
+
+// decodeToolLoopPending accepts both in-memory structs and checkpoint-decoded JSON values.
+// decodeToolLoopPending 同时兼容内存强类型切片与检查点恢复后的 []any/map[string]any。
+func decodeToolLoopPending(raw any) ([]toolLoopPendingCall, error) {
+	if raw == nil {
+		return nil, nil
+	}
+	if pending, ok := raw.([]toolLoopPendingCall); ok {
+		return pending, nil
+	}
+	data, err := json.Marshal(raw)
+	if err != nil {
+		return nil, fmt.Errorf("loom/toolloop: encode __toolloop_pending: %w", err)
+	}
+	var pending []toolLoopPendingCall
+	if err := json.Unmarshal(data, &pending); err != nil {
+		return nil, fmt.Errorf("loom/toolloop: decode __toolloop_pending: %w", err)
+	}
+	return pending, nil
+}
+
+// decodeResumedToolResults accepts the host's map[call_id]{content,is_error} in typed or JSON form.
+// decodeResumedToolResults 宽容解码宿主回灌结果，兼容 map[string]any 及检查点 JSON 形态。
+func decodeResumedToolResults(raw any) (map[string]resumedToolResult, error) {
+	if raw == nil {
+		return nil, nil
+	}
+	if results, ok := raw.(map[string]resumedToolResult); ok {
+		return results, nil
+	}
+	data, err := json.Marshal(raw)
+	if err != nil {
+		return nil, fmt.Errorf("loom/toolloop: encode __resumed_tool_results: %w", err)
+	}
+	var results map[string]resumedToolResult
+	if err := json.Unmarshal(data, &results); err != nil {
+		return nil, fmt.Errorf("loom/toolloop: decode __resumed_tool_results: %w", err)
+	}
+	return results, nil
+}
+
+// hasParkedToolResult reports whether a dispatch batch requests a run-level approval yield.
+// hasParkedToolResult 判断本批结果是否包含要求整轮暂停等待批准的 park 标记。
+func hasParkedToolResult(results []contract.ToolResult) bool {
+	for _, result := range results {
+		if result.Park {
+			return true
+		}
+	}
+	return false
+}
+
+// finishToolLoop clears park protocol state only for a resumed run, preserving the no-park delta exactly.
+// finishToolLoop 仅在 park 恢复后的正常出口清场，保证从未 park 的路径仍返回原有增量。
+func finishToolLoop(content string, usage contract.Usage, resumedFromPark bool) loom.State {
+	result := SetOutput(content, usage)
+	if resumedFromPark {
+		result["__toolloop_pending"] = nil
+		result["__toolloop_msgs"] = nil
+		result["__resumed_tool_results"] = nil
+	}
+	return result
 }
 
 // DispatchWithHooks runs tool hooks, then dispatches with read/write awareness.
