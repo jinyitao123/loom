@@ -142,13 +142,17 @@ numeric difference or full replacement required by that policy. A host using a
 sum policy must always pass this configuration explicitly.
 
 With the default `YieldBubble` policy, a yielded child is represented in the
-parent checkpoint by a continuation (`__child_run_id` and `__child_graph`). A
-host resumes that same child run by supplying `__child_resume_input` containing
-only `__resumed_tool_results`; a parked continuation without input fails closed
-instead of starting the child again. Approval yields also expose a sanitized
-`__child_pending` envelope containing only `park_ref`, `call_id`, and `tool`
-(never tool arguments). Completion clears the continuation and envelope, while
-a repeated yield refreshes them and consumes the one-shot resume input.
+parent checkpoint by a continuation containing the child run and graph plus a
+stable topology revision, the yielded checkpoint sequence, and a fresh random
+yield token. A host resumes that same child run by supplying
+`__child_resume_input` containing only `__resumed_tool_results`; before calling
+the child, the step verifies that its latest checkpoint is still yielded and
+that the topology revision, sequence, and token all match. A parked, incomplete,
+or stale continuation fails closed instead of starting the child again.
+Approval yields also expose a sanitized `__child_pending` envelope containing
+only `park_ref`, `call_id`, and `tool` (never tool arguments). Completion clears
+the continuation and envelope, while a repeated yield refreshes its token and
+sequence and consumes the one-shot resume input.
 
 </td>
 </tr>
@@ -184,6 +188,12 @@ unsupported formats fail closed with both versions in the error.
 The checkpoint envelope also reserves optional `meta` data for future
 provenance, such as the source of sensitive state keys or the policy version
 that produced them. Loom does not consume this field yet.
+
+Each yielded checkpoint exposes a fresh `__yield_token` and its monotonically
+increasing `__checkpoint_seq` in the yielded state. Continuation validation
+compares these values before resume; an atomic expected-token/sequence
+checkpoint CAS remains the follow-up required for complete concurrent-resume
+protection.
 
 When rolling back Loom, keep the existing deployment discipline: isolate the
 checkpoint store from checkpoints written by the newer binary before starting

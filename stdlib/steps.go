@@ -3,10 +3,12 @@ package stdlib
 import (
 	"bytes"
 	"context" // 步骤签名的第一参数，承载超时/取消并向子图透传
+	"crypto/sha256"
 	"encoding/json"
 	"fmt" // 子图暂停策略违规时构造错误
 	"io"
 	"math"
+	"strings"
 
 	"github.com/jinyitao123/loom" // 内核包：Step/State/Graph/Store/RunResult
 )
@@ -153,13 +155,19 @@ func runChildContinuation(ctx context.Context, parent loom.State, child *loom.Gr
 	runID, runPresent := parent["__child_run_id"]
 	graphName, graphPresent := parent["__child_graph"]
 	resumeRaw, inputPresent := parent["__child_resume_input"]
-	_, tokenPresent := parent["__child_yield_token"]
-	_, seqPresent := parent["__child_checkpoint_seq"]
-	hasContinuationKey := runPresent || graphPresent || tokenPresent || seqPresent
+	tokenRaw, tokenPresent := parent["__child_yield_token"]
+	seqRaw, seqPresent := parent["__child_checkpoint_seq"]
+	revisionRaw, revisionPresent := parent["__child_graph_revision"]
+	hasContinuationKey := runPresent || graphPresent || tokenPresent || seqPresent || revisionPresent
 
 	run, runOK := runID.(string)
 	graph, graphOK := graphName.(string)
-	complete := runPresent && graphPresent && runOK && graphOK && run != "" && graph != ""
+	token, tokenOK := tokenRaw.(string)
+	seq, seqOK := protocolInt64(seqRaw)
+	revision, revisionOK := revisionRaw.(string)
+	complete := runPresent && graphPresent && tokenPresent && seqPresent && revisionPresent &&
+		runOK && graphOK && tokenOK && seqOK && revisionOK &&
+		run != "" && graph != "" && token != "" && seq > 0 && revision != ""
 	if !complete {
 		if hasContinuationKey || inputPresent {
 			return nil, false, fmt.Errorf("loom: child graph %q continuation is missing or invalid", child.Name)
@@ -173,6 +181,9 @@ func runChildContinuation(ctx context.Context, parent loom.State, child *loom.Gr
 	if graph != child.Name {
 		return nil, false, fmt.Errorf("loom: child graph continuation names %q, current graph is %q", graph, child.Name)
 	}
+	if revision != childGraphRevision(child) {
+		return nil, false, fmt.Errorf("loom: child graph %q run %q stale continuation: topology revision does not match current child graph", child.Name, run)
+	}
 	if !inputPresent {
 		return nil, false, fmt.Errorf("loom: child graph %q run %q is parked without resume input", child.Name, run)
 	}
@@ -184,8 +195,8 @@ func runChildContinuation(ctx context.Context, parent loom.State, child *loom.Gr
 	if cp.RunID != run || cp.Graph != child.Name || cp.YieldPhase == "" || cp.State["__yield"] != true {
 		return nil, false, fmt.Errorf("loom: child graph %q run %q continuation does not reference a yielded checkpoint", child.Name, run)
 	}
-	if err := validateOptionalChildCheckpoint(parent, cp); err != nil {
-		return nil, false, fmt.Errorf("loom: child graph %q run %q continuation: %w", child.Name, run, err)
+	if err := validateChildCheckpointGeneration(token, seq, cp); err != nil {
+		return nil, false, fmt.Errorf("loom: child graph %q run %q stale continuation: %w", child.Name, run, err)
 	}
 	resumeInput, err := validateChildResumeInput(resumeRaw, cp.State["__toolloop_pending"])
 	if err != nil {
@@ -210,21 +221,21 @@ func loadChildCheckpoint(ctx context.Context, store loom.Store, graph, runID str
 	return cp, nil
 }
 
-func validateOptionalChildCheckpoint(parent loom.State, cp childCheckpoint) error {
-	if raw, ok := parent["__child_checkpoint_seq"]; ok {
-		seq, valid := protocolInt64(raw)
-		if !valid || seq != cp.Seq {
-			return fmt.Errorf("checkpoint seq does not match latest child checkpoint")
-		}
+func validateChildCheckpointGeneration(token string, seq int64, cp childCheckpoint) error {
+	checkpointSeq, valid := protocolInt64(cp.State["__checkpoint_seq"])
+	if !valid || seq != cp.Seq || seq != checkpointSeq {
+		return fmt.Errorf("checkpoint seq does not match latest child checkpoint")
 	}
-	if raw, ok := parent["__child_yield_token"]; ok {
-		token, valid := raw.(string)
-		checkpointToken, checkpointValid := cp.State["__yield_token"].(string)
-		if !valid || token == "" || !checkpointValid || checkpointToken != token {
-			return fmt.Errorf("yield token does not match latest child checkpoint")
-		}
+	checkpointToken, checkpointValid := cp.State["__yield_token"].(string)
+	if !checkpointValid || checkpointToken != token {
+		return fmt.Errorf("yield token does not match latest child checkpoint")
 	}
 	return nil
+}
+
+func childGraphRevision(child *loom.Graph) string {
+	digest := sha256.Sum256([]byte(child.Entry() + "\x00" + strings.Join(child.StepNames(), "\x00")))
+	return fmt.Sprintf("%x", digest)
 }
 
 func protocolInt64(value any) (int64, bool) {
@@ -297,9 +308,16 @@ func decodeStrictJSON(data []byte, target any) error {
 }
 
 func childYieldUpdate(child *loom.Graph, result *loom.RunResult, resumed bool) (loom.State, error) {
+	token, tokenOK := result.State["__yield_token"].(string)
+	seq, seqOK := protocolInt64(result.State["__checkpoint_seq"])
+	if !tokenOK || token == "" || !seqOK || seq <= 0 {
+		return nil, fmt.Errorf("loom: child graph %q run %q yielded without checkpoint generation", child.Name, result.RunID)
+	}
 	update := loom.State{
 		"__yield": true, "__yield_phase": "mid_step",
 		"__child_run_id": result.RunID, "__child_graph": child.Name,
+		"__child_graph_revision": childGraphRevision(child),
+		"__child_yield_token":    token, "__child_checkpoint_seq": seq,
 	}
 	if resumed {
 		update["__deleted_keys"] = []string{"__child_resume_input"}
@@ -320,7 +338,10 @@ func childYieldUpdate(child *loom.Graph, result *loom.RunResult, resumed bool) (
 }
 
 func withChildContinuationCleanup(delta loom.State) loom.State {
-	delta["__deleted_keys"] = []string{"__child_run_id", "__child_graph", "__child_resume_input", "__child_pending"}
+	delta["__deleted_keys"] = []string{
+		"__child_run_id", "__child_graph", "__child_graph_revision", "__child_yield_token",
+		"__child_checkpoint_seq", "__child_resume_input", "__child_pending",
+	}
 	return delta
 }
 

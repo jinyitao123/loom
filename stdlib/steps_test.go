@@ -19,23 +19,23 @@ func (identityCompressor) Compress(msgs []interface{}) []interface{} { return ms
 func TestChildContinuationProtocolMatrix(t *testing.T) {
 	tests := []struct {
 		name       string
-		state      func(runID string) loom.State
+		state      func(loom.State) loom.State
 		wantRun    int
 		wantResume int
 		wantErr    string
 	}{
-		{name: "fresh run", state: func(string) loom.State { return loom.State{} }, wantRun: 1},
-		{name: "parked without input", state: func(runID string) loom.State {
-			return loom.State{"__child_run_id": runID, "__child_graph": "child"}
+		{name: "fresh run", state: func(loom.State) loom.State { return loom.State{} }, wantRun: 1},
+		{name: "parked without input", state: func(continuation loom.State) loom.State {
+			return continuation
 		}, wantErr: "resume input"},
-		{name: "input without continuation", state: func(string) loom.State {
+		{name: "input without continuation", state: func(loom.State) loom.State {
 			return validChildResumeState(loom.State{})
 		}, wantErr: "continuation"},
-		{name: "partial continuation with input", state: func(string) loom.State {
+		{name: "partial continuation with input", state: func(loom.State) loom.State {
 			return validChildResumeState(loom.State{"__child_run_id": "partial"})
 		}, wantErr: "continuation"},
-		{name: "complete continuation with input", state: func(runID string) loom.State {
-			return validChildResumeState(loom.State{"__child_run_id": runID, "__child_graph": "child"})
+		{name: "complete continuation with input", state: func(continuation loom.State) loom.State {
+			return validChildResumeState(continuation)
 		}, wantResume: 1},
 	}
 
@@ -58,12 +58,12 @@ func TestChildContinuationProtocolMatrix(t *testing.T) {
 				runs := 0
 				resumes := 0
 				child := continuationTestChild("child", &runs, &resumes, nil)
-				parked, err := child.Run(context.Background(), loom.State{}, store)
+				step := constructor.make(child, store)
+				parked, err := step(context.Background(), loom.State{})
 				assertNoError(t, err)
 				runs = 0
-				step := constructor.make(child, store)
 
-				result, err := step(context.Background(), tt.state(parked.RunID))
+				result, err := step(context.Background(), tt.state(loom.State{}.Merge(parked, nil)))
 				if tt.wantErr != "" {
 					if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
 						t.Fatalf("error = %v, want protocol error containing %q", err, tt.wantErr)
@@ -114,7 +114,10 @@ func TestChildContinuationResumeValidationEnvelopeAndCleanup(t *testing.T) {
 	if runs != 1 || resumes != 1 {
 		t.Fatalf("calls Run=%d Resume=%d, want 1/1", runs, resumes)
 	}
-	wantDeleted := []string{"__child_run_id", "__child_graph", "__child_resume_input", "__child_pending"}
+	wantDeleted := []string{
+		"__child_run_id", "__child_graph", "__child_graph_revision", "__child_yield_token",
+		"__child_checkpoint_seq", "__child_resume_input", "__child_pending",
+	}
 	if got := done["__deleted_keys"]; !reflect.DeepEqual(got, wantDeleted) {
 		t.Fatalf("deleted keys = %#v, want %#v", got, wantDeleted)
 	}
@@ -168,8 +171,110 @@ func TestChildContinuationNonApprovalYieldHasNoEnvelopeAndResumeYieldRefreshes(t
 	if again["__child_run_id"] != first["__child_run_id"] {
 		t.Fatalf("run ID changed: first=%v second=%v", first["__child_run_id"], again["__child_run_id"])
 	}
+	firstToken, firstTokenOK := first["__child_yield_token"].(string)
+	againToken, againTokenOK := again["__child_yield_token"].(string)
+	if !firstTokenOK || !againTokenOK || firstToken == "" || againToken == "" || firstToken == againToken {
+		t.Fatalf("yield tokens first=%#v second=%#v, want distinct non-empty strings", first["__child_yield_token"], again["__child_yield_token"])
+	}
+	if first["__child_checkpoint_seq"] == again["__child_checkpoint_seq"] {
+		t.Fatalf("checkpoint seq did not refresh: first=%#v second=%#v", first["__child_checkpoint_seq"], again["__child_checkpoint_seq"])
+	}
+	if first["__child_graph_revision"] != again["__child_graph_revision"] {
+		t.Fatalf("graph revision changed without topology change: first=%#v second=%#v", first["__child_graph_revision"], again["__child_graph_revision"])
+	}
 	if deleted, _ := again["__deleted_keys"].([]string); !reflect.DeepEqual(deleted, []string{"__child_resume_input"}) {
 		t.Fatalf("resume input cleanup = %#v", again["__deleted_keys"])
+	}
+}
+
+func TestChildContinuationRejectsStaleGenerationAndTopologyWithoutExecutingChild(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(loom.State, *loom.Graph)
+	}{
+		{name: "token", mutate: func(state loom.State, _ *loom.Graph) { state["__child_yield_token"] = "stale" }},
+		{name: "seq", mutate: func(state loom.State, _ *loom.Graph) { state["__child_checkpoint_seq"] = int64(999) }},
+		{name: "topology revision", mutate: func(_ loom.State, child *loom.Graph) {
+			child.AddStep("changed", func(context.Context, loom.State) (loom.State, error) {
+				return loom.State{}, nil
+			}, loom.End())
+		}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			store := loom.NewMemStore()
+			runs, resumes := 0, 0
+			child := continuationTestChild("stale-child", &runs, &resumes, nil)
+			step := stdlib.NewSubGraphStep(child, store)
+			parked, err := step(context.Background(), loom.State{})
+			assertNoError(t, err)
+			state := validChildResumeState(loom.State{}.Merge(parked, nil))
+			tt.mutate(state, child)
+
+			_, err = step(context.Background(), state)
+			if err == nil || !strings.Contains(err.Error(), "stale continuation") {
+				t.Fatalf("error = %v, want stale continuation protocol error", err)
+			}
+			if runs != 1 || resumes != 0 {
+				t.Fatalf("calls Run=%d Resume=%d, want 1/0", runs, resumes)
+			}
+		})
+	}
+}
+
+func TestChildContinuationRejectsLatestCheckpointThatIsNoLongerYielded(t *testing.T) {
+	store := loom.NewMemStore()
+	runs, resumes := 0, 0
+	child := continuationTestChild("completed-child", &runs, &resumes, nil)
+	step := stdlib.NewSubGraphStep(child, store)
+	parked, err := step(context.Background(), loom.State{})
+	assertNoError(t, err)
+
+	runID := parked["__child_run_id"].(string)
+	data, err := store.Get(context.Background(), "checkpoint:"+child.Name, runID)
+	assertNoError(t, err)
+	var checkpoint map[string]any
+	assertNoError(t, json.Unmarshal(data, &checkpoint))
+	checkpoint["yield_phase"] = ""
+	checkpoint["state"].(map[string]any)["__yield"] = false
+	data, err = json.Marshal(checkpoint)
+	assertNoError(t, err)
+	assertNoError(t, store.Put(context.Background(), "checkpoint:"+child.Name, runID, data))
+
+	_, err = step(context.Background(), validChildResumeState(loom.State{}.Merge(parked, nil)))
+	if err == nil || !strings.Contains(err.Error(), "yielded checkpoint") {
+		t.Fatalf("error = %v, want non-yielded checkpoint protocol error", err)
+	}
+	if runs != 1 || resumes != 0 {
+		t.Fatalf("calls Run=%d Resume=%d, want 1/0", runs, resumes)
+	}
+}
+
+func TestChildContinuationRejectsChangedEntryWithoutExecutingReplacement(t *testing.T) {
+	store := loom.NewMemStore()
+	originalRuns, originalResumes := 0, 0
+	original := continuationTestChild("entry-child", &originalRuns, &originalResumes, nil)
+	parked, err := stdlib.NewSubGraphStep(original, store)(context.Background(), loom.State{})
+	assertNoError(t, err)
+
+	replacementRuns := 0
+	replacement := loom.NewGraph("entry-child", "other")
+	replacement.AddStep("work", func(context.Context, loom.State) (loom.State, error) {
+		replacementRuns++
+		return loom.State{}, nil
+	}, loom.End())
+	replacement.AddStep("other", func(context.Context, loom.State) (loom.State, error) {
+		replacementRuns++
+		return loom.State{}, nil
+	}, loom.End())
+
+	state := validChildResumeState(loom.State{}.Merge(parked, nil))
+	_, err = stdlib.NewSubGraphStep(replacement, store)(context.Background(), state)
+	if err == nil || !strings.Contains(err.Error(), "stale continuation") {
+		t.Fatalf("error = %v, want stale continuation protocol error", err)
+	}
+	if replacementRuns != 0 {
+		t.Fatalf("replacement child executed %d steps, want 0", replacementRuns)
 	}
 }
 

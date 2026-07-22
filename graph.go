@@ -5,6 +5,7 @@ import (
 	"encoding/json" // 检查点的序列化格式
 	"fmt"           // 拼装带上下文的错误信息
 	"log/slog"      // 尽力而为检查点失败时的结构化告警日志
+	"sort"          // 公开真实步骤名时提供稳定顺序
 	"sync/atomic"   // 全局步数预算的并发安全计数器
 	"time"          // 检查点落盘时间戳
 
@@ -162,6 +163,19 @@ func (g *Graph) Topology() []StepInfo {
 	return g.topology
 }
 
+// Entry returns the graph's configured entry step.
+func (g *Graph) Entry() string { return g.entry }
+
+// StepNames returns the registered step names in stable lexical order.
+func (g *Graph) StepNames() []string {
+	names := make([]string, 0, len(g.steps))
+	for name := range g.steps {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
+}
+
 // SetHooks attaches before/after hooks.
 // SetHooks 挂载前置/后置钩子集合（整体替换而非追加）。
 func (g *Graph) SetHooks(h HookPoints) { g.hooks = h }
@@ -220,6 +234,8 @@ func (g *Graph) Run(ctx context.Context, input State, store Store) (*RunResult, 
 	// 不清掉会导致刚恢复就被误判为再次暂停。
 	delete(state, "__yield")
 	delete(state, "__yield_phase")
+	delete(state, "__yield_token")
+	delete(state, "__checkpoint_seq")
 
 	current := g.entry // 当前待执行的步骤名，从入口开始
 	steps := 0         // 本次调用已执行步数，供下方 maxIter 熔断检查使用
@@ -287,6 +303,9 @@ func (g *Graph) Run(ctx context.Context, input State, store Store) (*RunResult, 
 		// 步骤若声明了暂停阶段，它会随快照一起持久化，Resume 靠它决定重入方式。
 		// 落盘失败是否中止由 checkpointPolicy 决定（doCheckpoint 内部分流）。
 		yieldPhase, _ := state["__yield_phase"].(string)
+		if yielded, _ := state["__yield"].(bool); yielded {
+			state["__yield_token"] = uuid.New().String()
+		}
 		if err := g.doCheckpoint(ctx, store, runID, current, state, yieldPhase); err != nil {
 			return &RunResult{State: state, LastStep: current, RunID: runID, StopReason: StopError}, err
 		}
@@ -499,6 +518,9 @@ func (g *Graph) doCheckpoint(ctx context.Context, store Store, runID, step strin
 	}
 	seq++
 	state["__seq"] = seq // 先写回状态再序列化，确保 cp.State 与 cp.Seq 始终一致
+	if yielded, _ := state["__yield"].(bool); yielded {
+		state["__checkpoint_seq"] = seq
+	}
 	// 预算在步骤执行前已扣减；仅当本次运行确有共享计数器时才把扣减后余额写入同一份快照。
 	// 未启用预算的图不创建协议键，保持既有状态与检查点零污染。
 	if budget, ok := ctx.Value(budgetKey{}).(*atomic.Int64); ok {

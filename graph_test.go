@@ -124,6 +124,60 @@ func TestGraph_Checkpoint_Saved(t *testing.T) {
 	if len(data) == 0 {
 		t.Error("checkpoint data is empty")
 	}
+	if _, ok := result.State["__checkpoint_seq"]; ok {
+		t.Fatalf("completed result exposed yield checkpoint generation: %#v", result.State)
+	}
+	var raw struct {
+		State loom.State `json:"state"`
+	}
+	assertNoError(t, json.Unmarshal(data, &raw))
+	if _, ok := raw.State["__checkpoint_seq"]; ok {
+		t.Fatalf("completed checkpoint exposed yield checkpoint generation: %#v", raw.State)
+	}
+}
+
+func TestGraph_YieldCheckpointTokenAndSeqRefresh(t *testing.T) {
+	store := loom.NewMemStore()
+	g := loom.NewGraph("yield-generation", "wait")
+	g.AddStep("wait", func(_ context.Context, state loom.State) (loom.State, error) {
+		return loom.State{"__yield": true, "__yield_phase": "mid_step"}, nil
+	}, loom.End())
+
+	first, err := g.Run(context.Background(), loom.State{}, store)
+	assertNoError(t, err)
+	firstToken, ok := first.State["__yield_token"].(string)
+	if !ok || firstToken == "" {
+		t.Fatalf("first yield token = %#v, want non-empty string", first.State["__yield_token"])
+	}
+	if got := first.State["__checkpoint_seq"]; got != int64(1) {
+		t.Fatalf("first checkpoint seq = %#v, want 1", got)
+	}
+	assertYieldCheckpointGeneration(t, store, g.Name, first.RunID, firstToken, 1)
+
+	second, err := g.Resume(context.Background(), first.RunID, loom.State{}, store)
+	assertNoError(t, err)
+	secondToken, ok := second.State["__yield_token"].(string)
+	if !ok || secondToken == "" || secondToken == firstToken {
+		t.Fatalf("second yield token = %#v, want non-empty token different from %q", second.State["__yield_token"], firstToken)
+	}
+	if got := second.State["__checkpoint_seq"]; got != int64(2) {
+		t.Fatalf("second checkpoint seq = %#v, want 2", got)
+	}
+	assertYieldCheckpointGeneration(t, store, g.Name, second.RunID, secondToken, 2)
+}
+
+func assertYieldCheckpointGeneration(t *testing.T, store loom.Store, graph, runID, token string, seq int64) {
+	t.Helper()
+	data, err := store.Get(context.Background(), "checkpoint:"+graph, runID)
+	assertNoError(t, err)
+	var raw struct {
+		Seq   int64      `json:"seq"`
+		State loom.State `json:"state"`
+	}
+	assertNoError(t, json.Unmarshal(data, &raw))
+	if raw.Seq != seq || raw.State["__checkpoint_seq"] != float64(seq) || raw.State["__yield_token"] != token {
+		t.Fatalf("checkpoint generation = seq:%d state:%#v, want seq:%d token:%q", raw.Seq, raw.State, seq, token)
+	}
 }
 
 func TestGraph_CheckpointSchema_CurrentVersionResumes(t *testing.T) {
