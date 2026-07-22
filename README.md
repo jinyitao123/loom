@@ -141,6 +141,15 @@ the parent's merge configuration with
 numeric difference or full replacement required by that policy. A host using a
 sum policy must always pass this configuration explicitly.
 
+With the default `YieldBubble` policy, a yielded child is represented in the
+parent checkpoint by a continuation (`__child_run_id` and `__child_graph`). A
+host resumes that same child run by supplying `__child_resume_input` containing
+only `__resumed_tool_results`; a parked continuation without input fails closed
+instead of starting the child again. Approval yields also expose a sanitized
+`__child_pending` envelope containing only `park_ref`, `call_id`, and `tool`
+(never tool arguments). Completion clears the continuation and envelope, while
+a repeated yield refreshes them and consumes the one-shot resume input.
+
 </td>
 </tr>
 <tr>

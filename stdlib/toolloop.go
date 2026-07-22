@@ -599,7 +599,7 @@ func stageStatePatches(results []contract.ToolResult, policy *StatePatchPolicy, 
 
 func isReservedStatePatchKey(key string) bool {
 	return key == "output" || key == "usage" || key == "__deleted_keys" || strings.HasPrefix(key, "__toolloop_") ||
-		strings.HasPrefix(key, "__yield") || key == "__resumed_tool_results"
+		strings.HasPrefix(key, "__yield") || strings.HasPrefix(key, "__child_") || key == "__resumed_tool_results"
 }
 
 func stageStateOp(result contract.ToolResult, op contract.StateOp, policy *StatePatchPolicy, current, staged loom.State) error {

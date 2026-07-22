@@ -251,6 +251,7 @@ func TestToolLoop_StateOpsProtocolValidation(t *testing.T) {
 	}{
 		{name: "unauthorized tool", tool: "other", op: contract.StateOp{Type: "replace", Key: "route", Value: "a"}, policy: stdlib.AllowKeys("update", "route")},
 		{name: "reserved key", tool: "update", op: contract.StateOp{Type: "delete", Key: "__deleted_keys"}, policy: stdlib.AllowKeys("update", "__deleted_keys")},
+		{name: "child protocol key", tool: "update", op: contract.StateOp{Type: "replace", Key: "__child_run_id", Value: "forged"}, policy: stdlib.AllowKeys("update", "__child_run_id")},
 		{name: "protocol nil validator", tool: "update", op: contract.StateOp{Type: "replace", Key: "__route", Value: "a"}, policy: stdlib.AllowKeys("update", "__route")},
 		{name: "non json value", tool: "update", op: contract.StateOp{Type: "replace", Key: "route", Value: func() {}}, policy: stdlib.AllowKeys("update", "route")},
 		{name: "non number debit", tool: "update", op: contract.StateOp{Type: "debit", Key: "route", Value: "one"}, policy: stdlib.AllowKeys("update", "route")},
@@ -512,6 +513,7 @@ func TestToolLoop_StatePatchRejectsReservedKeysAndNilProtocolValidator(t *testin
 		{name: "usage", key: "usage"},
 		{name: "toolloop private", key: "__toolloop_staged_patch"},
 		{name: "yield private", key: "__yield_reason"},
+		{name: "child protocol", key: "__child_pending"},
 		{name: "resumed results", key: "__resumed_tool_results"},
 		{name: "protocol nil validator", key: "__delegate_to"},
 	}

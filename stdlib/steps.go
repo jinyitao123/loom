@@ -5,6 +5,8 @@ import (
 	"context" // 步骤签名的第一参数，承载超时/取消并向子图透传
 	"encoding/json"
 	"fmt" // 子图暂停策略违规时构造错误
+	"io"
+	"math"
 
 	"github.com/jinyitao123/loom" // 内核包：Step/State/Graph/Store/RunResult
 )
@@ -100,10 +102,9 @@ func NewSubGraphStep(child *loom.Graph, store loom.Store, opts ...SubGraphOpts) 
 	}
 
 	return func(ctx context.Context, state loom.State) (loom.State, error) {
-		// 以父图当前状态为输入，同步运行整张子图直到完成或暂停。
-		result, err := child.Run(ctx, state, store)
+		// 以父图当前状态为首次输入；重入时共享 continuation helper 恢复原 child run。
+		result, resumed, err := runChildContinuation(ctx, state, child, store, func() loom.State { return state })
 		if err != nil {
-			// 子图出错：若带有部分结果状态则一并上交（便于父图诊断），错误照常上抛。
 			if result != nil {
 				return result.State, err
 			}
@@ -114,15 +115,7 @@ func NewSubGraphStep(child *loom.Graph, store loom.Store, opts ...SubGraphOpts) 
 		if result.Yielded {
 			switch o.YieldPolicy {
 			case YieldBubble:
-				// 冒泡协议：父步骤自己也发出 mid_step 暂停，并把 __child_run_id / __child_graph
-				// 记入状态——恢复时宿主凭这两个键找到暂停中的子图运行，先恢复子图，
-				// 子图完成后父步骤重跑（幂等），层层向上传导。
-				return loom.State{
-					"__yield":        true,
-					"__yield_phase":  "mid_step",
-					"__child_run_id": result.RunID,
-					"__child_graph":  child.Name,
-				}, nil
+				return childYieldUpdate(child, result, resumed)
 			case YieldTrap:
 				// 拦截策略：该子图被声明为"不允许暂停"，暂停即违约，直接报错。
 				return nil, fmt.Errorf("loom: sub-graph %q yielded but YieldTrap is set", child.Name)
@@ -137,8 +130,198 @@ func NewSubGraphStep(child *loom.Graph, store loom.Store, opts ...SubGraphOpts) 
 		}
 
 		// 子图正常完成：只把相对步骤输入发生变化的键作为增量交给父引擎合并。
-		return subGraphDelta(state, result.State, o.ParentMergeConfig)
+		delta, err := subGraphDelta(state, result.State, o.ParentMergeConfig)
+		if err != nil {
+			return nil, err
+		}
+		if resumed {
+			return withChildContinuationCleanup(delta), nil
+		}
+		return delta, nil
 	}
+}
+
+type childCheckpoint struct {
+	RunID      string     `json:"run_id"`
+	Graph      string     `json:"graph"`
+	Seq        int64      `json:"seq"`
+	YieldPhase string     `json:"yield_phase"`
+	State      loom.State `json:"state"`
+}
+
+func runChildContinuation(ctx context.Context, parent loom.State, child *loom.Graph, store loom.Store, initial func() loom.State) (*loom.RunResult, bool, error) {
+	runID, runPresent := parent["__child_run_id"]
+	graphName, graphPresent := parent["__child_graph"]
+	resumeRaw, inputPresent := parent["__child_resume_input"]
+	_, tokenPresent := parent["__child_yield_token"]
+	_, seqPresent := parent["__child_checkpoint_seq"]
+	hasContinuationKey := runPresent || graphPresent || tokenPresent || seqPresent
+
+	run, runOK := runID.(string)
+	graph, graphOK := graphName.(string)
+	complete := runPresent && graphPresent && runOK && graphOK && run != "" && graph != ""
+	if !complete {
+		if hasContinuationKey || inputPresent {
+			return nil, false, fmt.Errorf("loom: child graph %q continuation is missing or invalid", child.Name)
+		}
+		result, err := child.Run(ctx, initial(), store)
+		if err != nil {
+			return result, false, fmt.Errorf("loom: child graph %q run: %w", child.Name, err)
+		}
+		return result, false, nil
+	}
+	if graph != child.Name {
+		return nil, false, fmt.Errorf("loom: child graph continuation names %q, current graph is %q", graph, child.Name)
+	}
+	if !inputPresent {
+		return nil, false, fmt.Errorf("loom: child graph %q run %q is parked without resume input", child.Name, run)
+	}
+
+	cp, err := loadChildCheckpoint(ctx, store, child.Name, run)
+	if err != nil {
+		return nil, false, fmt.Errorf("loom: child graph %q run %q checkpoint: %w", child.Name, run, err)
+	}
+	if cp.RunID != run || cp.Graph != child.Name || cp.YieldPhase == "" || cp.State["__yield"] != true {
+		return nil, false, fmt.Errorf("loom: child graph %q run %q continuation does not reference a yielded checkpoint", child.Name, run)
+	}
+	if err := validateOptionalChildCheckpoint(parent, cp); err != nil {
+		return nil, false, fmt.Errorf("loom: child graph %q run %q continuation: %w", child.Name, run, err)
+	}
+	resumeInput, err := validateChildResumeInput(resumeRaw, cp.State["__toolloop_pending"])
+	if err != nil {
+		return nil, false, fmt.Errorf("loom: child graph %q run %q resume input: %w", child.Name, run, err)
+	}
+	result, err := child.Resume(ctx, run, resumeInput, store)
+	if err != nil {
+		return result, true, fmt.Errorf("loom: child graph %q run %q resume: %w", child.Name, run, err)
+	}
+	return result, true, nil
+}
+
+func loadChildCheckpoint(ctx context.Context, store loom.Store, graph, runID string) (childCheckpoint, error) {
+	data, err := store.Get(ctx, "checkpoint:"+graph, runID)
+	if err != nil {
+		return childCheckpoint{}, err
+	}
+	var cp childCheckpoint
+	if err := json.Unmarshal(data, &cp); err != nil {
+		return childCheckpoint{}, err
+	}
+	return cp, nil
+}
+
+func validateOptionalChildCheckpoint(parent loom.State, cp childCheckpoint) error {
+	if raw, ok := parent["__child_checkpoint_seq"]; ok {
+		seq, valid := protocolInt64(raw)
+		if !valid || seq != cp.Seq {
+			return fmt.Errorf("checkpoint seq does not match latest child checkpoint")
+		}
+	}
+	if raw, ok := parent["__child_yield_token"]; ok {
+		token, valid := raw.(string)
+		checkpointToken, checkpointValid := cp.State["__yield_token"].(string)
+		if !valid || token == "" || !checkpointValid || checkpointToken != token {
+			return fmt.Errorf("yield token does not match latest child checkpoint")
+		}
+	}
+	return nil
+}
+
+func protocolInt64(value any) (int64, bool) {
+	switch v := value.(type) {
+	case int:
+		return int64(v), true
+	case int64:
+		return v, true
+	case float64:
+		if math.Trunc(v) == v {
+			return int64(v), true
+		}
+	}
+	return 0, false
+}
+
+func validateChildResumeInput(raw, pendingRaw any) (loom.State, error) {
+	data, err := json.Marshal(raw)
+	if err != nil {
+		return nil, fmt.Errorf("encode: %w", err)
+	}
+	var top map[string]json.RawMessage
+	if err := decodeStrictJSON(data, &top); err != nil {
+		return nil, err
+	}
+	resultsRaw, ok := top["__resumed_tool_results"]
+	if !ok || len(top) != 1 {
+		return nil, fmt.Errorf("only __resumed_tool_results is allowed")
+	}
+	var rawResults map[string]map[string]json.RawMessage
+	if err := decodeStrictJSON(resultsRaw, &rawResults); err != nil {
+		return nil, fmt.Errorf("decode __resumed_tool_results: %w", err)
+	}
+	pending, err := decodeToolLoopPending(pendingRaw)
+	if err != nil {
+		return nil, err
+	}
+	allowed := make(map[string]bool, len(pending))
+	for _, call := range pending {
+		allowed[call.CallID] = true
+	}
+	results := make(map[string]resumedToolResult, len(rawResults))
+	for callID, fields := range rawResults {
+		if !allowed[callID] {
+			return nil, fmt.Errorf("call ID %q is not pending in child checkpoint", callID)
+		}
+		if len(fields) != 2 || fields["content"] == nil || fields["is_error"] == nil {
+			return nil, fmt.Errorf("result %q must contain only content and is_error", callID)
+		}
+		var result resumedToolResult
+		resultData, _ := json.Marshal(fields)
+		if err := decodeStrictJSON(resultData, &result); err != nil {
+			return nil, fmt.Errorf("decode result %q: %w", callID, err)
+		}
+		results[callID] = result
+	}
+	return loom.State{"__resumed_tool_results": results}, nil
+}
+
+func decodeStrictJSON(data []byte, target any) error {
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(target); err != nil {
+		return err
+	}
+	if err := decoder.Decode(&struct{}{}); err != io.EOF {
+		return fmt.Errorf("trailing JSON value")
+	}
+	return nil
+}
+
+func childYieldUpdate(child *loom.Graph, result *loom.RunResult, resumed bool) (loom.State, error) {
+	update := loom.State{
+		"__yield": true, "__yield_phase": "mid_step",
+		"__child_run_id": result.RunID, "__child_graph": child.Name,
+	}
+	if resumed {
+		update["__deleted_keys"] = []string{"__child_resume_input"}
+	}
+	if result.State["yield_type"] == "await_approval" {
+		pending, err := decodeToolLoopPending(result.State["__toolloop_pending"])
+		if err != nil {
+			return nil, fmt.Errorf("loom: child graph %q run %q pending envelope: %w", child.Name, result.RunID, err)
+		}
+		envelope := make([]map[string]string, 0, len(pending))
+		for _, call := range pending {
+			envelope = append(envelope, map[string]string{"park_ref": call.ParkRef, "call_id": call.CallID, "tool": call.Tool})
+		}
+		update["yield_type"] = "await_approval"
+		update["__child_pending"] = envelope
+	}
+	return update, nil
+}
+
+func withChildContinuationCleanup(delta loom.State) loom.State {
+	delta["__deleted_keys"] = []string{"__child_run_id", "__child_graph", "__child_resume_input", "__child_pending"}
+	return delta
 }
 
 func subGraphDelta(input, final loom.State, parentCfg *loom.MergeConfig) (loom.State, error) {
@@ -277,27 +460,22 @@ type ContextCompressor interface {
 // 本质上是 NewSubGraphStep 的特化——多了上下文压缩与身份键透传，暂停策略固定为冒泡。
 func NewHandoffStep(target *loom.Graph, store loom.Store, compressor ContextCompressor) loom.Step {
 	return func(ctx context.Context, state loom.State) (loom.State, error) {
-		// 取出当前对话历史；取不到就按空历史移交（忽略错误是有意为之）。
-		msgs, _ := GetMessages(state)
-		// 转成 []interface{} 以适配 ContextCompressor 的通用签名。
-		var rawMsgs []interface{}
-		for _, m := range msgs {
-			rawMsgs = append(rawMsgs, m)
-		}
-		// 执行压缩：只带走精华上下文，控制目标图的 token 开销。
-		compressed := compressor.Compress(rawMsgs)
-		// 为目标图构造全新的初始状态：只含压缩后的历史，不带父图的其他杂项。
-		handoffState := loom.State{"messages": compressed}
-		// 身份三键（会话/用户/命名空间）若存在则透传，保证目标图的存储隔离与归属一致。
-		for _, k := range []string{"session_id", "user_id", "namespace"} {
-			if v, ok := state[k]; ok {
-				handoffState[k] = v
+		initial := func() loom.State {
+			msgs, _ := GetMessages(state)
+			var rawMsgs []interface{}
+			for _, m := range msgs {
+				rawMsgs = append(rawMsgs, m)
 			}
+			handoffState := loom.State{"messages": compressor.Compress(rawMsgs)}
+			for _, k := range []string{"session_id", "user_id", "namespace"} {
+				if v, ok := state[k]; ok {
+					handoffState[k] = v
+				}
+			}
+			return handoffState
 		}
-		// 同步运行目标图直到完成或暂停。
-		result, err := target.Run(ctx, handoffState, store)
+		result, resumed, err := runChildContinuation(ctx, state, target, store, initial)
 		if err != nil {
-			// 出错处理与子图步骤一致：部分状态随错误一并上交。
 			if result != nil {
 				return result.State, err
 			}
@@ -307,19 +485,22 @@ func NewHandoffStep(target *loom.Graph, store loom.Store, compressor ContextComp
 		// 目标图暂停：走与 YieldBubble 相同的冒泡协议（__child_run_id/__child_graph），
 		// 额外记录 handoff_to 标明这是一次移交而非普通子图调用。
 		if result.Yielded {
-			return loom.State{
-				"__yield":        true,
-				"__yield_phase":  "mid_step",
-				"__child_run_id": result.RunID,
-				"__child_graph":  target.Name,
-				"handoff_to":     target.Name,
-			}, nil
+			update, err := childYieldUpdate(target, result, resumed)
+			if err != nil {
+				return nil, err
+			}
+			update["handoff_to"] = target.Name
+			return update, nil
 		}
 
 		// 目标图完成：只回收其最终输出与移交去向，不把目标图的内部状态灌回父图。
-		return loom.State{
+		completed := loom.State{
 			"output":     result.State["output"],
 			"handoff_to": target.Name,
-		}, nil
+		}
+		if resumed {
+			return withChildContinuationCleanup(completed), nil
+		}
+		return completed, nil
 	}
 }
