@@ -507,6 +507,176 @@ func TestToolLoop_StatePatchSurvivesParkAndResume(t *testing.T) {
 	}
 }
 
+func TestToolLoop_StopLoopCommitsPatchWithoutAnotherLLMCall(t *testing.T) {
+	calls := []contract.ToolCall{
+		{ID: "stop-1", Name: "transfer"},
+		{ID: "sibling-1", Name: "observe"},
+	}
+	llm := &statePatchLLM{responses: []contract.ChatResponse{
+		{
+			ToolCalls: []contract.ToolCall{{ID: "warmup-1", Name: "observe"}},
+			Usage:     contract.Usage{InputTokens: 5, OutputTokens: 2, CostUSD: 0.25},
+		},
+		{
+			Content:   "handoff in progress",
+			ToolCalls: calls,
+			Usage:     contract.Usage{InputTokens: 7, OutputTokens: 3, CostUSD: 0.50},
+		},
+	}}
+	dispatched := make(map[string]int)
+	tools := &mockTools{tools: []contract.ToolDef{{Name: "transfer"}, {Name: "observe"}}, handler: func(call contract.ToolCall) *contract.ToolResult {
+		dispatched[call.ID]++
+		if call.Name == "transfer" {
+			return &contract.ToolResult{
+				CallID: call.ID, Content: "accepted", StopLoop: true,
+				StatePatch: map[string]any{"route": "agent-a"},
+			}
+		}
+		return &contract.ToolResult{CallID: call.ID, Content: "observed"}
+	}}
+	step := stdlib.NewToolLoopStep(llm, tools, stdlib.ToolLoopOpts{
+		Model: "test", MaxIterations: 2, StatePatchPolicy: stdlib.AllowKeys("transfer", "route"),
+	})
+
+	result, err := step(context.Background(), loom.State{"messages": []contract.Message{{Role: "user", Content: "go"}}})
+	assertNoError(t, err)
+	if result["route"] != "agent-a" {
+		t.Fatalf("stop patch not committed: %#v", result)
+	}
+	if result["output"] != "handoff in progress" {
+		t.Fatalf("output = %#v, want last assistant content", result["output"])
+	}
+	wantUsage := contract.Usage{InputTokens: 12, OutputTokens: 5, CostUSD: 0.75}
+	if result["usage"] != wantUsage {
+		t.Fatalf("usage = %#v, want %#v", result["usage"], wantUsage)
+	}
+	if len(llm.requests) != 2 {
+		t.Fatalf("LLM calls = %d, want 2", len(llm.requests))
+	}
+	for _, call := range calls {
+		if dispatched[call.ID] != 1 {
+			t.Fatalf("dispatch count for %q = %d, want 1", call.ID, dispatched[call.ID])
+		}
+	}
+}
+
+func TestToolLoop_StopLoopProtocolValidation(t *testing.T) {
+	tests := []struct {
+		name    string
+		result  contract.ToolResult
+		policy  *stdlib.StatePatchPolicy
+		wantErr string
+	}{
+		{
+			name:    "bare stop",
+			result:  contract.ToolResult{StopLoop: true},
+			policy:  stdlib.AllowKeys("transfer", "route"),
+			wantErr: "StopLoop",
+		},
+		{
+			name: "unauthorized tool",
+			result: contract.ToolResult{
+				StopLoop: true, StatePatch: map[string]any{"route": "agent-a"},
+			},
+			policy:  stdlib.AllowKeys("other", "route"),
+			wantErr: "not allowed",
+		},
+		{
+			name: "error stop",
+			result: contract.ToolResult{
+				StopLoop: true, IsError: true, StatePatch: map[string]any{"route": "agent-a"},
+			},
+			policy:  stdlib.AllowKeys("transfer", "route"),
+			wantErr: "IsError",
+		},
+		{
+			name: "parked stop",
+			result: contract.ToolResult{
+				StopLoop: true, Park: true, StatePatch: map[string]any{"route": "agent-a"},
+			},
+			policy:  stdlib.AllowKeys("transfer", "route"),
+			wantErr: "Park",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			call := contract.ToolCall{ID: "stop-1", Name: "transfer"}
+			llm := &statePatchLLM{responses: []contract.ChatResponse{{ToolCalls: []contract.ToolCall{call}}}}
+			tools := &mockTools{tools: []contract.ToolDef{{Name: "transfer"}}, handler: func(contract.ToolCall) *contract.ToolResult {
+				result := tt.result
+				result.CallID = call.ID
+				return &result
+			}}
+			step := stdlib.NewToolLoopStep(llm, tools, stdlib.ToolLoopOpts{
+				Model: "test", MaxIterations: 1, StatePatchPolicy: tt.policy,
+			})
+
+			result, err := step(context.Background(), loom.State{"messages": []contract.Message{{Role: "user", Content: "go"}}})
+			if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("error = %v, want substring %q", err, tt.wantErr)
+			}
+			if result != nil {
+				t.Fatalf("result = %#v, want nil on protocol error", result)
+			}
+		})
+	}
+}
+
+func TestToolLoop_ParkTakesPriorityOverStopUntilResume(t *testing.T) {
+	stopCall := contract.ToolCall{ID: "stop-1", Name: "transfer"}
+	parkCall := contract.ToolCall{ID: "park-1", Name: "wait"}
+	llm := &statePatchLLM{responses: []contract.ChatResponse{{
+		Content:   "handoff in progress",
+		ToolCalls: []contract.ToolCall{stopCall, parkCall},
+		Usage:     contract.Usage{InputTokens: 11, OutputTokens: 4, CostUSD: 0.03},
+	}}}
+	tools := &mockTools{
+		tools: []contract.ToolDef{{Name: "transfer"}, {Name: "wait"}},
+		handler: func(call contract.ToolCall) *contract.ToolResult {
+			if call.Name == "wait" {
+				return &contract.ToolResult{CallID: call.ID, Content: "parked", Park: true, ParkRef: "approval-1"}
+			}
+			return &contract.ToolResult{
+				CallID: call.ID, Content: "accepted", StopLoop: true,
+				StatePatch: map[string]any{"route": "agent-a"},
+			}
+		},
+	}
+	step := stdlib.NewToolLoopStep(llm, tools, stdlib.ToolLoopOpts{
+		Model: "test", StatePatchPolicy: stdlib.AllowKeys("transfer", "route"),
+	})
+
+	yielded, err := step(context.Background(), loom.State{"messages": []contract.Message{{Role: "user", Content: "go"}}})
+	assertNoError(t, err)
+	if yielded["__yield"] != true {
+		t.Fatalf("stop bypassed park: %#v", yielded)
+	}
+	if yielded["__toolloop_staged_patch"] == nil {
+		t.Fatalf("yielded state missing staged stop result: %#v", yielded)
+	}
+	checkpoint, err := json.Marshal(yielded)
+	assertNoError(t, err)
+	var resumed loom.State
+	assertNoError(t, json.Unmarshal(checkpoint, &resumed))
+	resumed["__resumed_tool_results"] = map[string]any{
+		parkCall.ID: map[string]any{"content": "approved", "is_error": false},
+	}
+
+	result, err := step(context.Background(), resumed)
+	assertNoError(t, err)
+	if result["route"] != "agent-a" || result["output"] != "handoff in progress" {
+		t.Fatalf("resumed stop result = %#v", result)
+	}
+	wantUsage := contract.Usage{InputTokens: 11, OutputTokens: 4, CostUSD: 0.03}
+	if result["usage"] != wantUsage {
+		t.Fatalf("usage = %#v, want %#v", result["usage"], wantUsage)
+	}
+	if len(llm.requests) != 1 {
+		t.Fatalf("LLM calls after resume = %d, want 1", len(llm.requests))
+	}
+}
+
 func TestToolLoop_MaxIterations(t *testing.T) {
 	// LLM keeps returning tool calls until the budget runs out. Exhaustion must
 	// NOT error the turn — the loop injects a wrap-up note and makes one final

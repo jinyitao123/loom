@@ -101,6 +101,10 @@ func NewToolLoopStep(llm contract.LLM, tools contract.ToolDispatcher, opts ToolL
 		stagedPatch := make(loom.State)
 		stagedPatchJSON := make(map[string][]byte)
 		stagedPatchResults := make([]contract.ToolResult, 0)
+		accumulatedUsage, err := decodeToolLoopUsage(state["__toolloop_usage"])
+		if err != nil {
+			return nil, err
+		}
 
 		var msgs []contract.Message
 		if resumedFromPark {
@@ -145,7 +149,11 @@ func NewToolLoopStep(llm contract.LLM, tools contract.ToolDispatcher, opts ToolL
 					"__toolloop_pending":      remaining,
 					"__resumed_tool_results":  nil,
 					"__toolloop_staged_patch": stagedPatchResults,
+					"__toolloop_usage":        accumulatedUsage,
 				}, nil
+			}
+			if hasStopLoopResult(stagedPatchResults) {
+				return finishToolLoop(lastAssistantContent(msgs), accumulatedUsage, true, stagedPatch), nil
 			}
 
 			// Resume invariant: after the assistant tool_calls message, every call_id has exactly one real
@@ -235,6 +243,7 @@ func NewToolLoopStep(llm contract.LLM, tools contract.ToolDispatcher, opts ToolL
 			if err != nil {
 				return loom.State{"__error": err.Error()}, err
 			}
+			accumulatedUsage = addUsage(accumulatedUsage, resp.Usage)
 
 			// 模型没有再请求工具 ⇒ 任务在本轮完成，把文本答案与用量写入输出状态，正常收官。
 			if len(resp.ToolCalls) == 0 {
@@ -299,7 +308,11 @@ func NewToolLoopStep(llm contract.LLM, tools contract.ToolDispatcher, opts ToolL
 					"__toolloop_msgs":         msgs,
 					"__toolloop_pending":      parked,
 					"__toolloop_staged_patch": stagedPatchResults,
+					"__toolloop_usage":        accumulatedUsage,
 				}, nil
+			}
+			if hasStopLoopResult(results) {
+				return finishToolLoop(resp.Content, accumulatedUsage, resumedFromPark, stagedPatch), nil
 			}
 			// 结果回填协议：先追加 assistant 的工具调用消息，再逐条追加对应的工具结果消息，
 			// 保持"调用在前、结果在后"的顺序供下一轮 LLM 阅读。
@@ -420,11 +433,54 @@ func decodeStagedStatePatch(raw any) ([]contract.ToolResult, error) {
 	return results, nil
 }
 
+func decodeToolLoopUsage(raw any) (contract.Usage, error) {
+	if raw == nil {
+		return contract.Usage{}, nil
+	}
+	if usage, ok := raw.(contract.Usage); ok {
+		return usage, nil
+	}
+	data, err := json.Marshal(raw)
+	if err != nil {
+		return contract.Usage{}, fmt.Errorf("loom/toolloop: encode __toolloop_usage: %w", err)
+	}
+	var usage contract.Usage
+	if err := json.Unmarshal(data, &usage); err != nil {
+		return contract.Usage{}, fmt.Errorf("loom/toolloop: decode __toolloop_usage: %w", err)
+	}
+	return usage, nil
+}
+
+func addUsage(total, usage contract.Usage) contract.Usage {
+	total.InputTokens += usage.InputTokens
+	total.OutputTokens += usage.OutputTokens
+	total.CostUSD += usage.CostUSD
+	return total
+}
+
+func lastAssistantContent(msgs []contract.Message) string {
+	for i := len(msgs) - 1; i >= 0; i-- {
+		if msgs[i].Role == "assistant" {
+			return msgs[i].Content
+		}
+	}
+	return ""
+}
+
 // hasParkedToolResult reports whether a dispatch batch requests a run-level approval yield.
 // hasParkedToolResult 判断本批结果是否包含要求整轮暂停等待批准的 park 标记。
 func hasParkedToolResult(results []contract.ToolResult) bool {
 	for _, result := range results {
 		if result.Park {
+			return true
+		}
+	}
+	return false
+}
+
+func hasStopLoopResult(results []contract.ToolResult) bool {
+	for _, result := range results {
+		if result.StopLoop {
 			return true
 		}
 	}
@@ -443,6 +499,7 @@ func finishToolLoop(content string, usage contract.Usage, resumedFromPark bool, 
 		result["__toolloop_msgs"] = nil
 		result["__resumed_tool_results"] = nil
 		result["__toolloop_staged_patch"] = nil
+		result["__toolloop_usage"] = nil
 	}
 	return result
 }
@@ -450,6 +507,17 @@ func finishToolLoop(content string, usage contract.Usage, resumedFromPark bool, 
 // stageStatePatches validates post-hook tool results and accumulates patches until normal ToolLoop completion.
 func stageStatePatches(results []contract.ToolResult, policy *StatePatchPolicy, staged loom.State, stagedJSON map[string][]byte) error {
 	for _, result := range results {
+		if result.StopLoop {
+			if result.IsError {
+				return fmt.Errorf("loom/toolloop: StopLoop protocol violation: IsError result %q requests stop", result.CallID)
+			}
+			if result.Park {
+				return fmt.Errorf("loom/toolloop: StopLoop protocol violation: Park result %q requests stop", result.CallID)
+			}
+			if result.StatePatch == nil {
+				return fmt.Errorf("loom/toolloop: StopLoop protocol violation: result %q requires a StatePatch", result.CallID)
+			}
+		}
 		if result.StatePatch == nil {
 			continue
 		}

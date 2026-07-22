@@ -230,6 +230,19 @@ tools. An invalid or malicious patch fails the entire ToolLoop step. An ordinary
 does not prevent a valid sibling patch from being staged. Future compare-and-swap, budget debit, deep-merge, or
 other typed operations must use distinct typed protocols rather than reinterpret this map.
 
+A tool result may also set `stop_loop: true` to commit-and-stop. In v1 this is valid only when that same result
+carries a `StatePatch`, the patch passes the existing tool-by-key `StatePatchPolicy`, and the result is neither
+`IsError` nor `Park`; a bare or otherwise invalid stop is a protocol error. The entire tool-call batch still runs
+and every patch is validated and staged before stop takes effect. If any sibling result parks, park takes priority:
+the stop-bearing result and accumulated usage are checkpointed with the staged patches, and a completed Resume
+commits and stops immediately when the saved stop is still valid.
+
+Commit-and-stop is a normal completion, so it commits staged patches even when it occurs on the final iteration or
+at the cycle limit. Unlike natural completion, it makes no final LLM call; unlike forced completion after tool-budget
+exhaustion or cycle detection, it does not discard staged patches. The step `output` is the last assistant message's
+content (which may be empty), and `usage` is the cumulative usage of LLM calls already made. Because there is no final
+LLM text, the host is responsible for the final presentation.
+
 ## The `loom` CLI
 
 Loom is a library first — but the repo also ships `loom`, a standalone agent engine built on that library. It is the [weave](https://github.com/jinyitao123/Weave) daemon's spawn-harness backend: prompt JSON on stdin, one agent turn, NDJSON events on stdout — with MCP tool servers, session resume, semantic memory, and deterministic sub-agent orchestration compiled from an agent spec.

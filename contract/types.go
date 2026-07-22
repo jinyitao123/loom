@@ -31,6 +31,7 @@ type ToolResult struct {
 	IsError    bool           `json:"is_error,omitempty"`    // 标记执行失败：错误也作为结果反馈给模型，而不是中断循环
 	ToolName   string         `json:"tool_name,omitempty"`   // for post-hook matching
 	StatePatch map[string]any `json:"state_patch,omitempty"` // optional control-plane state delta; ToolLoop policy-gates it
+	StopLoop   bool           `json:"stop_loop,omitempty"`   // commit a valid StatePatch and end ToolLoop without another LLM call
 	// ToolName 冗余记录工具名：ToolHook 的 Post 阶段只拿到结果时仍能按工具名匹配。
 	Park    bool   `json:"park,omitempty"`     // true=本次调用未执行，已被平台扣下等外部批准；Content 仅为占位说明，循环不得将其当作执行结果
 	ParkRef string `json:"park_ref,omitempty"` // 平台侧不透明关联引用（如审批动作 ID），原样带进暂停现场供宿主定位
