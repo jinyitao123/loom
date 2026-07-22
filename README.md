@@ -164,6 +164,23 @@ result, _ = g.Resume(ctx, runID, State{}, pgStore)
 </tr>
 </table>
 
+### Checkpoint schema compatibility
+
+Every newly written checkpoint carries `schema_version: 1`. A newer Loom binary
+accepts legacy checkpoints that have no version field (treated as version 0),
+while an older binary rejects checkpoints whose version is newer than it
+supports. This applies consistently to `Resume`, `ResumeAt`, and history reads;
+unsupported formats fail closed with both versions in the error.
+
+The checkpoint envelope also reserves optional `meta` data for future
+provenance, such as the source of sensitive state keys or the policy version
+that produced them. Loom does not consume this field yet.
+
+When rolling back Loom, keep the existing deployment discipline: isolate the
+checkpoint store from checkpoints written by the newer binary before starting
+the older binary. Schema rejection prevents unsafe resume; it does not make a
+newer checkpoint readable by older code.
+
 ## What the Kernel Deliberately Doesn't Know
 
 This is Loom's most important design decision.

@@ -64,6 +64,9 @@ type RunResult struct {
 	StopReason StopReason // 停机原因分类
 }
 
+// CurrentCheckpointSchema is the newest checkpoint format this binary can read.
+const CurrentCheckpointSchema = 1
+
 // checkpoint 是落盘到 Store 的检查点结构：一步执行并合并之后的自洽快照。
 // latest 位于键 RunID；启用历史后，同一份字节还会追加到 RunID/零填充序号，形成只增不改的存档链。
 type checkpoint struct {
@@ -76,8 +79,18 @@ type checkpoint struct {
 	State     State  `json:"state"`                // 合并后的完整状态快照（自洽，可独立恢复现场）
 	// YieldPhase：暂停阶段协议——"mid_step"=恢复时重跑该步骤；"after_step"=恢复时跳过该步骤直接走路由；
 	// 空串兼容 v1.0 旧检查点（按 mid_step 处理）。
-	YieldPhase string    `json:"yield_phase"`
-	SavedAt    time.Time `json:"saved_at"` // 落盘时间戳，便于审计与过期清理
+	YieldPhase string         `json:"yield_phase"`
+	SavedAt    time.Time      `json:"saved_at"`       // 落盘时间戳，便于审计与过期清理
+	Schema     int            `json:"schema_version"` // 格式版本；存量无字段检查点反序列化为 0
+	Meta       map[string]any `json:"meta,omitempty"` // 可选来源元信息；当前仅预留，不参与恢复语义
+}
+
+func validateCheckpointSchema(cp checkpoint) error {
+	if cp.Schema > CurrentCheckpointSchema {
+		return fmt.Errorf("loom: unsupported checkpoint schema version %d (supported version %d)",
+			cp.Schema, CurrentCheckpointSchema)
+	}
+	return nil
 }
 
 // CheckpointInfo is the public metadata view of one historical checkpoint.
@@ -329,6 +342,9 @@ func (g *Graph) Resume(ctx context.Context, runID string, input State, store Sto
 	if err := json.Unmarshal(data, &cp); err != nil {
 		return nil, fmt.Errorf("loom: corrupt checkpoint for run %s: %w", runID, err)
 	}
+	if err := validateCheckpointSchema(cp); err != nil {
+		return nil, fmt.Errorf("loom: cannot resume run %s: %w", runID, err)
+	}
 
 	// 恢复现场：以检查点快照为底、人工输入为增量做合并——人工反馈按正常合并语义并入状态；
 	// 随快照落盘的 __budget_remaining 会在下方 Run 中为全新 context 重新装载共享计数器。
@@ -381,6 +397,9 @@ func (g *Graph) ResumeAt(ctx context.Context, runID string, seq int64, input Sta
 		// 历史键存在但内容不可解析即视为损坏；不得从不可信快照启动新分支。
 		return nil, fmt.Errorf("loom: corrupt checkpoint for run %s at seq %d: %w (%v)",
 			runID, seq, ErrCorruptCheckpoint, err)
+	}
+	if err := validateCheckpointSchema(cp); err != nil {
+		return nil, fmt.Errorf("loom: cannot resume run %s at seq %d: %w", runID, seq, err)
 	}
 
 	// fork 现场以源快照为底合并调用方输入，然后强制覆盖三个身份/溯源协议键：
@@ -447,6 +466,9 @@ func (g *Graph) History(ctx context.Context, store Store, runID string) ([]Check
 				"graph", g.Name, "run_id", runID, "key", key, "error", err)
 			continue
 		}
+		if err := validateCheckpointSchema(cp); err != nil {
+			return nil, fmt.Errorf("loom: cannot read checkpoint history for run %s at key %s: %w", runID, key, err)
+		}
 		history = append(history, CheckpointInfo{
 			Seq: cp.Seq, LastStep: cp.LastStep, YieldPhase: cp.YieldPhase, SavedAt: cp.SavedAt,
 		})
@@ -497,6 +519,7 @@ func (g *Graph) doCheckpoint(ctx context.Context, store Store, runID, step strin
 
 	// 组装检查点：完整状态 + 序号/溯源 + 步骤位置 + 暂停阶段 + 时间戳，构成可独立恢复的自洽快照。
 	cp := checkpoint{
+		Schema:     CurrentCheckpointSchema,
 		RunID:      runID,
 		Graph:      g.Name,
 		Seq:        seq,

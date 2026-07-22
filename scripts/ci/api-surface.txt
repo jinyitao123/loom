@@ -55,6 +55,7 @@ type StatePatchPolicy struct{ ... }
 type StepHook func(ctx context.Context, stepName string, state loom.State) error
 type SubAgentRef struct{ ... }
 type SubGraphOpts struct{ ... }
+    func WithParentMergeConfig(cfg *loom.MergeConfig) SubGraphOpts
 type ToolLoopOpts struct{ ... }
 type YieldPolicy int
     const YieldBubble YieldPolicy = iota ...

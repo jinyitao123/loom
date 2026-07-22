@@ -2,6 +2,7 @@ package loom_test
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"testing"
 
@@ -123,6 +124,73 @@ func TestGraph_Checkpoint_Saved(t *testing.T) {
 	if len(data) == 0 {
 		t.Error("checkpoint data is empty")
 	}
+}
+
+func TestGraph_CheckpointSchema_CurrentVersionResumes(t *testing.T) {
+	store := loom.NewMemStore()
+	g := loom.NewGraph("schema-current", "s")
+	g.AddStep("s", echoStep("runs", "yes"), loom.End())
+
+	result, err := g.Run(context.Background(), loom.State{}, store)
+	assertNoError(t, err)
+
+	data, err := store.Get(context.Background(), "checkpoint:schema-current", result.RunID)
+	assertNoError(t, err)
+	var raw map[string]any
+	assertNoError(t, json.Unmarshal(data, &raw))
+	if got := raw["schema_version"]; got != float64(loom.CurrentCheckpointSchema) {
+		t.Fatalf("schema_version = %v, want %d", got, loom.CurrentCheckpointSchema)
+	}
+
+	resumed, err := g.Resume(context.Background(), result.RunID, loom.State{}, store)
+	assertNoError(t, err)
+	assertState(t, resumed, "runs", "yes")
+}
+
+func TestGraph_CheckpointSchema_ResumeRejectsFutureVersion(t *testing.T) {
+	store := loom.NewMemStore()
+	g := loom.NewGraph("schema-future", "s")
+	g.AddStep("s", echoStep("unexpected", "true"), loom.End())
+	runID := "future-run"
+	data := []byte(fmt.Sprintf(`{"schema_version":%d,"run_id":%q,"graph":%q,"last_step":"s","state":{}}`,
+		loom.CurrentCheckpointSchema+1, runID, g.Name))
+	assertNoError(t, store.Put(context.Background(), "checkpoint:"+g.Name, runID, data))
+
+	_, err := g.Resume(context.Background(), runID, loom.State{}, store)
+	assertError(t, err, fmt.Sprintf("checkpoint schema version %d", loom.CurrentCheckpointSchema+1))
+	assertError(t, err, fmt.Sprintf("supported version %d", loom.CurrentCheckpointSchema))
+}
+
+func TestGraph_CheckpointSchema_ResumeAcceptsLegacyVersionZero(t *testing.T) {
+	store := loom.NewMemStore()
+	g := loom.NewGraph("schema-legacy", "s")
+	g.AddStep("s", echoStep("legacy", "resumed"), loom.End())
+	runID := "legacy-run"
+	data := []byte(`{"run_id":"legacy-run","graph":"schema-legacy","last_step":"s","state":{}}`)
+	assertNoError(t, store.Put(context.Background(), "checkpoint:"+g.Name, runID, data))
+
+	result, err := g.Resume(context.Background(), runID, loom.State{}, store)
+	assertNoError(t, err)
+	assertState(t, result, "legacy", "resumed")
+}
+
+func TestGraph_CheckpointSchema_HistoryAndResumeAtRejectFutureVersion(t *testing.T) {
+	store := loom.NewMemStore()
+	g := loom.NewGraph("schema-history", "s", loom.WithCheckpointHistory(-1))
+	g.AddStep("s", echoStep("unexpected", "true"), loom.End())
+	runID := "future-history-run"
+	key := runID + "/000000000001"
+	data := []byte(fmt.Sprintf(`{"schema_version":%d,"run_id":%q,"graph":%q,"seq":1,"last_step":"s","state":{}}`,
+		loom.CurrentCheckpointSchema+1, runID, g.Name))
+	assertNoError(t, store.Put(context.Background(), "checkpoint:"+g.Name, key, data))
+
+	_, err := g.ResumeAt(context.Background(), runID, 1, loom.State{}, store)
+	assertError(t, err, fmt.Sprintf("checkpoint schema version %d", loom.CurrentCheckpointSchema+1))
+	assertError(t, err, fmt.Sprintf("supported version %d", loom.CurrentCheckpointSchema))
+
+	_, err = g.History(context.Background(), store, runID)
+	assertError(t, err, fmt.Sprintf("checkpoint schema version %d", loom.CurrentCheckpointSchema+1))
+	assertError(t, err, fmt.Sprintf("supported version %d", loom.CurrentCheckpointSchema))
 }
 
 func TestGraph_Checkpoint_Required_FailAborts(t *testing.T) {
