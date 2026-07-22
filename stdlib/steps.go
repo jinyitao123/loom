@@ -1,8 +1,10 @@
 package stdlib
 
 import (
+	"bytes"
 	"context" // 步骤签名的第一参数，承载超时/取消并向子图透传
-	"fmt"     // 子图暂停策略违规时构造错误
+	"encoding/json"
+	"fmt" // 子图暂停策略违规时构造错误
 
 	"github.com/jinyitao123/loom" // 内核包：Step/State/Graph/Store/RunResult
 )
@@ -75,8 +77,15 @@ const (
 // SubGraphOpts configures sub-graph step behavior.
 // SubGraphOpts 配置子图步骤的行为：暂停策略 + （YieldCustom 时的）自定义处理器。
 type SubGraphOpts struct {
-	YieldPolicy  YieldPolicy                                                                // 采用哪种暂停策略
-	YieldHandler func(ctx context.Context, childResult *loom.RunResult) (loom.State, error) // YieldCustom 专用：自定义处置子图暂停结果
+	YieldPolicy       YieldPolicy                                                                // 采用哪种暂停策略
+	YieldHandler      func(ctx context.Context, childResult *loom.RunResult) (loom.State, error) // YieldCustom 专用：自定义处置子图暂停结果
+	ParentMergeConfig *loom.MergeConfig                                                          // 父图应用本步骤增量时使用的合并配置
+}
+
+// WithParentMergeConfig configures a sub-graph step to calculate deltas for
+// the merge policies used by its parent graph.
+func WithParentMergeConfig(cfg *loom.MergeConfig) SubGraphOpts {
+	return SubGraphOpts{ParentMergeConfig: cfg}
 }
 
 // NewSubGraphStep creates a step that runs a child graph.
@@ -127,9 +136,133 @@ func NewSubGraphStep(child *loom.Graph, store loom.Store, opts ...SubGraphOpts) 
 			}
 		}
 
-		// 子图正常完成：其最终状态就是本步骤的输出，合并回父图状态。
-		return result.State, nil
+		// 子图正常完成：只把相对步骤输入发生变化的键作为增量交给父引擎合并。
+		return subGraphDelta(state, result.State, o.ParentMergeConfig)
 	}
+}
+
+func subGraphDelta(input, final loom.State, parentCfg *loom.MergeConfig) (loom.State, error) {
+	delta := make(loom.State)
+	for key, finalValue := range final {
+		inputValue, existed := input[key]
+		if existed {
+			equal, err := equalJSONValue(inputValue, finalValue)
+			if err != nil {
+				return nil, fmt.Errorf("loom: compare sub-graph state key %q: %w", key, err)
+			}
+			if equal {
+				continue
+			}
+		} else {
+			delta[key] = finalValue
+			continue
+		}
+
+		candidate, err := mergeAwareDelta(key, inputValue, finalValue, parentCfg)
+		if err != nil {
+			return nil, err
+		}
+		delta[key] = candidate
+	}
+	return delta, nil
+}
+
+func mergeAwareDelta(key string, inputValue, finalValue any, parentCfg *loom.MergeConfig) (any, error) {
+	nonPrefixSlice := false
+	if inputSlice, ok := inputValue.([]any); ok {
+		if finalSlice, ok := finalValue.([]any); ok {
+			suffix, prefix, err := sliceSuffix(inputSlice, finalSlice)
+			if err != nil {
+				return nil, fmt.Errorf("loom: compare sub-graph slice key %q: %w", key, err)
+			}
+			if parentCfg == nil {
+				if !prefix {
+					return nil, fmt.Errorf("loom: sub-graph slice key %q does not preserve the input prefix", key)
+				}
+				return suffix, nil
+			}
+			if prefix {
+				matches, err := mergedValueEquals(key, inputValue, suffix, finalValue, parentCfg)
+				if err != nil {
+					return nil, err
+				}
+				if matches {
+					return suffix, nil
+				}
+			} else {
+				nonPrefixSlice = true
+			}
+		}
+	}
+
+	if parentCfg != nil {
+		var difference any
+		switch inputNumber := inputValue.(type) {
+		case int:
+			if finalNumber, ok := finalValue.(int); ok {
+				difference = finalNumber - inputNumber
+			}
+		case float64:
+			if finalNumber, ok := finalValue.(float64); ok {
+				difference = finalNumber - inputNumber
+			}
+		}
+		if difference != nil {
+			matches, err := mergedValueEquals(key, inputValue, difference, finalValue, parentCfg)
+			if err != nil {
+				return nil, err
+			}
+			if matches {
+				return difference, nil
+			}
+		}
+
+		matches, err := mergedValueEquals(key, inputValue, finalValue, finalValue, parentCfg)
+		if err != nil {
+			return nil, err
+		}
+		if !matches {
+			if nonPrefixSlice {
+				return nil, fmt.Errorf("loom: sub-graph slice key %q does not preserve the input prefix", key)
+			}
+			return nil, fmt.Errorf("loom: sub-graph key %q cannot reproduce the child state with the parent merge policy", key)
+		}
+	}
+
+	return finalValue, nil
+}
+
+func sliceSuffix(input, final []any) ([]any, bool, error) {
+	if len(input) > len(final) {
+		return nil, false, nil
+	}
+	for i := range input {
+		equal, err := equalJSONValue(input[i], final[i])
+		if err != nil {
+			return nil, false, err
+		}
+		if !equal {
+			return nil, false, nil
+		}
+	}
+	return final[len(input):], true, nil
+}
+
+func mergedValueEquals(key string, existing, incoming, want any, cfg *loom.MergeConfig) (bool, error) {
+	merged := (loom.State{key: existing}).Merge(loom.State{key: incoming}, cfg)
+	return equalJSONValue(merged[key], want)
+}
+
+func equalJSONValue(left, right any) (bool, error) {
+	leftJSON, err := json.Marshal(left)
+	if err != nil {
+		return false, err
+	}
+	rightJSON, err := json.Marshal(right)
+	if err != nil {
+		return false, err
+	}
+	return bytes.Equal(leftJSON, rightJSON), nil
 }
 
 // ContextCompressor compresses conversation history for handoffs.

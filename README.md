@@ -131,6 +131,16 @@ parent.AddStep("analyst", SubGraphStep(analystGraph), ...)
 parent.AddStep("coder",   SubGraphStep(coderGraph),   ...)
 ```
 
+`stdlib.NewSubGraphStep` follows the Step contract by returning only the child's
+per-key JSON changes relative to the state it received. By default, changed
+slice values are returned as suffixes, so a parent using `AppendSlice` does not
+append the inherited prefix twice; a child that reorders or replaces that prefix
+fails closed. For `SumInt`, `SumFloat`, or an explicit overwrite policy, pass
+the parent's merge configuration with
+`stdlib.WithParentMergeConfig(parentMergeConfig)` so the step can return the
+numeric difference or full replacement required by that policy. A host using a
+sum policy must always pass this configuration explicitly.
+
 </td>
 </tr>
 <tr>
