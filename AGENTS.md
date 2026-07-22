@@ -31,6 +31,40 @@ Concretely:
 
 If a change needs to break the layering, it's the wrong change.
 
+## Kernel purity guardrails
+
+The five kernel files (`graph.go`, `step.go`, `router.go`, `state.go`,
+`store.go`) are frozen around a single-hop, serial, deterministic design with
+no business vocabulary. `contract/` contains only generally useful mechanism
+types and must not use business-domain names. `stdlib/` contains only
+business-agnostic compositions of the existing mechanisms. Business semantics
+always stay in the Layer-3 host (for example, weave); they never move down into
+Loom.
+
+Kernel invariants:
+
+- A step returns only a state delta.
+- The engine is the sole place that merges state deltas.
+- Default-path behavior does not change; enforcement is opt-in and
+  fail-closed.
+- Routing is deterministic and single-hop.
+
+The kernel business-word blacklist has a single source of truth in
+`scripts/ci/no-business-words.sh`. It currently covers `avatar`, `team`,
+`transfer`, `delegate`, `weave`, `tenant`, `审批`, `团队`, `分身`, `员工` and is
+checked only against the five kernel files above. `agent` is intentionally not
+blacklisted: Loom is an agent engine, so `agent` and `CompileAgent` are generic
+Loom vocabulary. If a proposed blacklist word already occurs in the kernel,
+report the hit before changing the list; do not edit kernel code merely to pass
+the guardrail.
+
+Every future Loom ticket completion report must answer this purity proof:
+
+1. Which layer changed?
+2. Did the change introduce any business vocabulary?
+3. Did default-path behavior change?
+4. For each of the four kernel invariants above, was it preserved?
+
 ## Build / test / lint (match CI before you commit)
 
 CI (`.github/workflows/loom-cli.yml`) gates on `cmd/loom`; run these locally:

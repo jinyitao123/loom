@@ -1,0 +1,60 @@
+# contract
+type ChatRequest struct{ ... }
+type ChatResponse struct{ ... }
+type EffortLevel string
+    const EffortLow EffortLevel = "low" ...
+type Embedder interface{ ... }
+type LLM interface{ ... }
+type Message struct{ ... }
+type StreamChunk struct{ ... }
+type StreamSink interface{ ... }
+type ToolCall struct{ ... }
+type ToolDef struct{ ... }
+type ToolDispatcher interface{ ... }
+type ToolHook struct{ ... }
+type ToolResult struct{ ... }
+type Usage struct{ ... }
+# stdlib
+func CostBudgetHook(maxUSD float64) loom.StepHook
+func DispatchWithHooks(ctx context.Context, tools contract.ToolDispatcher, calls []contract.ToolCall, ...) ([]contract.ToolResult, error)
+func GetBool(s loom.State, key string, fallback bool) bool
+func GetFloat(s loom.State, key string, fallback float64) float64
+func GetMessages(s loom.State) ([]contract.Message, error)
+func GetString(s loom.State, key, fallback string) string
+func LoadSession(store loom.Store, sessionID string) ([]contract.Message, error)
+func MustGetMessages(s loom.State) []contract.Message
+func NewGuardStep(checks ...StepHook) loom.Step
+func NewHandoffStep(target *loom.Graph, store loom.Store, compressor ContextCompressor) loom.Step
+func NewHumanWaitStep(promptKey, responseKey string) loom.Step
+func NewLLMCallStep(llm interface{ ... }) loom.Step
+func NewPromptAssembleStep(cfg PromptConfig) loom.Step
+func NewSkillDispatcher(inner contract.ToolDispatcher, skills []SkillDef) contract.ToolDispatcher
+func NewStreamingLLM(inner contract.LLM, sink contract.StreamSink) contract.LLM
+func NewSubGraphStep(child *loom.Graph, store loom.Store, opts ...SubGraphOpts) loom.Step
+func NewToolLoopStep(llm contract.LLM, tools contract.ToolDispatcher, opts ToolLoopOpts) loom.Step
+func SaveSession(store loom.Store, sessionID string, msgs []contract.Message) error
+func SetOutput(content string, usage contract.Usage) loom.State
+func TokenBudgetHook(maxTokens int64) loom.StepHook
+type AgentSpec struct{ ... }
+    func LoadFromDirectory(dir string) (*AgentSpec, error)
+type CompactionPolicy struct{ ... }
+type ContextCompressor interface{ ... }
+type HealthCheckDef struct{ ... }
+type IdentitySpec struct{ ... }
+type KeywordMatcher struct{}
+type PermissionDispatcher struct{ ... }
+    func NewPermissionDispatcher(inner contract.ToolDispatcher, deny, allow []string) *PermissionDispatcher
+    func NewPermissionDispatcherWithAsk(inner contract.ToolDispatcher, deny, ask, allow []string) *PermissionDispatcher
+type ProfileEntry struct{ ... }
+type PromptConfig struct{ ... }
+type SkillDef struct{ ... }
+type SkillMatchResult struct{ ... }
+type SkillMatcher interface{ ... }
+type StatePatchPolicy struct{ ... }
+    func AllowKeys(tool string, keys ...string) *StatePatchPolicy
+type StepHook func(ctx context.Context, stepName string, state loom.State) error
+type SubAgentRef struct{ ... }
+type SubGraphOpts struct{ ... }
+type ToolLoopOpts struct{ ... }
+type YieldPolicy int
+    const YieldBubble YieldPolicy = iota ...
