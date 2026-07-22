@@ -148,6 +148,28 @@ func TestState_Merge_DoesNotMutateOriginal(t *testing.T) {
 	}
 }
 
+func TestState_Merge_DeletedKeysProtocol(t *testing.T) {
+	s := loom.State{"keep": "yes", "remove": "old", "__deleted_keys": []string{"stale"}}
+	updated := s.Merge(loom.State{
+		"remove":         "replacement-is-discarded",
+		"added":          "new",
+		"__deleted_keys": []string{"remove", "missing"},
+	}, nil)
+
+	if _, ok := updated["remove"]; ok {
+		t.Fatalf("remove remains in merged state: %#v", updated)
+	}
+	if _, ok := updated["__deleted_keys"]; ok {
+		t.Fatalf("protocol key leaked into merged state: %#v", updated)
+	}
+	if updated["keep"] != "yes" || updated["added"] != "new" {
+		t.Fatalf("unrelated merge values changed: %#v", updated)
+	}
+	if _, ok := s["remove"]; !ok {
+		t.Fatalf("original state was mutated: %#v", s)
+	}
+}
+
 func TestState_Marshal_Roundtrip(t *testing.T) {
 	s := loom.State{"name": "test", "count": float64(42)}
 	data, err := s.Marshal()

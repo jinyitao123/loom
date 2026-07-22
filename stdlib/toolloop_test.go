@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -183,6 +184,149 @@ func TestToolLoop_StatePatchValidation(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestToolLoop_StateOpsApplyInOrderAfterPatch(t *testing.T) {
+	llm := &mockLLM{responses: []contract.ChatResponse{
+		{ToolCalls: []contract.ToolCall{{ID: "1", Name: "update"}}},
+		{Content: "done"},
+	}}
+	tools := &mockTools{}
+	tools.handler = func(call contract.ToolCall) *contract.ToolResult {
+		return &contract.ToolResult{
+			CallID: call.ID, StatePatch: map[string]any{"balance": float64(20)},
+			StateOps: []contract.StateOp{
+				{Type: "debit", Key: "balance", Value: float64(3)},
+				{Type: "cas", Key: "balance", Expect: float64(17), Value: float64(9)},
+				{Type: "replace", Key: "status", Value: "paid"},
+				{Type: "delete", Key: "obsolete"},
+			},
+		}
+	}
+	step := stdlib.NewToolLoopStep(llm, tools, stdlib.ToolLoopOpts{
+		Model: "test", StatePatchPolicy: stdlib.AllowKeys("update", "balance", "status", "obsolete"),
+	})
+
+	delta, err := step(context.Background(), loom.State{
+		"messages": []contract.Message{{Role: "user", Content: "go"}},
+		"balance":  float64(100), "obsolete": "yes",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if delta["balance"] != float64(9) || delta["status"] != "paid" {
+		t.Fatalf("ops result = %#v", delta)
+	}
+	deleted, ok := delta["__deleted_keys"].([]string)
+	if !ok || !reflect.DeepEqual(deleted, []string{"obsolete"}) {
+		t.Fatalf("deleted keys = %#v", delta["__deleted_keys"])
+	}
+}
+
+func TestToolLoop_StateOpsDebitMissingUsesZero(t *testing.T) {
+	delta, err := runSingleStateOps(t, loom.State{}, contract.StateOp{Type: "debit", Key: "balance", Value: float64(2)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if delta["balance"] != float64(-2) {
+		t.Fatalf("balance = %#v, want -2", delta["balance"])
+	}
+}
+
+func TestToolLoop_StateOpsCASFailureFailsStep(t *testing.T) {
+	_, err := runSingleStateOps(t, loom.State{"status": "old"}, contract.StateOp{
+		Type: "cas", Key: "status", Expect: "other", Value: "new",
+	})
+	if err == nil || !strings.Contains(err.Error(), "cas") {
+		t.Fatalf("error = %v, want cas protocol error", err)
+	}
+}
+
+func TestToolLoop_StateOpsProtocolValidation(t *testing.T) {
+	tests := []struct {
+		name   string
+		tool   string
+		op     contract.StateOp
+		policy *stdlib.StatePatchPolicy
+	}{
+		{name: "unauthorized tool", tool: "other", op: contract.StateOp{Type: "replace", Key: "route", Value: "a"}, policy: stdlib.AllowKeys("update", "route")},
+		{name: "reserved key", tool: "update", op: contract.StateOp{Type: "delete", Key: "__deleted_keys"}, policy: stdlib.AllowKeys("update", "__deleted_keys")},
+		{name: "protocol nil validator", tool: "update", op: contract.StateOp{Type: "replace", Key: "__route", Value: "a"}, policy: stdlib.AllowKeys("update", "__route")},
+		{name: "non json value", tool: "update", op: contract.StateOp{Type: "replace", Key: "route", Value: func() {}}, policy: stdlib.AllowKeys("update", "route")},
+		{name: "non number debit", tool: "update", op: contract.StateOp{Type: "debit", Key: "route", Value: "one"}, policy: stdlib.AllowKeys("update", "route")},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			llm := &mockLLM{responses: []contract.ChatResponse{{ToolCalls: []contract.ToolCall{{ID: "1", Name: tt.tool}}}}}
+			tools := &mockTools{handler: func(call contract.ToolCall) *contract.ToolResult {
+				return &contract.ToolResult{CallID: call.ID, StateOps: []contract.StateOp{tt.op}}
+			}}
+			step := stdlib.NewToolLoopStep(llm, tools, stdlib.ToolLoopOpts{Model: "test", StatePatchPolicy: tt.policy})
+			result, err := step(context.Background(), loom.State{"messages": []contract.Message{{Role: "user", Content: "go"}}})
+			if err == nil {
+				t.Fatalf("result = %#v, want protocol error", result)
+			}
+		})
+	}
+}
+
+func TestToolLoop_StateOpsValidateWithOldValue(t *testing.T) {
+	var gotOld, gotNew any
+	policy := stdlib.AllowKeys("update", "balance")
+	policy.ValidateWithState = map[string]map[string]func(old, new any) error{
+		"update": {"balance": func(old, new any) error { gotOld, gotNew = old, new; return nil }},
+	}
+	_, err := runSingleStateOpsWithPolicy(t, loom.State{"balance": float64(10)}, policy,
+		contract.StateOp{Type: "debit", Key: "balance", Value: float64(3)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotOld != float64(10) || gotNew != float64(7) {
+		t.Fatalf("validator saw old=%#v new=%#v", gotOld, gotNew)
+	}
+}
+
+func TestToolLoop_StatePatchValidateWithOldValue(t *testing.T) {
+	var gotOld, gotNew any
+	policy := stdlib.AllowKeys("update", "status")
+	policy.ValidateWithState = map[string]map[string]func(old, new any) error{
+		"update": {"status": func(old, new any) error { gotOld, gotNew = old, new; return nil }},
+	}
+	llm := &mockLLM{responses: []contract.ChatResponse{
+		{ToolCalls: []contract.ToolCall{{ID: "1", Name: "update"}}}, {Content: "done"},
+	}}
+	tools := &mockTools{handler: func(call contract.ToolCall) *contract.ToolResult {
+		return &contract.ToolResult{CallID: call.ID, StatePatch: map[string]any{"status": "new"}}
+	}}
+	step := stdlib.NewToolLoopStep(llm, tools, stdlib.ToolLoopOpts{Model: "test", StatePatchPolicy: policy})
+	_, err := step(context.Background(), loom.State{
+		"messages": []contract.Message{{Role: "user", Content: "go"}}, "status": "old",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotOld != "old" || gotNew != "new" {
+		t.Fatalf("validator saw old=%#v new=%#v", gotOld, gotNew)
+	}
+}
+
+func runSingleStateOps(t *testing.T, state loom.State, op contract.StateOp) (loom.State, error) {
+	t.Helper()
+	return runSingleStateOpsWithPolicy(t, state, stdlib.AllowKeys("update", op.Key), op)
+}
+
+func runSingleStateOpsWithPolicy(t *testing.T, state loom.State, policy *stdlib.StatePatchPolicy, op contract.StateOp) (loom.State, error) {
+	t.Helper()
+	llm := &mockLLM{responses: []contract.ChatResponse{
+		{ToolCalls: []contract.ToolCall{{ID: "1", Name: "update"}}}, {Content: "done"},
+	}}
+	tools := &mockTools{}
+	tools.handler = func(call contract.ToolCall) *contract.ToolResult {
+		return &contract.ToolResult{CallID: call.ID, StateOps: []contract.StateOp{op}}
+	}
+	state["messages"] = []contract.Message{{Role: "user", Content: "go"}}
+	step := stdlib.NewToolLoopStep(llm, tools, stdlib.ToolLoopOpts{Model: "test", StatePatchPolicy: policy})
+	return step(context.Background(), state)
 }
 
 func TestToolLoop_StatePatchMergeAndMessageIsolation(t *testing.T) {
@@ -449,17 +593,21 @@ func TestToolLoop_StatePatchDiscardedOnForcedCompletion(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			llm := &statePatchLLM{responses: tt.responses}
 			tools := &mockTools{tools: []contract.ToolDef{{Name: "patch"}}, handler: func(call contract.ToolCall) *contract.ToolResult {
-				return &contract.ToolResult{CallID: call.ID, Content: "ok", StatePatch: map[string]any{"route": "agent-a"}}
+				return &contract.ToolResult{CallID: call.ID, Content: "ok", StatePatch: map[string]any{"route": "agent-a"},
+					StateOps: []contract.StateOp{{Type: "replace", Key: "status", Value: "staged"}}}
 			}}
 			step := stdlib.NewToolLoopStep(llm, tools, stdlib.ToolLoopOpts{
 				Model: "test", MaxIterations: tt.iterations, MaxToolRepeats: tt.repeats,
-				StatePatchPolicy: stdlib.AllowKeys("patch", "route"),
+				StatePatchPolicy: stdlib.AllowKeys("patch", "route", "status"),
 			})
 
 			result, err := step(context.Background(), loom.State{"messages": []contract.Message{{Role: "user", Content: "go"}}})
 			assertNoError(t, err)
 			if _, ok := result["route"]; ok {
 				t.Fatalf("forced completion committed patch: %#v", result)
+			}
+			if _, ok := result["status"]; ok {
+				t.Fatalf("forced completion committed ops: %#v", result)
 			}
 		})
 	}
@@ -478,15 +626,20 @@ func TestToolLoop_StatePatchSurvivesParkAndResume(t *testing.T) {
 			if call.Name == "wait" {
 				return &contract.ToolResult{CallID: call.ID, Content: "parked", Park: true, ParkRef: "approval-1"}
 			}
-			return &contract.ToolResult{CallID: call.ID, Content: "ok", StatePatch: map[string]any{"route": "agent-a"}}
+			return &contract.ToolResult{CallID: call.ID, Content: "ok", StatePatch: map[string]any{"route": "agent-a"},
+				StateOps: []contract.StateOp{{Type: "debit", Key: "balance", Value: float64(2)}}}
 		},
 	}
 	step := stdlib.NewToolLoopStep(llm, tools, stdlib.ToolLoopOpts{
-		Model: "test", StatePatchPolicy: stdlib.AllowKeys("patch", "route"),
+		Model: "test", StatePatchPolicy: stdlib.AllowKeys("patch", "route", "balance"),
 	})
 
-	yielded, err := step(context.Background(), loom.State{"messages": []contract.Message{{Role: "user", Content: "go"}}})
+	initial := loom.State{
+		"messages": []contract.Message{{Role: "user", Content: "go"}}, "balance": float64(10),
+	}
+	yielded, err := step(context.Background(), initial)
 	assertNoError(t, err)
+	yielded = initial.Merge(yielded, nil)
 	if yielded["__toolloop_staged_patch"] == nil {
 		t.Fatalf("yielded state missing staged patch: %#v", yielded)
 	}
@@ -501,6 +654,9 @@ func TestToolLoop_StatePatchSurvivesParkAndResume(t *testing.T) {
 	assertNoError(t, err)
 	if result["route"] != "agent-a" {
 		t.Fatalf("resumed result lost staged patch: %#v", result)
+	}
+	if result["balance"] != float64(8) {
+		t.Fatalf("resumed result lost staged ops: %#v", result)
 	}
 	if value, ok := result["__toolloop_staged_patch"]; !ok || value != nil {
 		t.Fatalf("staged patch checkpoint not cleared: %#v", result)
@@ -529,7 +685,7 @@ func TestToolLoop_StopLoopCommitsPatchWithoutAnotherLLMCall(t *testing.T) {
 		if call.Name == "transfer" {
 			return &contract.ToolResult{
 				CallID: call.ID, Content: "accepted", StopLoop: true,
-				StatePatch: map[string]any{"route": "agent-a"},
+				StateOps: []contract.StateOp{{Type: "replace", Key: "route", Value: "agent-a"}},
 			}
 		}
 		return &contract.ToolResult{CallID: call.ID, Content: "observed"}

@@ -6,6 +6,7 @@ type EffortLevel string
 type Embedder interface{ ... }
 type LLM interface{ ... }
 type Message struct{ ... }
+type StateOp struct{ ... }
 type StreamChunk struct{ ... }
 type StreamSink interface{ ... }
 type ToolCall struct{ ... }

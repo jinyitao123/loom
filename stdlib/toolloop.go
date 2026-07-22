@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"reflect"
 	"strings"
 	"sync"
 
@@ -33,7 +34,8 @@ type CompactionPolicy struct {
 
 // StatePatchPolicy opts a ToolLoop into accepting validated control-plane state deltas from tools.
 type StatePatchPolicy struct {
-	Allowed map[string]map[string]func(value any) error
+	Allowed           map[string]map[string]func(value any) error
+	ValidateWithState map[string]map[string]func(old, new any) error
 }
 
 // AllowKeys allows the named tool to replace the listed non-protocol state keys with any JSON value.
@@ -99,6 +101,10 @@ func NewToolLoopStep(llm contract.LLM, tools contract.ToolDispatcher, opts ToolL
 		}
 		resumedFromPark := len(pending) > 0
 		stagedPatch := make(loom.State)
+		stagedState := make(loom.State, len(state))
+		for key, value := range state {
+			stagedState[key] = value
+		}
 		stagedPatchJSON := make(map[string][]byte)
 		stagedPatchResults := make([]contract.ToolResult, 0)
 		accumulatedUsage, err := decodeToolLoopUsage(state["__toolloop_usage"])
@@ -112,7 +118,7 @@ func NewToolLoopStep(llm contract.LLM, tools contract.ToolDispatcher, opts ToolL
 			if err != nil {
 				return nil, err
 			}
-			if err := stageStatePatches(stagedPatchResults, opts.StatePatchPolicy, stagedPatch, stagedPatchJSON); err != nil {
+			if err := stageStatePatches(stagedPatchResults, opts.StatePatchPolicy, stagedState, stagedPatch, stagedPatchJSON); err != nil {
 				return nil, err
 			}
 			// Resume starts from the private full snapshot, never from "messages": compiler graphs append-merge
@@ -274,11 +280,11 @@ func NewToolLoopStep(llm contract.LLM, tools contract.ToolDispatcher, opts ToolL
 			if err != nil {
 				return nil, err
 			}
-			if err := stageStatePatches(results, opts.StatePatchPolicy, stagedPatch, stagedPatchJSON); err != nil {
+			if err := stageStatePatches(results, opts.StatePatchPolicy, stagedState, stagedPatch, stagedPatchJSON); err != nil {
 				return nil, err
 			}
 			for _, result := range results {
-				if result.StatePatch != nil {
+				if result.StatePatch != nil || len(result.StateOps) > 0 {
 					stagedPatchResults = append(stagedPatchResults, result)
 				}
 			}
@@ -505,8 +511,9 @@ func finishToolLoop(content string, usage contract.Usage, resumedFromPark bool, 
 }
 
 // stageStatePatches validates post-hook tool results and accumulates patches until normal ToolLoop completion.
-func stageStatePatches(results []contract.ToolResult, policy *StatePatchPolicy, staged loom.State, stagedJSON map[string][]byte) error {
+func stageStatePatches(results []contract.ToolResult, policy *StatePatchPolicy, current, staged loom.State, stagedJSON map[string][]byte) error {
 	for _, result := range results {
+		hasStateChange := result.StatePatch != nil || len(result.StateOps) > 0
 		if result.StopLoop {
 			if result.IsError {
 				return fmt.Errorf("loom/toolloop: StopLoop protocol violation: IsError result %q requests stop", result.CallID)
@@ -514,18 +521,18 @@ func stageStatePatches(results []contract.ToolResult, policy *StatePatchPolicy, 
 			if result.Park {
 				return fmt.Errorf("loom/toolloop: StopLoop protocol violation: Park result %q requests stop", result.CallID)
 			}
-			if result.StatePatch == nil {
-				return fmt.Errorf("loom/toolloop: StopLoop protocol violation: result %q requires a StatePatch", result.CallID)
+			if !hasStateChange {
+				return fmt.Errorf("loom/toolloop: StopLoop protocol violation: result %q requires a StatePatch or StateOps", result.CallID)
 			}
 		}
-		if result.StatePatch == nil {
+		if !hasStateChange {
 			continue
 		}
 		if result.IsError {
-			return fmt.Errorf("loom/toolloop: StatePatch protocol violation: IsError result %q carries a patch", result.CallID)
+			return fmt.Errorf("loom/toolloop: state change protocol violation: IsError result %q carries state changes", result.CallID)
 		}
 		if result.Park {
-			return fmt.Errorf("loom/toolloop: StatePatch protocol violation: Park result %q carries a patch", result.CallID)
+			return fmt.Errorf("loom/toolloop: state change protocol violation: Park result %q carries state changes", result.CallID)
 		}
 		if policy == nil {
 			return fmt.Errorf("loom/toolloop: StatePatch policy is required for result %q", result.CallID)
@@ -545,12 +552,25 @@ func stageStatePatches(results []contract.ToolResult, policy *StatePatchPolicy, 
 			if !allowed {
 				return fmt.Errorf("loom/toolloop: StatePatch key %q is not allowed for tool %q", key, result.ToolName)
 			}
-			if validate == nil && strings.HasPrefix(key, "__") {
+			var validateWithState func(old, new any) error
+			if validators := policy.ValidateWithState[result.ToolName]; validators != nil {
+				validateWithState = validators[key]
+			}
+			if validate == nil && validateWithState == nil && strings.HasPrefix(key, "__") {
 				return fmt.Errorf("loom/toolloop: StatePatch key %q requires an explicit validator", key)
 			}
 			if validate != nil {
 				if err := validate(value); err != nil {
 					return fmt.Errorf("loom/toolloop: StatePatch key %q validation failed: %w", key, err)
+				}
+			}
+			old, exists := current[key]
+			if !exists {
+				old = nil
+			}
+			if validateWithState != nil {
+				if err := validateWithState(old, value); err != nil {
+					return fmt.Errorf("loom/toolloop: StatePatch key %q state validation failed: %w", key, err)
 				}
 			}
 			encoded, err := json.Marshal(value)
@@ -564,15 +584,141 @@ func stageStatePatches(results []contract.ToolResult, policy *StatePatchPolicy, 
 				continue
 			}
 			staged[key] = value
+			current[key] = value
+			removeDeletedKey(staged, key)
 			stagedJSON[key] = encoded
+		}
+		for _, op := range result.StateOps {
+			if err := stageStateOp(result, op, policy, current, staged); err != nil {
+				return err
+			}
 		}
 	}
 	return nil
 }
 
 func isReservedStatePatchKey(key string) bool {
-	return key == "output" || key == "usage" || strings.HasPrefix(key, "__toolloop_") ||
+	return key == "output" || key == "usage" || key == "__deleted_keys" || strings.HasPrefix(key, "__toolloop_") ||
 		strings.HasPrefix(key, "__yield") || key == "__resumed_tool_results"
+}
+
+func stageStateOp(result contract.ToolResult, op contract.StateOp, policy *StatePatchPolicy, current, staged loom.State) error {
+	if isReservedStatePatchKey(op.Key) {
+		return fmt.Errorf("loom/toolloop: StateOps key %q is reserved", op.Key)
+	}
+	allowedKeys := policy.Allowed[result.ToolName]
+	validate, allowed := allowedKeys[op.Key]
+	if !allowed {
+		return fmt.Errorf("loom/toolloop: StateOps key %q is not allowed for tool %q", op.Key, result.ToolName)
+	}
+	var validateWithState func(old, new any) error
+	if validators := policy.ValidateWithState[result.ToolName]; validators != nil {
+		validateWithState = validators[op.Key]
+	}
+	if validate == nil && validateWithState == nil && strings.HasPrefix(op.Key, "__") {
+		return fmt.Errorf("loom/toolloop: StateOps key %q requires an explicit validator", op.Key)
+	}
+	old, exists := current[op.Key]
+	if !exists {
+		old = nil
+	}
+	var newValue any
+	switch op.Type {
+	case "replace":
+		newValue = op.Value
+	case "debit":
+		amount, err := jsonNumber(op.Value)
+		if err != nil {
+			return fmt.Errorf("loom/toolloop: StateOps debit value for key %q must be a JSON number: %w", op.Key, err)
+		}
+		balance := float64(0)
+		if old != nil {
+			balance, err = jsonNumber(old)
+			if err != nil {
+				return fmt.Errorf("loom/toolloop: StateOps debit old value for key %q must be a JSON number: %w", op.Key, err)
+			}
+		}
+		newValue = balance - amount
+	case "delete":
+		newValue = nil
+	case "cas":
+		if !reflect.DeepEqual(old, op.Expect) {
+			return fmt.Errorf("loom/toolloop: StateOps cas failed for key %q", op.Key)
+		}
+		newValue = op.Value
+	default:
+		return fmt.Errorf("loom/toolloop: StateOps type %q is not supported", op.Type)
+	}
+	for field, value := range map[string]any{"value": op.Value, "expect": op.Expect, "result": newValue} {
+		if _, err := json.Marshal(value); err != nil {
+			return fmt.Errorf("loom/toolloop: StateOps key %q %s is not JSON serializable: %w", op.Key, field, err)
+		}
+	}
+	if validate != nil {
+		if err := validate(newValue); err != nil {
+			return fmt.Errorf("loom/toolloop: StateOps key %q validation failed: %w", op.Key, err)
+		}
+	}
+	if validateWithState != nil {
+		if err := validateWithState(old, newValue); err != nil {
+			return fmt.Errorf("loom/toolloop: StateOps key %q state validation failed: %w", op.Key, err)
+		}
+	}
+	if op.Type == "delete" {
+		delete(current, op.Key)
+		delete(staged, op.Key)
+		appendDeletedKey(staged, op.Key)
+	} else {
+		current[op.Key] = newValue
+		staged[op.Key] = newValue
+		removeDeletedKey(staged, op.Key)
+	}
+	return nil
+}
+
+func jsonNumber(value any) (float64, error) {
+	encoded, err := json.Marshal(value)
+	if err != nil {
+		return 0, err
+	}
+	var number json.Number
+	decoder := json.NewDecoder(strings.NewReader(string(encoded)))
+	decoder.UseNumber()
+	var decoded any
+	if err := decoder.Decode(&decoded); err != nil {
+		return 0, err
+	}
+	var ok bool
+	number, ok = decoded.(json.Number)
+	if !ok {
+		return 0, fmt.Errorf("got %T", decoded)
+	}
+	return number.Float64()
+}
+
+func appendDeletedKey(staged loom.State, key string) {
+	keys, _ := staged["__deleted_keys"].([]string)
+	for _, existing := range keys {
+		if existing == key {
+			return
+		}
+	}
+	staged["__deleted_keys"] = append(keys, key)
+}
+
+func removeDeletedKey(staged loom.State, key string) {
+	keys, _ := staged["__deleted_keys"].([]string)
+	filtered := keys[:0]
+	for _, existing := range keys {
+		if existing != key {
+			filtered = append(filtered, existing)
+		}
+	}
+	if len(filtered) == 0 {
+		delete(staged, "__deleted_keys")
+	} else {
+		staged["__deleted_keys"] = filtered
+	}
 }
 
 // DispatchWithHooks runs tool hooks, then dispatches with read/write awareness.

@@ -239,26 +239,33 @@ g.SetHooks(loom.HookPoints{
 
 Read-only tools run in parallel automatically; stateful tools run serially. ToolLoop reads `ToolDef.ReadOnly` to decide.
 
-Tool results may optionally carry a control-plane `StatePatch`. This channel is fail-closed and opt-in:
-configure `ToolLoopOpts.StatePatchPolicy` by actual dispatched tool name, key, and validator; otherwise any patch
-is a protocol error. Unknown or empty tool names fail closed. The `__` namespace requires explicit tool-by-key
-authorization and a non-nil validator. `output`, `usage`, `__toolloop_*`, `__yield*`, and
-`__resumed_tool_results` are always reserved. A nil validator for a non-`__` key is an explicit choice to accept
-any JSON value.
+Tool results may optionally carry control-plane `StatePatch` v1 and `StateOps` v2. Both channels are fail-closed
+and opt-in: configure `ToolLoopOpts.StatePatchPolicy` by actual dispatched tool name, key, and validator, otherwise
+any patch or operation is a protocol error. Unknown or empty tool names fail closed. The `__` namespace requires
+explicit tool-by-key authorization and a non-nil validator. `output`, `usage`, `__deleted_keys`, `__toolloop_*`,
+`__yield*`, and `__resumed_tool_results` are always reserved. A nil validator for a non-`__` key is an explicit
+choice to accept any JSON value. `ValidateWithState` optionally receives the old and proposed new values without
+changing the v1 validator signature.
 
-StatePatch v1 replaces each authorized key as a whole: it does not deep-merge, increment, or delete. A `nil`
-value means JSON `null`, not deletion. Valid patches are staged until the ToolLoop finishes naturally with no
-tool calls and are then returned in the step delta for the engine to merge; forced completion after tool-budget
-exhaustion or cycle detection discards them. Park checkpoints preserve staged patches, and Resume revalidates
-them through the same policy before eventual commit. Patches are never copied into tool messages.
+StatePatch v1 replaces each authorized key as a whole: it does not deep-merge, increment, or delete. A `nil` value
+means JSON `null`, not deletion. StateOps v2 carries an ordered array of typed operations: `replace` performs the
+same whole-value replacement, `debit` subtracts a JSON number from the old JSON number (or zero when absent),
+`delete` removes the key, and `cas` replaces only when the current value deeply equals `expect`. A failed CAS is a
+protocol error for the entire step. When one result carries both versions, its patch is applied first and its ops
+then run in array order, so multiple operations on one key observe preceding changes.
+
+Valid patches and ops are staged until the ToolLoop finishes naturally with no tool calls and are then returned
+in the step delta for the engine to merge; forced completion after tool-budget exhaustion or cycle detection
+discards them. Park checkpoints preserve the staged results, and Resume revalidates them through the same policy
+before eventual commit. State changes are never copied into tool messages. Future operation types extend the
+`type` enumeration; they do not reinterpret or change the existing fields or v1 map semantics.
 
 The commit is atomic only for the state delta; it does not roll back external side effects already performed by
-tools. An invalid or malicious patch fails the entire ToolLoop step. An ordinary `IsError` result without a patch
-does not prevent a valid sibling patch from being staged. Future compare-and-swap, budget debit, deep-merge, or
-other typed operations must use distinct typed protocols rather than reinterpret this map.
+tools. An invalid or malicious state change fails the entire ToolLoop step. An ordinary `IsError` result without
+state changes does not prevent a valid sibling result from being staged.
 
-A tool result may also set `stop_loop: true` to commit-and-stop. In v1 this is valid only when that same result
-carries a `StatePatch`, the patch passes the existing tool-by-key `StatePatchPolicy`, and the result is neither
+A tool result may also set `stop_loop: true` to commit-and-stop. This is valid only when that same result carries
+a `StatePatch` or `StateOps`, the state change passes the tool-by-key `StatePatchPolicy`, and the result is neither
 `IsError` nor `Park`; a bare or otherwise invalid stop is a protocol error. The entire tool-call batch still runs
 and every patch is validated and staged before stop takes effect. If any sibling result parks, park takes priority:
 the stop-bearing result and accumulated usage are checkpointed with the staged patches, and a completed Resume

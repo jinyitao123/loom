@@ -102,15 +102,41 @@ func (s State) Merge(update State, cfg *MergeConfig) State {
 	result := make(State, len(s)+len(update)) // 新建结果 map，容量按两者之和预估，避免中途扩容
 	// 第一遍：把旧状态整体浅拷贝进结果（值本身不深拷贝，约定步骤不就地修改旧值的内部结构）。
 	for k, v := range s {
+		if k == "__deleted_keys" {
+			continue
+		}
 		result[k] = v
 	}
 	// 第二遍：逐键应用增量——有注册策略用注册策略，否则用兜底策略（默认覆盖）。
 	for k, v := range update {
+		if k == "__deleted_keys" {
+			continue
+		}
 		if policy, ok := cfg.policies[k]; ok {
 			result[k] = policy(result[k], v) // 按键定制的合并（如 messages 追加）
 		} else {
 			result[k] = cfg.fallback(result[k], v) // 兜底合并（默认新值覆盖旧值）
 		}
 	}
+	for _, key := range deletedStateKeys(update["__deleted_keys"]) {
+		delete(result, key)
+	}
 	return result // 返回全新快照，原状态 s 保持不变
+}
+
+func deletedStateKeys(value any) []string {
+	switch keys := value.(type) {
+	case []string:
+		return keys
+	case []any:
+		result := make([]string, 0, len(keys))
+		for _, key := range keys {
+			if key, ok := key.(string); ok {
+				result = append(result, key)
+			}
+		}
+		return result
+	default:
+		return nil
+	}
 }

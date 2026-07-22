@@ -23,6 +23,14 @@ type ToolCall struct {
 	Args string `json:"args"` // 调用参数，保持为 JSON 字符串原样透传，不在 contract 层解析
 }
 
+// StateOp is a typed control-plane state operation returned by a tool.
+type StateOp struct {
+	Type   string `json:"type"`
+	Key    string `json:"key"`
+	Value  any    `json:"value,omitempty"`
+	Expect any    `json:"expect,omitempty"`
+}
+
 // ToolResult represents the result of a tool invocation.
 // ToolResult 是一次工具执行的结果，将被转成 tool 消息回填进对话历史。
 type ToolResult struct {
@@ -31,6 +39,7 @@ type ToolResult struct {
 	IsError    bool           `json:"is_error,omitempty"`    // 标记执行失败：错误也作为结果反馈给模型，而不是中断循环
 	ToolName   string         `json:"tool_name,omitempty"`   // for post-hook matching
 	StatePatch map[string]any `json:"state_patch,omitempty"` // optional control-plane state delta; ToolLoop policy-gates it
+	StateOps   []StateOp      `json:"state_ops,omitempty"`   // optional typed state operations; ToolLoop policy-gates them
 	StopLoop   bool           `json:"stop_loop,omitempty"`   // commit a valid StatePatch and end ToolLoop without another LLM call
 	// ToolName 冗余记录工具名：ToolHook 的 Post 阶段只拿到结果时仍能按工具名匹配。
 	Park    bool   `json:"park,omitempty"`     // true=本次调用未执行，已被平台扣下等外部批准；Content 仅为占位说明，循环不得将其当作执行结果
