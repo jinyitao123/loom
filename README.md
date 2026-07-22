@@ -212,6 +212,24 @@ g.SetHooks(loom.HookPoints{
 
 Read-only tools run in parallel automatically; stateful tools run serially. ToolLoop reads `ToolDef.ReadOnly` to decide.
 
+Tool results may optionally carry a control-plane `StatePatch`. This channel is fail-closed and opt-in:
+configure `ToolLoopOpts.StatePatchPolicy` by actual dispatched tool name, key, and validator; otherwise any patch
+is a protocol error. Unknown or empty tool names fail closed. The `__` namespace requires explicit tool-by-key
+authorization and a non-nil validator. `output`, `usage`, `__toolloop_*`, `__yield*`, and
+`__resumed_tool_results` are always reserved. A nil validator for a non-`__` key is an explicit choice to accept
+any JSON value.
+
+StatePatch v1 replaces each authorized key as a whole: it does not deep-merge, increment, or delete. A `nil`
+value means JSON `null`, not deletion. Valid patches are staged until the ToolLoop finishes naturally with no
+tool calls and are then returned in the step delta for the engine to merge; forced completion after tool-budget
+exhaustion or cycle detection discards them. Park checkpoints preserve staged patches, and Resume revalidates
+them through the same policy before eventual commit. Patches are never copied into tool messages.
+
+The commit is atomic only for the state delta; it does not roll back external side effects already performed by
+tools. An invalid or malicious patch fails the entire ToolLoop step. An ordinary `IsError` result without a patch
+does not prevent a valid sibling patch from being staged. Future compare-and-swap, budget debit, deep-merge, or
+other typed operations must use distinct typed protocols rather than reinterpret this map.
+
 ## The `loom` CLI
 
 Loom is a library first — but the repo also ships `loom`, a standalone agent engine built on that library. It is the [weave](https://github.com/jinyitao123/Weave) daemon's spawn-harness backend: prompt JSON on stdin, one agent turn, NDJSON events on stdout — with MCP tool servers, session resume, semantic memory, and deterministic sub-agent orchestration compiled from an agent spec.

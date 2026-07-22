@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"strings"
 	"sync"
 
 	"github.com/jinyitao123/loom"
@@ -30,6 +31,20 @@ type CompactionPolicy struct {
 	PreCompact func(ctx context.Context, transcript []contract.Message) error
 }
 
+// StatePatchPolicy opts a ToolLoop into accepting validated control-plane state deltas from tools.
+type StatePatchPolicy struct {
+	Allowed map[string]map[string]func(value any) error
+}
+
+// AllowKeys allows the named tool to replace the listed non-protocol state keys with any JSON value.
+func AllowKeys(tool string, keys ...string) *StatePatchPolicy {
+	allowed := make(map[string]func(value any) error, len(keys))
+	for _, key := range keys {
+		allowed[key] = nil
+	}
+	return &StatePatchPolicy{Allowed: map[string]map[string]func(value any) error{tool: allowed}}
+}
+
 // ToolLoopOpts configures the tool loop step.
 // ToolLoopOpts 是工具循环步骤的全部可调参数。
 type ToolLoopOpts struct {
@@ -47,6 +62,8 @@ type ToolLoopOpts struct {
 	// ToolHooks：工具级前置/后置钩子——前置可改写或拦截调用，后置用于审计观测。
 	Compaction *CompactionPolicy // v1.4: auto-summarize when context grows
 	// Compaction：上下文压缩策略，nil 表示不做压缩。
+	StatePatchPolicy *StatePatchPolicy
+	// StatePatchPolicy：工具状态增量白名单；nil 时任何 StatePatch 都是协议错误。
 }
 
 // toolLoopPendingCall is the checkpoint-safe description of one parked tool call.
@@ -81,9 +98,19 @@ func NewToolLoopStep(llm contract.LLM, tools contract.ToolDispatcher, opts ToolL
 			return nil, err
 		}
 		resumedFromPark := len(pending) > 0
+		stagedPatch := make(loom.State)
+		stagedPatchJSON := make(map[string][]byte)
+		stagedPatchResults := make([]contract.ToolResult, 0)
 
 		var msgs []contract.Message
 		if resumedFromPark {
+			stagedPatchResults, err = decodeStagedStatePatch(state["__toolloop_staged_patch"])
+			if err != nil {
+				return nil, err
+			}
+			if err := stageStatePatches(stagedPatchResults, opts.StatePatchPolicy, stagedPatch, stagedPatchJSON); err != nil {
+				return nil, err
+			}
 			// Resume starts from the private full snapshot, never from "messages": compiler graphs append-merge
 			// that public key, which would duplicate the transcript. Checkpoint JSON may have erased Go types.
 			// 恢复只读取私有完整快照，绝不读取/写入会被 AppendSlice 合并的 messages；同时兼容 JSON 类型退化。
@@ -112,11 +139,12 @@ func NewToolLoopStep(llm contract.LLM, tools contract.ToolDispatcher, opts ToolL
 
 			if len(remaining) > 0 {
 				return loom.State{
-					"__yield":                true,
-					"yield_type":             "await_approval",
-					"__toolloop_msgs":        msgs,
-					"__toolloop_pending":     remaining,
-					"__resumed_tool_results": nil,
+					"__yield":                 true,
+					"yield_type":              "await_approval",
+					"__toolloop_msgs":         msgs,
+					"__toolloop_pending":      remaining,
+					"__resumed_tool_results":  nil,
+					"__toolloop_staged_patch": stagedPatchResults,
 				}, nil
 			}
 
@@ -127,6 +155,8 @@ func NewToolLoopStep(llm contract.LLM, tools contract.ToolDispatcher, opts ToolL
 			// ToolResult 回灌（驳回 IsError=true），绝不注入系统旁白。
 			// MaxIterations intentionally restarts here: a resumed run receives a fresh loop budget.
 			// MaxIterations 在恢复后从头重计：恢复后的 run 获得一份新的循环预算。
+			// StatePatch is intentionally unsupported on resume in this version. If resumed results gain
+			// StatePatch later, validate and stage it here using the same path as dispatched results below.
 		} else {
 			// 从状态取出会话消息历史；取不到属于协议错误，直接失败。
 			msgs, err = GetMessages(state)
@@ -208,7 +238,7 @@ func NewToolLoopStep(llm contract.LLM, tools contract.ToolDispatcher, opts ToolL
 
 			// 模型没有再请求工具 ⇒ 任务在本轮完成，把文本答案与用量写入输出状态，正常收官。
 			if len(resp.ToolCalls) == 0 {
-				return finishToolLoop(resp.Content, resp.Usage, resumedFromPark), nil
+				return finishToolLoop(resp.Content, resp.Usage, resumedFromPark, stagedPatch), nil
 			}
 
 			// Cycle detection: hash current tool call batch and compare to previous.
@@ -221,7 +251,7 @@ func NewToolLoopStep(llm contract.LLM, tools contract.ToolDispatcher, opts ToolL
 				if repeatCount >= maxRepeats {
 					slog.Warn("loom/toolloop: cycle detected, breaking",
 						"repeat_count", repeatCount, "batch_hash", batchHash[:8]) // 哈希只记前 8 位，够日志检索用
-					return finishToolLoop(resp.Content, resp.Usage, resumedFromPark), nil
+					return finishToolLoop(resp.Content, resp.Usage, resumedFromPark, nil), nil
 				}
 			} else {
 				// 出现新的调用组合：更新基准签名，计数从 1 重新累计。
@@ -231,7 +261,18 @@ func NewToolLoopStep(llm contract.LLM, tools contract.ToolDispatcher, opts ToolL
 
 			// Dispatch with hooks and read/write awareness.
 			// 执行本批工具调用（带钩子、按只读/有状态分流，见 DispatchWithHooks）。
-			results := DispatchWithHooks(ctx, tools, resp.ToolCalls, availableTools, opts.ToolHooks)
+			results, err := DispatchWithHooks(ctx, tools, resp.ToolCalls, availableTools, opts.ToolHooks)
+			if err != nil {
+				return nil, err
+			}
+			if err := stageStatePatches(results, opts.StatePatchPolicy, stagedPatch, stagedPatchJSON); err != nil {
+				return nil, err
+			}
+			for _, result := range results {
+				if result.StatePatch != nil {
+					stagedPatchResults = append(stagedPatchResults, result)
+				}
+			}
 			if hasParkedToolResult(results) {
 				// The assistant tool_calls message is checkpointed once. Executed siblings keep their real
 				// results; parked placeholders are omitted and represented only by the pending protocol.
@@ -253,10 +294,11 @@ func NewToolLoopStep(llm contract.LLM, tools contract.ToolDispatcher, opts ToolL
 					})
 				}
 				return loom.State{
-					"__yield":            true,
-					"yield_type":         "await_approval",
-					"__toolloop_msgs":    msgs,
-					"__toolloop_pending": parked,
+					"__yield":                 true,
+					"yield_type":              "await_approval",
+					"__toolloop_msgs":         msgs,
+					"__toolloop_pending":      parked,
+					"__toolloop_staged_patch": stagedPatchResults,
 				}, nil
 			}
 			// 结果回填协议：先追加 assistant 的工具调用消息，再逐条追加对应的工具结果消息，
@@ -296,7 +338,7 @@ func NewToolLoopStep(llm contract.LLM, tools contract.ToolDispatcher, opts ToolL
 			return loom.State{"__error": err.Error()}, err
 		}
 		// 把收尾总结作为本轮的最终输出返回。
-		return finishToolLoop(resp.Content, resp.Usage, resumedFromPark), nil
+		return finishToolLoop(resp.Content, resp.Usage, resumedFromPark, nil), nil
 	}
 }
 
@@ -360,6 +402,24 @@ func decodeResumedToolResults(raw any) (map[string]resumedToolResult, error) {
 	return results, nil
 }
 
+func decodeStagedStatePatch(raw any) ([]contract.ToolResult, error) {
+	if raw == nil {
+		return nil, nil
+	}
+	if results, ok := raw.([]contract.ToolResult); ok {
+		return results, nil
+	}
+	data, err := json.Marshal(raw)
+	if err != nil {
+		return nil, fmt.Errorf("loom/toolloop: encode __toolloop_staged_patch: %w", err)
+	}
+	var results []contract.ToolResult
+	if err := json.Unmarshal(data, &results); err != nil {
+		return nil, fmt.Errorf("loom/toolloop: decode __toolloop_staged_patch: %w", err)
+	}
+	return results, nil
+}
+
 // hasParkedToolResult reports whether a dispatch batch requests a run-level approval yield.
 // hasParkedToolResult 判断本批结果是否包含要求整轮暂停等待批准的 park 标记。
 func hasParkedToolResult(results []contract.ToolResult) bool {
@@ -373,14 +433,78 @@ func hasParkedToolResult(results []contract.ToolResult) bool {
 
 // finishToolLoop clears park protocol state only for a resumed run, preserving the no-park delta exactly.
 // finishToolLoop 仅在 park 恢复后的正常出口清场，保证从未 park 的路径仍返回原有增量。
-func finishToolLoop(content string, usage contract.Usage, resumedFromPark bool) loom.State {
+func finishToolLoop(content string, usage contract.Usage, resumedFromPark bool, stagedPatch loom.State) loom.State {
 	result := SetOutput(content, usage)
+	for key, value := range stagedPatch {
+		result[key] = value
+	}
 	if resumedFromPark {
 		result["__toolloop_pending"] = nil
 		result["__toolloop_msgs"] = nil
 		result["__resumed_tool_results"] = nil
+		result["__toolloop_staged_patch"] = nil
 	}
 	return result
+}
+
+// stageStatePatches validates post-hook tool results and accumulates patches until normal ToolLoop completion.
+func stageStatePatches(results []contract.ToolResult, policy *StatePatchPolicy, staged loom.State, stagedJSON map[string][]byte) error {
+	for _, result := range results {
+		if result.StatePatch == nil {
+			continue
+		}
+		if result.IsError {
+			return fmt.Errorf("loom/toolloop: StatePatch protocol violation: IsError result %q carries a patch", result.CallID)
+		}
+		if result.Park {
+			return fmt.Errorf("loom/toolloop: StatePatch protocol violation: Park result %q carries a patch", result.CallID)
+		}
+		if policy == nil {
+			return fmt.Errorf("loom/toolloop: StatePatch policy is required for result %q", result.CallID)
+		}
+		if result.ToolName == "" {
+			return fmt.Errorf("loom/toolloop: StatePatch tool name is empty for result %q", result.CallID)
+		}
+		allowedKeys, allowedTool := policy.Allowed[result.ToolName]
+		if !allowedTool {
+			return fmt.Errorf("loom/toolloop: StatePatch tool %q is not allowed", result.ToolName)
+		}
+		for key, value := range result.StatePatch {
+			if isReservedStatePatchKey(key) {
+				return fmt.Errorf("loom/toolloop: StatePatch key %q is reserved", key)
+			}
+			validate, allowed := allowedKeys[key]
+			if !allowed {
+				return fmt.Errorf("loom/toolloop: StatePatch key %q is not allowed for tool %q", key, result.ToolName)
+			}
+			if validate == nil && strings.HasPrefix(key, "__") {
+				return fmt.Errorf("loom/toolloop: StatePatch key %q requires an explicit validator", key)
+			}
+			if validate != nil {
+				if err := validate(value); err != nil {
+					return fmt.Errorf("loom/toolloop: StatePatch key %q validation failed: %w", key, err)
+				}
+			}
+			encoded, err := json.Marshal(value)
+			if err != nil {
+				return fmt.Errorf("loom/toolloop: StatePatch key %q value is not JSON serializable: %w", key, err)
+			}
+			if previous, exists := stagedJSON[key]; exists {
+				if string(previous) != string(encoded) {
+					return fmt.Errorf("loom/toolloop: StatePatch conflict for key %q", key)
+				}
+				continue
+			}
+			staged[key] = value
+			stagedJSON[key] = encoded
+		}
+	}
+	return nil
+}
+
+func isReservedStatePatchKey(key string) bool {
+	return key == "output" || key == "usage" || strings.HasPrefix(key, "__toolloop_") ||
+		strings.HasPrefix(key, "__yield") || key == "__resumed_tool_results"
 }
 
 // DispatchWithHooks runs tool hooks, then dispatches with read/write awareness.
@@ -393,7 +517,7 @@ func finishToolLoop(content string, usage contract.Usage, resumedFromPark bool) 
 //
 // 返回的结果切片与传入的 calls 按下标一一对应，保证回填消息历史时顺序正确。
 func DispatchWithHooks(ctx context.Context, tools contract.ToolDispatcher,
-	calls []contract.ToolCall, defs []contract.ToolDef, hooks []contract.ToolHook) []contract.ToolResult {
+	calls []contract.ToolCall, defs []contract.ToolDef, hooks []contract.ToolHook) ([]contract.ToolResult, error) {
 
 	// Build def lookup map.
 	// 建立"工具名 → 定义"查找表，供阶段 2 读取 ReadOnly 标记做分流。
@@ -510,18 +634,22 @@ func DispatchWithHooks(ctx context.Context, tools contract.ToolDispatcher,
 	// 钩子拿到原调用和结果指针，可用于审计留痕、脱敏或原地改写结果内容。
 	for i := range results {
 		for _, h := range hooks {
-			// 按结果的工具名做匹配过滤（被拦截的槽位 ToolName 也已填好）。
-			if h.Matcher != nil && !h.Matcher(results[i].ToolName) {
+			// Match against the actual post-Pre dispatch name, not mutable result data.
+			if h.Matcher != nil && !h.Matcher(calls[i].Name) {
 				continue
 			}
 			if h.Post != nil {
-				h.Post(ctx, calls[i], &results[i])
+				if err := h.Post(ctx, calls[i], &results[i]); err != nil {
+					return nil, fmt.Errorf("loom/toolloop: post hook for tool %q: %w", calls[i].Name, err)
+				}
 			}
 		}
+		// ToolName is provenance, not hook-controlled result content.
+		results[i].ToolName = calls[i].Name
 	}
 
 	// 返回与 calls 等长、按下标对齐的结果集。
-	return results
+	return results, nil
 }
 
 // hashToolCalls creates a deterministic hash of a tool call batch for cycle detection.

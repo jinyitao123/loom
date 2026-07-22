@@ -33,7 +33,10 @@ func TestToolHook_PreBlocks(t *testing.T) {
 		return &contract.ToolResult{CallID: c.ID, Content: "ok", ToolName: c.Name}
 	}}
 
-	results := stdlib.DispatchWithHooks(context.Background(), tools, calls, defs, hooks)
+	results, err := stdlib.DispatchWithHooks(context.Background(), tools, calls, defs, hooks)
+	if err != nil {
+		t.Fatalf("DispatchWithHooks() error = %v", err)
+	}
 	if !blocked {
 		t.Error("Pre hook should have been called for dangerous_tool")
 	}
@@ -60,7 +63,9 @@ func TestToolHook_PreModifiesArgs(t *testing.T) {
 	}}
 
 	calls := []contract.ToolCall{{ID: "1", Name: "edit", Args: `{"path":"/home/user/file.txt"}`}}
-	stdlib.DispatchWithHooks(context.Background(), tools, calls, nil, hooks)
+	if _, err := stdlib.DispatchWithHooks(context.Background(), tools, calls, nil, hooks); err != nil {
+		t.Fatalf("DispatchWithHooks() error = %v", err)
+	}
 
 	if strings.Contains(capturedArgs, "/home/user") {
 		t.Error("Pre hook should have rewritten path to /sandbox")
@@ -84,7 +89,9 @@ func TestToolHook_PostAudits(t *testing.T) {
 	}}
 
 	calls := []contract.ToolCall{{ID: "1", Name: "search"}, {ID: "2", Name: "read"}}
-	stdlib.DispatchWithHooks(context.Background(), tools, calls, nil, hooks)
+	if _, err := stdlib.DispatchWithHooks(context.Background(), tools, calls, nil, hooks); err != nil {
+		t.Fatalf("DispatchWithHooks() error = %v", err)
+	}
 
 	if len(auditLog) != 2 {
 		t.Errorf("audit log len = %d, want 2", len(auditLog))
@@ -114,7 +121,9 @@ func TestReadWriteDispatch_ReadOnlyParallel(t *testing.T) {
 	}
 
 	start := time.Now()
-	stdlib.DispatchWithHooks(context.Background(), tools, calls, defs, nil)
+	if _, err := stdlib.DispatchWithHooks(context.Background(), tools, calls, defs, nil); err != nil {
+		t.Fatalf("DispatchWithHooks() error = %v", err)
+	}
 	elapsed := time.Since(start)
 
 	if elapsed > 25*time.Millisecond {
@@ -138,7 +147,9 @@ func TestReadWriteDispatch_StatefulSerial(t *testing.T) {
 		{Name: "write2", ReadOnly: false},
 	}
 
-	stdlib.DispatchWithHooks(context.Background(), tools, calls, defs, nil)
+	if _, err := stdlib.DispatchWithHooks(context.Background(), tools, calls, defs, nil); err != nil {
+		t.Fatalf("DispatchWithHooks() error = %v", err)
+	}
 
 	if len(order) != 2 || order[0] != "write1" || order[1] != "write2" {
 		t.Errorf("stateful order = %v, want [write1, write2]", order)
