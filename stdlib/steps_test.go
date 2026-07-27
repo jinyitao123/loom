@@ -222,6 +222,46 @@ func TestChildContinuationRejectsStaleGenerationAndTopologyWithoutExecutingChild
 	}
 }
 
+func TestChildContinuationResumesLegacyEmptyYieldPhaseCheckpoint(t *testing.T) {
+	store := loom.NewMemStore()
+	runs, resumes := 0, 0
+	child := continuationTestChild("legacy-phase-child", &runs, &resumes, nil)
+	step := stdlib.NewSubGraphStep(child, store)
+	parked, err := step(context.Background(), loom.State{})
+	assertNoError(t, err)
+
+	runID := parked["__child_run_id"].(string)
+	data, err := store.Get(context.Background(), "checkpoint:"+child.Name, runID)
+	assertNoError(t, err)
+	var checkpoint map[string]any
+	assertNoError(t, json.Unmarshal(data, &checkpoint))
+	checkpoint["yield_phase"] = ""
+	data, err = json.Marshal(checkpoint)
+	assertNoError(t, err)
+	assertNoError(t, store.Put(context.Background(), "checkpoint:"+child.Name, runID, data))
+
+	done, err := step(context.Background(), validChildResumeState(loom.State{}.Merge(parked, nil)))
+	if err != nil {
+		t.Errorf("resume error = %v, want nil", err)
+	}
+	if runs != 1 || resumes != 1 {
+		t.Errorf("calls Run=%d Resume=%d, want 1/1", runs, resumes)
+	}
+	if done == nil {
+		return
+	}
+	if got := done["output"]; got != "done" {
+		t.Fatalf("output = %v, want done", got)
+	}
+	wantDeleted := []string{
+		"__child_run_id", "__child_graph", "__child_graph_revision", "__child_yield_token",
+		"__child_checkpoint_seq", "__child_resume_input", "__child_pending",
+	}
+	if got := done["__deleted_keys"]; !reflect.DeepEqual(got, wantDeleted) {
+		t.Fatalf("deleted keys = %#v, want %#v", got, wantDeleted)
+	}
+}
+
 func TestChildContinuationRejectsLatestCheckpointThatIsNoLongerYielded(t *testing.T) {
 	store := loom.NewMemStore()
 	runs, resumes := 0, 0

@@ -192,7 +192,10 @@ func runChildContinuation(ctx context.Context, parent loom.State, child *loom.Gr
 	if err != nil {
 		return nil, false, fmt.Errorf("loom: child graph %q run %q checkpoint: %w", child.Name, run, err)
 	}
-	if cp.RunID != run || cp.Graph != child.Name || cp.YieldPhase == "" || cp.State["__yield"] != true {
+	// Empty YieldPhase is a legacy mid-step checkpoint accepted by Graph.Resume.
+	// Keep identity and yielded-state validation here while preserving that
+	// reader compatibility for child continuations already stored by ToolLoop.
+	if cp.RunID != run || cp.Graph != child.Name || cp.State["__yield"] != true {
 		return nil, false, fmt.Errorf("loom: child graph %q run %q continuation does not reference a yielded checkpoint", child.Name, run)
 	}
 	if err := validateChildCheckpointGeneration(token, seq, cp); err != nil {

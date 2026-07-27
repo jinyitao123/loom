@@ -121,8 +121,8 @@ func assertYieldedForApproval(t *testing.T, result *loom.RunResult) {
 	if got := result.State["yield_type"]; got != "await_approval" {
 		t.Fatalf("yield_type = %v, want await_approval", got)
 	}
-	if _, ok := result.State["__yield_phase"]; ok {
-		t.Fatal("park yield must not set __yield_phase")
+	if got := result.State["__yield_phase"]; got != "mid_step" {
+		t.Fatalf("__yield_phase = %v, want mid_step", got)
 	}
 }
 
@@ -366,6 +366,9 @@ func TestDoublePark(t *testing.T) {
 	}, store)
 	if err != nil {
 		t.Fatalf("first Resume: %v", err)
+	}
+	if got := partial.State["__yield_phase"]; got != "mid_step" {
+		t.Fatalf("partial __yield_phase = %v, want mid_step", got)
 	}
 	assertYieldedForApproval(t, partial)
 	if llm.calls != 1 {

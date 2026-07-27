@@ -150,6 +150,7 @@ func NewToolLoopStep(llm contract.LLM, tools contract.ToolDispatcher, opts ToolL
 			if len(remaining) > 0 {
 				return loom.State{
 					"__yield":                 true,
+					"__yield_phase":           "mid_step",
 					"yield_type":              "await_approval",
 					"__toolloop_msgs":         msgs,
 					"__toolloop_pending":      remaining,
@@ -310,6 +311,7 @@ func NewToolLoopStep(llm contract.LLM, tools contract.ToolDispatcher, opts ToolL
 				}
 				return loom.State{
 					"__yield":                 true,
+					"__yield_phase":           "mid_step",
 					"yield_type":              "await_approval",
 					"__toolloop_msgs":         msgs,
 					"__toolloop_pending":      parked,
