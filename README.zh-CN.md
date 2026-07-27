@@ -133,6 +133,13 @@ parent.AddStep("analyst", SubGraphStep(analystGraph), ...)
 parent.AddStep("coder",   SubGraphStep(coderGraph),   ...)
 ```
 
+宿主可以设置 `SubGraphOpts.ChildObserver`，在 `NewSubGraphStep` 投影父图暂停结果或
+状态增量之前，读取完整且只读的 `RunResult`、子运行错误以及本次是否使用了
+`Resume`。continuation 校验在产生结果前失败时不会调用 observer；observer 也不得
+修改结果或其中的状态。observer 返回错误会在任何暂停处理器或父图增量产生前
+fail closed；如果子运行同时失败，两个错误都可通过 `errors.Is` 判断。nil observer
+保持默认行为不变。
+
 </td>
 </tr>
 <tr>

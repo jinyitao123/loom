@@ -5,6 +5,7 @@ import (
 	"context" // 步骤签名的第一参数，承载超时/取消并向子图透传
 	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt" // 子图暂停策略违规时构造错误
 	"io"
 	"math"
@@ -78,12 +79,22 @@ const (
 	YieldCustom                    // 自定义：交给调用方提供的 YieldHandler 决定如何处理
 )
 
+// ChildLifecycleObserver observes one completed child Run or Resume attempt
+// before NewSubGraphStep projects the result into parent state.
+type ChildLifecycleObserver func(
+	ctx context.Context,
+	result *loom.RunResult,
+	runErr error,
+	resumed bool,
+) error
+
 // SubGraphOpts configures sub-graph step behavior.
 // SubGraphOpts 配置子图步骤的行为：暂停策略 + （YieldCustom 时的）自定义处理器。
 type SubGraphOpts struct {
 	YieldPolicy       YieldPolicy                                                                // 采用哪种暂停策略
 	YieldHandler      func(ctx context.Context, childResult *loom.RunResult) (loom.State, error) // YieldCustom 专用：自定义处置子图暂停结果
 	ParentMergeConfig *loom.MergeConfig                                                          // 父图应用本步骤增量时使用的合并配置
+	ChildObserver     ChildLifecycleObserver
 }
 
 // WithParentMergeConfig configures a sub-graph step to calculate deltas for
@@ -105,12 +116,26 @@ func NewSubGraphStep(child *loom.Graph, store loom.Store, opts ...SubGraphOpts) 
 
 	return func(ctx context.Context, state loom.State) (loom.State, error) {
 		// 以父图当前状态为首次输入；重入时共享 continuation helper 恢复原 child run。
-		result, resumed, err := runChildContinuation(ctx, state, child, store, func() loom.State { return state })
-		if err != nil {
-			if result != nil {
-				return result.State, err
+		result, resumed, runErr := runChildContinuation(ctx, state, child, store, func() loom.State { return state })
+		if result != nil && o.ChildObserver != nil {
+			observerErr := o.ChildObserver(ctx, result, runErr, resumed)
+			if observerErr != nil {
+				wrapped := fmt.Errorf(
+					"loom: sub-graph %q child observer: %w",
+					child.Name,
+					observerErr,
+				)
+				if runErr != nil {
+					return nil, errors.Join(runErr, wrapped)
+				}
+				return nil, wrapped
 			}
-			return nil, err
+		}
+		if runErr != nil {
+			if result != nil {
+				return result.State, runErr
+			}
+			return nil, runErr
 		}
 
 		// 子图没跑完而是暂停了（内部有步骤在等人工介入）：按策略处置。

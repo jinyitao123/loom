@@ -154,6 +154,14 @@ only `park_ref`, `call_id`, and `tool` (never tool arguments). Completion clears
 the continuation and envelope, while a repeated yield refreshes its token and
 sequence and consumes the one-shot resume input.
 
+A host can set `SubGraphOpts.ChildObserver` to inspect the complete, read-only
+`RunResult`, the child run error, and whether the attempt used `Resume` before
+`NewSubGraphStep` projects a parent yield or state delta. The observer is not
+called when continuation validation fails without a result, and it must not
+modify the result or its state. An observer error fails closed before any yield
+handler or parent delta; when the child run also fails, both errors remain
+available through `errors.Is`. A nil observer preserves the default behavior.
+
 </td>
 </tr>
 <tr>

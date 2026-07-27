@@ -38,6 +38,7 @@ func SetOutput(content string, usage contract.Usage) loom.State
 func TokenBudgetHook(maxTokens int64) loom.StepHook
 type AgentSpec struct{ ... }
     func LoadFromDirectory(dir string) (*AgentSpec, error)
+type ChildLifecycleObserver func(ctx context.Context, result *loom.RunResult, runErr error, resumed bool) error
 type CompactionPolicy struct{ ... }
 type ContextCompressor interface{ ... }
 type HealthCheckDef struct{ ... }

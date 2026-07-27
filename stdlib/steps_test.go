@@ -330,6 +330,475 @@ func TestChildContinuationPreservesWrappedChildError(t *testing.T) {
 	}
 }
 
+func TestSubGraphChildObserverLifecycle(t *testing.T) {
+	t.Run("fresh_success", func(t *testing.T) {
+		store := loom.NewMemStore()
+		child := loom.NewGraph("observer-success-child", "work")
+		child.AddStep("work", func(context.Context, loom.State) (loom.State, error) {
+			return loom.State{"child_only": "visible"}, nil
+		}, loom.End())
+
+		calls := 0
+		var observer stdlib.ChildLifecycleObserver = func(_ context.Context, result *loom.RunResult, runErr error, resumed bool) error {
+			calls++
+			if resumed {
+				t.Fatal("resumed = true, want false")
+			}
+			if runErr != nil {
+				t.Fatalf("runErr = %v, want nil", runErr)
+			}
+			if result.RunID == "" {
+				t.Fatal("RunID is empty")
+			}
+			if result.StopReason != loom.StopCompleted {
+				t.Fatalf("StopReason = %q, want %q", result.StopReason, loom.StopCompleted)
+			}
+			if got := result.State["child_only"]; got != "visible" {
+				t.Fatalf("child state = %v, want visible", got)
+			}
+			return nil
+		}
+		step := stdlib.NewSubGraphStep(child, store, stdlib.SubGraphOpts{ChildObserver: observer})
+
+		delta, err := step(context.Background(), loom.State{"unchanged": "parent"})
+		assertNoError(t, err)
+		if calls != 1 {
+			t.Fatalf("observer calls = %d, want 1", calls)
+		}
+		if !reflect.DeepEqual(delta, loom.State{"__seq": int64(1), "child_only": "visible"}) {
+			t.Fatalf("delta = %#v, want original child delta", delta)
+		}
+	})
+
+	t.Run("fresh_yield", func(t *testing.T) {
+		store := loom.NewMemStore()
+		child := observerYieldChild("observer-yield-child", false)
+		calls := 0
+		step := stdlib.NewSubGraphStep(child, store, stdlib.SubGraphOpts{
+			ChildObserver: func(_ context.Context, result *loom.RunResult, runErr error, resumed bool) error {
+				calls++
+				if resumed || runErr != nil {
+					t.Fatalf("resumed=%v runErr=%v, want false/nil", resumed, runErr)
+				}
+				if !result.Yielded || result.StopReason != loom.StopYielded {
+					t.Fatalf("yielded=%v StopReason=%q, want true/%q", result.Yielded, result.StopReason, loom.StopYielded)
+				}
+				assertObserverRawChildState(t, result)
+				return nil
+			},
+		})
+
+		delta, err := step(context.Background(), loom.State{})
+		assertNoError(t, err)
+		if calls != 1 {
+			t.Fatalf("observer calls = %d, want 1", calls)
+		}
+		assertSanitizedChildYield(t, delta)
+	})
+
+	t.Run("fresh_partial_error", func(t *testing.T) {
+		childErr := errors.New("child partial failure")
+		store := loom.NewMemStore()
+		child := loom.NewGraph("observer-error-child", "fail")
+		child.AddStep("fail", func(context.Context, loom.State) (loom.State, error) {
+			return loom.State{"ignored": "delta"}, childErr
+		}, loom.End())
+		calls := 0
+		step := stdlib.NewSubGraphStep(child, store, stdlib.SubGraphOpts{
+			ChildObserver: func(_ context.Context, result *loom.RunResult, runErr error, resumed bool) error {
+				calls++
+				if resumed || result == nil {
+					t.Fatalf("resumed=%v result=%v, want false/non-nil", resumed, result)
+				}
+				if !errors.Is(runErr, childErr) {
+					t.Fatalf("runErr = %v, want child sentinel", runErr)
+				}
+				if result.StopReason != loom.StopError || result.State["__failed_step"] != "fail" {
+					t.Fatalf("partial result = %#v", result)
+				}
+				return nil
+			},
+		})
+
+		state, err := step(context.Background(), loom.State{"input": "kept"})
+		if !errors.Is(err, childErr) {
+			t.Fatalf("error = %v, want child sentinel", err)
+		}
+		if calls != 1 {
+			t.Fatalf("observer calls = %d, want 1", calls)
+		}
+		if state == nil || state["input"] != "kept" || state["__failed_step"] != "fail" {
+			t.Fatalf("partial state = %#v", state)
+		}
+	})
+
+	t.Run("resume_success", func(t *testing.T) {
+		store := loom.NewMemStore()
+		runs, resumes := 0, 0
+		child := continuationTestChild("observer-resume-child", &runs, &resumes, nil)
+		type observation struct {
+			runID   string
+			resumed bool
+			yielded bool
+		}
+		var observations []observation
+		step := stdlib.NewSubGraphStep(child, store, stdlib.SubGraphOpts{
+			ChildObserver: func(_ context.Context, result *loom.RunResult, runErr error, resumed bool) error {
+				if runErr != nil {
+					t.Fatalf("runErr = %v, want nil", runErr)
+				}
+				observations = append(observations, observation{
+					runID: result.RunID, resumed: resumed, yielded: result.Yielded,
+				})
+				return nil
+			},
+		})
+
+		first, err := step(context.Background(), loom.State{})
+		assertNoError(t, err)
+		done, err := step(context.Background(), validChildResumeState(loom.State{}.Merge(first, nil)))
+		assertNoError(t, err)
+		if len(observations) != 2 {
+			t.Fatalf("observer calls = %d, want 2", len(observations))
+		}
+		if observations[0].resumed || !observations[0].yielded {
+			t.Fatalf("fresh observation = %#v", observations[0])
+		}
+		if !observations[1].resumed || observations[1].yielded {
+			t.Fatalf("resume observation = %#v", observations[1])
+		}
+		if observations[0].runID == "" || observations[1].runID != observations[0].runID {
+			t.Fatalf("run IDs = %#v, want same non-empty ID", observations)
+		}
+		assertChildContinuationCleanup(t, done)
+	})
+
+	t.Run("resume_yield", func(t *testing.T) {
+		store := loom.NewMemStore()
+		runs, resumes := 0, 0
+		child := continuationTestChild("observer-resume-yield-child", &runs, &resumes, func(resume int) bool {
+			return resume == 1
+		})
+		var runIDs []string
+		var resumedValues []bool
+		step := stdlib.NewSubGraphStep(child, store, stdlib.SubGraphOpts{
+			ChildObserver: func(_ context.Context, result *loom.RunResult, runErr error, resumed bool) error {
+				if runErr != nil || !result.Yielded {
+					t.Fatalf("runErr=%v yielded=%v, want nil/true", runErr, result.Yielded)
+				}
+				runIDs = append(runIDs, result.RunID)
+				resumedValues = append(resumedValues, resumed)
+				return nil
+			},
+		})
+
+		first, err := step(context.Background(), loom.State{})
+		assertNoError(t, err)
+		again, err := step(context.Background(), validChildResumeState(loom.State{}.Merge(first, nil)))
+		assertNoError(t, err)
+		if len(runIDs) != 2 || resumedValues[0] || !resumedValues[1] {
+			t.Fatalf("observations runIDs=%#v resumed=%#v", runIDs, resumedValues)
+		}
+		if runIDs[0] == "" || runIDs[1] != runIDs[0] {
+			t.Fatalf("run IDs = %#v, want same non-empty ID", runIDs)
+		}
+		if first["__child_yield_token"] == again["__child_yield_token"] {
+			t.Fatalf("yield token did not refresh: first=%v second=%v", first["__child_yield_token"], again["__child_yield_token"])
+		}
+		if first["__child_checkpoint_seq"] == again["__child_checkpoint_seq"] {
+			t.Fatalf("checkpoint seq did not refresh: first=%v second=%v", first["__child_checkpoint_seq"], again["__child_checkpoint_seq"])
+		}
+	})
+
+	t.Run("validation_error_without_result", func(t *testing.T) {
+		store := loom.NewMemStore()
+		runs, resumes := 0, 0
+		child := continuationTestChild("observer-validation-child", &runs, &resumes, nil)
+		calls := 0
+		step := stdlib.NewSubGraphStep(child, store, stdlib.SubGraphOpts{
+			ChildObserver: func(context.Context, *loom.RunResult, error, bool) error {
+				calls++
+				return nil
+			},
+		})
+		first, err := step(context.Background(), loom.State{})
+		assertNoError(t, err)
+		calls = 0
+		state := validChildResumeState(loom.State{}.Merge(first, nil))
+		state["__child_yield_token"] = "stale"
+
+		result, err := step(context.Background(), state)
+		if err == nil || !strings.Contains(err.Error(), "stale continuation") {
+			t.Fatalf("error = %v, want stale continuation error", err)
+		}
+		if result != nil {
+			t.Fatalf("result = %#v, want nil", result)
+		}
+		if calls != 0 || runs != 1 || resumes != 0 {
+			t.Fatalf("observer=%d Run=%d Resume=%d, want 0/1/0", calls, runs, resumes)
+		}
+	})
+}
+
+func TestSubGraphChildObserverRunsBeforeProjection(t *testing.T) {
+	t.Run("yield_bubble", func(t *testing.T) {
+		store := loom.NewMemStore()
+		child := observerYieldChild("observer-bubble-child", false)
+		step := stdlib.NewSubGraphStep(child, store, stdlib.SubGraphOpts{
+			ChildObserver: func(_ context.Context, result *loom.RunResult, _ error, _ bool) error {
+				assertObserverRawChildState(t, result)
+				return nil
+			},
+		})
+
+		delta, err := step(context.Background(), loom.State{})
+		assertNoError(t, err)
+		assertSanitizedChildYield(t, delta)
+	})
+
+	t.Run("yield_trap", func(t *testing.T) {
+		store := loom.NewMemStore()
+		child := observerYieldChild("observer-trap-child", false)
+		observed := false
+		step := stdlib.NewSubGraphStep(child, store, stdlib.SubGraphOpts{
+			YieldPolicy: stdlib.YieldTrap,
+			ChildObserver: func(context.Context, *loom.RunResult, error, bool) error {
+				observed = true
+				return nil
+			},
+		})
+
+		state, err := step(context.Background(), loom.State{})
+		if !observed {
+			t.Fatal("observer was not called before YieldTrap")
+		}
+		if state != nil || err == nil || !strings.Contains(err.Error(), "YieldTrap") {
+			t.Fatalf("state=%#v error=%v, want nil trap error", state, err)
+		}
+	})
+
+	t.Run("yield_custom", func(t *testing.T) {
+		store := loom.NewMemStore()
+		child := observerYieldChild("observer-custom-child", false)
+		observed := false
+		handlerCalls := 0
+		step := stdlib.NewSubGraphStep(child, store, stdlib.SubGraphOpts{
+			YieldPolicy: stdlib.YieldCustom,
+			ChildObserver: func(context.Context, *loom.RunResult, error, bool) error {
+				observed = true
+				return nil
+			},
+			YieldHandler: func(context.Context, *loom.RunResult) (loom.State, error) {
+				handlerCalls++
+				if !observed {
+					t.Fatal("YieldCustom handler ran before observer")
+				}
+				return loom.State{"handled": true}, nil
+			},
+		})
+
+		state, err := step(context.Background(), loom.State{})
+		assertNoError(t, err)
+		if handlerCalls != 1 || !reflect.DeepEqual(state, loom.State{"handled": true}) {
+			t.Fatalf("handler calls=%d state=%#v", handlerCalls, state)
+		}
+	})
+
+	t.Run("success_delta", func(t *testing.T) {
+		store := loom.NewMemStore()
+		child := loom.NewGraph("observer-delta-child", "work")
+		child.AddStep("work", func(context.Context, loom.State) (loom.State, error) {
+			return loom.State{"child_only": "visible"}, nil
+		}, loom.End())
+		observed := false
+		step := stdlib.NewSubGraphStep(child, store, stdlib.SubGraphOpts{
+			ChildObserver: func(_ context.Context, result *loom.RunResult, _ error, _ bool) error {
+				observed = true
+				if result.State["unchanged"] != "parent" || result.State["child_only"] != "visible" {
+					t.Fatalf("observer state = %#v, want complete child state", result.State)
+				}
+				return nil
+			},
+		})
+
+		delta, err := step(context.Background(), loom.State{"unchanged": "parent"})
+		assertNoError(t, err)
+		if !observed {
+			t.Fatal("observer was not called")
+		}
+		if !reflect.DeepEqual(delta, loom.State{"__seq": int64(1), "child_only": "visible"}) {
+			t.Fatalf("delta = %#v, want projected change only", delta)
+		}
+	})
+}
+
+func TestSubGraphChildObserverFailureFailsClosed(t *testing.T) {
+	observerErr := errors.New("observer failed")
+
+	t.Run("child_success", func(t *testing.T) {
+		store := loom.NewMemStore()
+		child := loom.NewGraph("observer-failure-success-child", "work")
+		child.AddStep("work", func(context.Context, loom.State) (loom.State, error) {
+			return loom.State{"would_leak": true}, nil
+		}, loom.End())
+		step := stdlib.NewSubGraphStep(child, store, stdlib.SubGraphOpts{
+			ChildObserver: func(context.Context, *loom.RunResult, error, bool) error {
+				return observerErr
+			},
+		})
+
+		state, err := step(context.Background(), loom.State{})
+		if state != nil || !errors.Is(err, observerErr) || !strings.Contains(err.Error(), child.Name) {
+			t.Fatalf("state=%#v error=%v, want nil wrapped observer error", state, err)
+		}
+	})
+
+	t.Run("child_partial_error", func(t *testing.T) {
+		childErr := errors.New("child failed")
+		store := loom.NewMemStore()
+		child := loom.NewGraph("observer-failure-error-child", "fail")
+		child.AddStep("fail", func(context.Context, loom.State) (loom.State, error) {
+			return loom.State{"would_leak": true}, childErr
+		}, loom.End())
+		step := stdlib.NewSubGraphStep(child, store, stdlib.SubGraphOpts{
+			ChildObserver: func(context.Context, *loom.RunResult, error, bool) error {
+				return observerErr
+			},
+		})
+
+		state, err := step(context.Background(), loom.State{})
+		if state != nil || !errors.Is(err, childErr) || !errors.Is(err, observerErr) {
+			t.Fatalf("state=%#v error=%v, want nil joined child/observer errors", state, err)
+		}
+	})
+
+	t.Run("yield_custom_handler_not_called", func(t *testing.T) {
+		store := loom.NewMemStore()
+		child := observerYieldChild("observer-failure-yield-child", false)
+		handlerCalls := 0
+		step := stdlib.NewSubGraphStep(child, store, stdlib.SubGraphOpts{
+			YieldPolicy: stdlib.YieldCustom,
+			ChildObserver: func(context.Context, *loom.RunResult, error, bool) error {
+				return observerErr
+			},
+			YieldHandler: func(context.Context, *loom.RunResult) (loom.State, error) {
+				handlerCalls++
+				return loom.State{"would_leak": true}, nil
+			},
+		})
+
+		state, err := step(context.Background(), loom.State{})
+		if state != nil || !errors.Is(err, observerErr) {
+			t.Fatalf("state=%#v error=%v, want nil observer error", state, err)
+		}
+		if handlerCalls != 0 {
+			t.Fatalf("YieldCustom handler calls = %d, want 0", handlerCalls)
+		}
+	})
+}
+
+func TestSubGraphChildObserverNilPreservesDefaultBehavior(t *testing.T) {
+	t.Run("success", func(t *testing.T) {
+		store := loom.NewMemStore()
+		child := loom.NewGraph("nil-observer-success-child", "work")
+		child.AddStep("work", func(context.Context, loom.State) (loom.State, error) {
+			return loom.State{"output": "done"}, nil
+		}, loom.End())
+
+		delta, err := stdlib.NewSubGraphStep(child, store, stdlib.SubGraphOpts{
+			ChildObserver: nil,
+		})(context.Background(), loom.State{"unchanged": true})
+		assertNoError(t, err)
+		if !reflect.DeepEqual(delta, loom.State{"__seq": int64(1), "output": "done"}) {
+			t.Fatalf("delta = %#v, want default success delta", delta)
+		}
+	})
+
+	t.Run("yield_and_resume", func(t *testing.T) {
+		store := loom.NewMemStore()
+		runs, resumes := 0, 0
+		child := continuationTestChild("nil-observer-resume-child", &runs, &resumes, nil)
+		step := stdlib.NewSubGraphStep(child, store, stdlib.SubGraphOpts{ChildObserver: nil})
+
+		first, err := step(context.Background(), loom.State{})
+		assertNoError(t, err)
+		assertSanitizedChildYield(t, first)
+		done, err := step(context.Background(), validChildResumeState(loom.State{}.Merge(first, nil)))
+		assertNoError(t, err)
+		if runs != 1 || resumes != 1 || done["output"] != "done" {
+			t.Fatalf("Run=%d Resume=%d done=%#v", runs, resumes, done)
+		}
+		assertChildContinuationCleanup(t, done)
+	})
+
+	t.Run("error", func(t *testing.T) {
+		childErr := errors.New("nil observer child failure")
+		store := loom.NewMemStore()
+		child := loom.NewGraph("nil-observer-error-child", "fail")
+		child.AddStep("fail", func(context.Context, loom.State) (loom.State, error) {
+			return nil, childErr
+		}, loom.End())
+
+		state, err := stdlib.NewSubGraphStep(child, store, stdlib.SubGraphOpts{
+			ChildObserver: nil,
+		})(context.Background(), loom.State{"input": "kept"})
+		if !errors.Is(err, childErr) || state == nil || state["__failed_step"] != "fail" {
+			t.Fatalf("state=%#v error=%v, want default partial error result", state, err)
+		}
+	})
+}
+
+func observerYieldChild(name string, yieldAgain bool) *loom.Graph {
+	child := loom.NewGraph(name, "work")
+	child.AddStep("work", func(_ context.Context, state loom.State) (loom.State, error) {
+		if _, resumed := state["__resumed_tool_results"]; resumed && !yieldAgain {
+			return loom.State{"output": "done"}, nil
+		}
+		update := approvalYield("call-1")
+		update["child_only"] = "visible"
+		return update, nil
+	}, loom.End())
+	return child
+}
+
+func assertObserverRawChildState(t *testing.T, result *loom.RunResult) {
+	t.Helper()
+	if got := result.State["child_only"]; got != "visible" {
+		t.Fatalf("child-only state = %v, want visible", got)
+	}
+	pending, ok := result.State["__toolloop_pending"].([]map[string]any)
+	if !ok || len(pending) != 1 || pending[0]["args"] != `{"secret":true}` {
+		t.Fatalf("raw pending = %#v, want complete args", result.State["__toolloop_pending"])
+	}
+}
+
+func assertSanitizedChildYield(t *testing.T, state loom.State) {
+	t.Helper()
+	if state == nil || state["__child_run_id"] == "" || state["yield_type"] != "await_approval" {
+		t.Fatalf("yield state = %#v, want child continuation", state)
+	}
+	if _, ok := state["child_only"]; ok {
+		t.Fatalf("yield state leaked child-only key: %#v", state)
+	}
+	if _, ok := state["__toolloop_pending"]; ok {
+		t.Fatalf("yield state leaked raw pending calls: %#v", state)
+	}
+	if strings.Contains(toJSON(t, state["__child_pending"]), "secret") {
+		t.Fatalf("yield envelope leaked pending args: %#v", state["__child_pending"])
+	}
+}
+
+func assertChildContinuationCleanup(t *testing.T, state loom.State) {
+	t.Helper()
+	wantDeleted := []string{
+		"__child_run_id", "__child_graph", "__child_graph_revision", "__child_yield_token",
+		"__child_checkpoint_seq", "__child_resume_input", "__child_pending",
+	}
+	if got := state["__deleted_keys"]; !reflect.DeepEqual(got, wantDeleted) {
+		t.Fatalf("deleted keys = %#v, want %#v", got, wantDeleted)
+	}
+}
+
 func continuationTestChild(name string, runs, resumes *int, yieldAgain func(int) bool) *loom.Graph {
 	child := loom.NewGraph(name, "work")
 	child.AddStep("work", func(_ context.Context, state loom.State) (loom.State, error) {
