@@ -199,6 +199,57 @@ func resolveRunID(input State) string {
 // 主循环各阶段固定顺序：单图熔断 → 全局预算 → Before 钩子 → 执行步骤 → 合并增量
 // → After 钩子 → 检查点 → yield（暂停）检查 → 路由决定下一跳。
 func (g *Graph) Run(ctx context.Context, input State, store Store) (*RunResult, error) {
+	runID := resolveRunID(input)
+	return runWithTerminalizer(
+		ctx,
+		g.Name,
+		runID,
+		LifecycleHooks{},
+		func(runCtx context.Context) (*RunResult, error) {
+			return g.run(runCtx, input, store)
+		},
+	)
+}
+
+// RunWithLifecycle executes a caller-allocated run with per-invocation
+// lifecycle hooks. input must carry the authoritative non-empty __run_id.
+func (g *Graph) RunWithLifecycle(
+	ctx context.Context,
+	input State,
+	store Store,
+	hooks LifecycleHooks,
+) (*RunResult, error) {
+	runID, ok := input["__run_id"].(string)
+	if !ok || runID == "" {
+		return nil, fmt.Errorf("loom: RunWithLifecycle requires a caller-allocated __run_id")
+	}
+	parentRunID, parentSeq := lifecycleParent(input)
+	return runWithTerminalizer(
+		ctx,
+		g.Name,
+		runID,
+		hooks,
+		func(runCtx context.Context) (*RunResult, error) {
+			executionCtx, err := runAllocation(
+				runCtx,
+				hooks,
+				RunAllocationEvent{
+					RunID:       runID,
+					GraphName:   g.Name,
+					ParentRunID: parentRunID,
+					ParentSeq:   parentSeq,
+					State:       input,
+				},
+			)
+			if err != nil {
+				return nil, err
+			}
+			return g.run(executionCtx, input, store)
+		},
+	)
+}
+
+func (g *Graph) run(ctx context.Context, input State, store Store) (*RunResult, error) {
 	runID := resolveRunID(input) // 沿用或生成运行标识：整个运行（含后续 Resume）共用同一 ID
 
 	// Load the global step budget exactly once, in context > persisted state > graph option order.
@@ -351,6 +402,41 @@ func (g *Graph) Run(ctx context.Context, input State, store Store) (*RunResult, 
 // 兼容差异：Resume 对空 phase 按 mid_step 处理，因为 v1.0 latest 表示“暂停中”的恢复点；
 // ResumeAt 则对空 phase 按 after_step 处理，因为历史条目是步骤完成后的快照，重跑会造成双重作用。
 func (g *Graph) Resume(ctx context.Context, runID string, input State, store Store) (*RunResult, error) {
+	return runWithTerminalizer(
+		ctx,
+		g.Name,
+		runID,
+		LifecycleHooks{},
+		func(runCtx context.Context) (*RunResult, error) {
+			return g.resume(runCtx, runID, input, store)
+		},
+	)
+}
+
+// ResumeWithLifecycle resumes an existing run with per-invocation lifecycle
+// hooks. Resume does not allocate a new run identity.
+func (g *Graph) ResumeWithLifecycle(
+	ctx context.Context,
+	runID string,
+	input State,
+	store Store,
+	hooks LifecycleHooks,
+) (*RunResult, error) {
+	if runID == "" {
+		return nil, fmt.Errorf("loom: ResumeWithLifecycle requires a non-empty run ID")
+	}
+	return runWithTerminalizer(
+		ctx,
+		g.Name,
+		runID,
+		hooks,
+		func(runCtx context.Context) (*RunResult, error) {
+			return g.resume(runCtx, runID, input, store)
+		},
+	)
+}
+
+func (g *Graph) resume(ctx context.Context, runID string, input State, store Store) (*RunResult, error) {
 	// 按 runID 读取检查点：命名空间与 Run 落盘时一致（"checkpoint:"+图名）。
 	data, err := store.Get(ctx, "checkpoint:"+g.Name, runID)
 	if err != nil {
@@ -377,24 +463,33 @@ func (g *Graph) Resume(ctx context.Context, runID string, input State, store Sto
 		router := g.routers[cp.LastStep]
 		if router == nil {
 			// 暂停的步骤本身是终端步骤：无路可走，恢复即正常结束。
-			return &RunResult{State: state, RunID: runID}, nil
+			return &RunResult{
+				State: state, LastStep: cp.LastStep, RunID: runID,
+				StopReason: StopCompleted,
+			}, nil
 		}
 		// 用合并了人工输入的状态做路由决策：人工反馈可以改变后续走向。
 		nextStep, err := router(ctx, state)
 		if err != nil {
-			return &RunResult{State: state, LastStep: cp.LastStep, RunID: runID}, err
+			return &RunResult{
+				State: state, LastStep: cp.LastStep, RunID: runID,
+				StopReason: StopError,
+			}, err
 		}
 		if nextStep == "" {
 			// 路由返回空串 = 停机：恢复后直接正常结束。
-			return &RunResult{State: state, LastStep: cp.LastStep, RunID: runID}, nil
+			return &RunResult{
+				State: state, LastStep: cp.LastStep, RunID: runID,
+				StopReason: StopCompleted,
+			}, nil
 		}
 		// 以路由结果为新入口继续执行：withEntry 浅拷贝共享全部配置，预算经 context 继承。
-		return g.withEntry(nextStep).Run(ctx, state, store)
+		return g.withEntry(nextStep).run(ctx, state, store)
 
 	default: // "mid_step" or empty (v1.0 compat)
 		// mid_step（或空串，兼容 v1.0 旧检查点）：暂停发生在步骤中途——恢复时重跑该步骤，
 		// 由步骤自身根据合并进来的人工输入决定后续行为，因此声明 mid_step 的步骤必须设计为可重入。
-		return g.withEntry(cp.LastStep).Run(ctx, state, store)
+		return g.withEntry(cp.LastStep).run(ctx, state, store)
 	}
 }
 
@@ -404,6 +499,68 @@ func (g *Graph) Resume(ctx context.Context, runID string, input State, store Sto
 // 后的状态，若按 mid_step 重跑原步骤，外部副作用与状态增量都可能重复发生。fork 默认继承源快照
 // 在分叉点的 __budget_remaining；宿主可在 input 中显式提供同名键，借由下方 Merge 覆盖该余额。
 func (g *Graph) ResumeAt(ctx context.Context, runID string, seq int64, input State, store Store) (*RunResult, error) {
+	allocatedRunID := uuid.New().String()
+	return runWithTerminalizer(
+		ctx,
+		g.Name,
+		allocatedRunID,
+		LifecycleHooks{},
+		func(runCtx context.Context) (*RunResult, error) {
+			return g.resumeAt(
+				runCtx,
+				runID,
+				seq,
+				allocatedRunID,
+				input,
+				store,
+				LifecycleHooks{},
+			)
+		},
+	)
+}
+
+// ResumeAtWithLifecycle forks a historical checkpoint into the exact
+// caller-allocated run identity and applies per-invocation lifecycle hooks.
+func (g *Graph) ResumeAtWithLifecycle(
+	ctx context.Context,
+	sourceRunID string,
+	seq int64,
+	allocatedRunID string,
+	input State,
+	store Store,
+	hooks LifecycleHooks,
+) (*RunResult, error) {
+	if allocatedRunID == "" {
+		return nil, fmt.Errorf("loom: ResumeAtWithLifecycle requires a non-empty allocated run ID")
+	}
+	return runWithTerminalizer(
+		ctx,
+		g.Name,
+		allocatedRunID,
+		hooks,
+		func(runCtx context.Context) (*RunResult, error) {
+			return g.resumeAt(
+				runCtx,
+				sourceRunID,
+				seq,
+				allocatedRunID,
+				input,
+				store,
+				hooks,
+			)
+		},
+	)
+}
+
+func (g *Graph) resumeAt(
+	ctx context.Context,
+	runID string,
+	seq int64,
+	allocatedRunID string,
+	input State,
+	store Store,
+	hooks LifecycleHooks,
+) (*RunResult, error) {
 	historyKey := fmt.Sprintf("%s/%012d", runID, seq) // 零填充格式与 doCheckpoint 的历史键协议完全一致
 	data, err := store.Get(ctx, "checkpoint:"+g.Name, historyKey)
 	if err != nil {
@@ -423,15 +580,24 @@ func (g *Graph) ResumeAt(ctx context.Context, runID string, seq int64, input Sta
 
 	// fork 现场以源快照为底合并调用方输入，然后强制覆盖三个身份/溯源协议键：
 	// 新运行绝不复用源 runID；__seq 保留在合并状态中，使首次 fork 检查点从源 seq+1 续编。
-	newID := uuid.New().String()
 	state := cp.State.Merge(input, g.mergeConfig)
-	state["__run_id"] = newID
+	state["__run_id"] = allocatedRunID
 	state["__parent_run"] = runID
 	state["__parent_seq"] = seq
+	executionCtx, err := runAllocation(ctx, hooks, RunAllocationEvent{
+		RunID:       allocatedRunID,
+		GraphName:   g.Name,
+		ParentRunID: runID,
+		ParentSeq:   seq,
+		State:       state,
+	})
+	if err != nil {
+		return nil, err
+	}
 
 	if cp.YieldPhase == "mid_step" {
 		// 显式 mid_step 表示步骤尚未完成：从原步骤重入，让它消费 fork 输入并重跑。
-		return g.withEntry(cp.LastStep).Run(ctx, state, store)
+		return g.withEntry(cp.LastStep).run(executionCtx, state, store)
 	}
 
 	// 其余 phase（包括空串与 after_step）均把历史节点视为“该步骤已完成”，直接执行其路由。
@@ -439,22 +605,22 @@ func (g *Graph) ResumeAt(ctx context.Context, runID string, seq int64, input Sta
 	if router == nil {
 		// 源节点没有出边即为终端：fork 已创建身份，但没有新步骤需要执行，因此不产生新检查点。
 		return &RunResult{
-			State: state, LastStep: cp.LastStep, RunID: newID, StopReason: StopCompleted,
+			State: state, LastStep: cp.LastStep, RunID: allocatedRunID, StopReason: StopCompleted,
 		}, nil
 	}
-	nextStep, err := router(ctx, state)
+	nextStep, err := router(executionCtx, state)
 	if err != nil {
 		return &RunResult{
-			State: state, LastStep: cp.LastStep, RunID: newID, StopReason: StopError,
+			State: state, LastStep: cp.LastStep, RunID: allocatedRunID, StopReason: StopError,
 		}, err
 	}
 	if nextStep == "" {
 		// 路由器显式返回空串同样是正常完成，不执行任何源步骤，也不落 fork 检查点。
 		return &RunResult{
-			State: state, LastStep: cp.LastStep, RunID: newID, StopReason: StopCompleted,
+			State: state, LastStep: cp.LastStep, RunID: allocatedRunID, StopReason: StopCompleted,
 		}, nil
 	}
-	return g.withEntry(nextStep).Run(ctx, state, store) // 后续所有写入由新 __run_id 隔离到 fork 存档树
+	return g.withEntry(nextStep).run(executionCtx, state, store) // 后续所有写入由新 __run_id 隔离到 fork 存档树
 }
 
 // History lists valid historical checkpoint metadata for a run in ascending step order.
@@ -552,14 +718,29 @@ func (g *Graph) doCheckpoint(ctx context.Context, store Store, runID, step strin
 		YieldPhase: yieldPhase,
 		SavedAt:    time.Now(),
 	}
+	if tracker := lifecycleCheckpointTrackerFrom(ctx, g.Name, runID); tracker != nil {
+		tracker.putAttempted(seq)
+	}
 	data, err := json.Marshal(cp) // 序列化为 JSON（State 的值必须可 JSON 化）
 	if err != nil {
 		// 序列化失败属于编程错误（状态里塞了不可 JSON 化的值），无论何种策略都必须上抛暴露。
 		return fmt.Errorf("loom: checkpoint marshal failed at step %q: %w (check State for non-JSON values)", step, err)
 	}
+	if err := observeLatestCheckpoint(
+		ctx,
+		g.Name,
+		runID,
+		seq,
+		CheckpointLatestPutBefore,
+	); err != nil {
+		return err
+	}
 	// 落盘：同一 runID 覆盖写，存储中始终只保留该运行最新一步的快照。
 	err = store.Put(ctx, "checkpoint:"+g.Name, runID, data)
 	if err != nil {
+		if tracker := lifecycleCheckpointTrackerFrom(ctx, g.Name, runID); tracker != nil {
+			tracker.putFailed()
+		}
 		// 写入失败按策略分流。
 		switch g.checkpointPolicy {
 		case CheckpointRequired:
@@ -571,6 +752,18 @@ func (g *Graph) doCheckpoint(ctx context.Context, store Store, runID, step strin
 				"graph", g.Name, "step", step, "error", err)
 			return nil
 		}
+	}
+	if tracker := lifecycleCheckpointTrackerFrom(ctx, g.Name, runID); tracker != nil {
+		tracker.putSucceeded(seq)
+	}
+	if err := observeLatestCheckpoint(
+		ctx,
+		g.Name,
+		runID,
+		seq,
+		CheckpointLatestPutAfter,
+	); err != nil {
+		return err
 	}
 
 	// historyKeep=0 保持原有 latest-only 行为：不创建任何 runID/ 前缀键。

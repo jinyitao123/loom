@@ -95,6 +95,7 @@ type SubGraphOpts struct {
 	YieldHandler      func(ctx context.Context, childResult *loom.RunResult) (loom.State, error) // YieldCustom 专用：自定义处置子图暂停结果
 	ParentMergeConfig *loom.MergeConfig                                                          // 父图应用本步骤增量时使用的合并配置
 	ChildObserver     ChildLifecycleObserver
+	LifecycleHooks    *loom.LifecycleHooks
 }
 
 // WithParentMergeConfig configures a sub-graph step to calculate deltas for
@@ -116,7 +117,14 @@ func NewSubGraphStep(child *loom.Graph, store loom.Store, opts ...SubGraphOpts) 
 
 	return func(ctx context.Context, state loom.State) (loom.State, error) {
 		// 以父图当前状态为首次输入；重入时共享 continuation helper 恢复原 child run。
-		result, resumed, runErr := runChildContinuation(ctx, state, child, store, func() loom.State { return state })
+		result, resumed, runErr := runChildContinuation(
+			ctx,
+			state,
+			child,
+			store,
+			o.LifecycleHooks,
+			func() loom.State { return state },
+		)
 		if result != nil && o.ChildObserver != nil {
 			observerErr := o.ChildObserver(ctx, result, runErr, resumed)
 			if observerErr != nil {
@@ -176,7 +184,14 @@ type childCheckpoint struct {
 	State      loom.State `json:"state"`
 }
 
-func runChildContinuation(ctx context.Context, parent loom.State, child *loom.Graph, store loom.Store, initial func() loom.State) (*loom.RunResult, bool, error) {
+func runChildContinuation(
+	ctx context.Context,
+	parent loom.State,
+	child *loom.Graph,
+	store loom.Store,
+	lifecycleHooks *loom.LifecycleHooks,
+	initial func() loom.State,
+) (*loom.RunResult, bool, error) {
 	runID, runPresent := parent["__child_run_id"]
 	graphName, graphPresent := parent["__child_graph"]
 	resumeRaw, inputPresent := parent["__child_resume_input"]
@@ -197,7 +212,13 @@ func runChildContinuation(ctx context.Context, parent loom.State, child *loom.Gr
 		if hasContinuationKey || inputPresent {
 			return nil, false, fmt.Errorf("loom: child graph %q continuation is missing or invalid", child.Name)
 		}
-		result, err := child.Run(ctx, initial(), store)
+		var result *loom.RunResult
+		var err error
+		if lifecycleHooks == nil {
+			result, err = child.Run(ctx, initial(), store)
+		} else {
+			result, err = child.RunWithLifecycle(ctx, initial(), store, *lifecycleHooks)
+		}
 		if err != nil {
 			return result, false, fmt.Errorf("loom: child graph %q run: %w", child.Name, err)
 		}
@@ -230,7 +251,12 @@ func runChildContinuation(ctx context.Context, parent loom.State, child *loom.Gr
 	if err != nil {
 		return nil, false, fmt.Errorf("loom: child graph %q run %q resume input: %w", child.Name, run, err)
 	}
-	result, err := child.Resume(ctx, run, resumeInput, store)
+	var result *loom.RunResult
+	if lifecycleHooks == nil {
+		result, err = child.Resume(ctx, run, resumeInput, store)
+	} else {
+		result, err = child.ResumeWithLifecycle(ctx, run, resumeInput, store, *lifecycleHooks)
+	}
 	if err != nil {
 		return result, true, fmt.Errorf("loom: child graph %q run %q resume: %w", child.Name, run, err)
 	}
@@ -523,7 +549,7 @@ func NewHandoffStep(target *loom.Graph, store loom.Store, compressor ContextComp
 			}
 			return handoffState
 		}
-		result, resumed, err := runChildContinuation(ctx, state, target, store, initial)
+		result, resumed, err := runChildContinuation(ctx, state, target, store, nil, initial)
 		if err != nil {
 			if result != nil {
 				return result.State, err

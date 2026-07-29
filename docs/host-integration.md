@@ -108,6 +108,32 @@ completion (`result` carries final status + session id).
 process invocations. This is how a per-turn CLI sustains a multi-turn,
 in-presence agent.
 
+## Embedded lifecycle hooks
+
+An embedded Go host that needs durable run admission or terminalization can
+use per-invocation `LifecycleHooks`. Hooks are not stored on `Graph`, so the
+same graph remains safe for concurrent callers with different host policies.
+
+- `RunWithLifecycle` requires a caller-supplied `__run_id`.
+- `ResumeWithLifecycle` retains the existing run identity.
+- `ResumeAtWithLifecycle` requires an explicit new run ID and calls
+  `RunAllocated` after restoring and merging the source checkpoint but before
+  any step, router, or no-step return.
+- `ExecutionContext` optionally derives the router/step context after
+  `RunAllocated` succeeds, for example to attach a host-owned lease or fencing
+  cancellation scope. It must return a non-nil context derived from the
+  supplied invocation context.
+- `Terminalizer` runs synchronously exactly once before every non-nil
+  `RunResult` is returned. Its error is joined with any graph error.
+- `CheckpointObserver` exposes only the required/latest store boundaries
+  `latest_put_before` and `latest_put_after`; history writes remain outside the
+  contract.
+- `stdlib.SubGraphOpts.LifecycleHooks` applies the same contract to fresh and
+  resumed child graphs.
+
+The event types contain only engine facts. Hosts remain responsible for
+storage transactions, fencing, retries, and domain-specific records.
+
 ## What stays out of the engine
 
 By design, the following are **host** responsibilities, deliberately not baked
