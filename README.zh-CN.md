@@ -6,6 +6,14 @@
   <a href="README.md">English</a> | <a href="README.zh-CN.md">中文</a>
 </p>
 
+<p align="center">
+  <a href="https://github.com/jinyitao123/loom/actions/workflows/loom-cli.yml"><img src="https://github.com/jinyitao123/loom/actions/workflows/loom-cli.yml/badge.svg" alt="CI"></a>
+  <a href="https://pkg.go.dev/github.com/jinyitao123/loom"><img src="https://pkg.go.dev/badge/github.com/jinyitao123/loom.svg" alt="Go Reference"></a>
+  <a href="https://goreportcard.com/report/github.com/jinyitao123/loom"><img src="https://goreportcard.com/badge/github.com/jinyitao123/loom" alt="Go Report Card"></a>
+  <a href="https://github.com/jinyitao123/loom/releases"><img src="https://img.shields.io/github/v/release/jinyitao123/loom" alt="Release"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-blue.svg" alt="License: MIT"></a>
+</p>
+
 ---
 
 织布机只有三个部件——经线、纬线、梭子——却能织出任何图案。
@@ -32,7 +40,7 @@ type Graph  struct { steps; routers; Run(); Resume() }               // 编排
 
 Loom 的设计原则是反过来的：**内核小到你能在一个下午读完全部源码。** 不是因为功能少，是因为一个复杂成熟的系统，其内核必然是精悍简洁的。复杂性应该从组合中涌现，而不是在框架里预制。
 
-这不只是工程审美。一个你读得懂的内核，也是一个你**治得住**的内核。因为在 Loom 里，一个 agent 是一张明确步骤组成的图、跑在一个可检视的 `State` 上——不是一个松散的 prompt 循环——它的执行是**确定的、可回放的**。而你只能为你预见得到、重建得出的东西去担责。这个属性，正是让一个 agent 去干真活、还受人监督的前提:一只稳的、看得清的手，才是治理层能真正攥住的东西。[Weave](https://github.com/jinyitao123/Weave) 就是那一层——它在这个内核之上，建起写审批闸、审计账、和可寻址的运行时。Loom 让手稳;Weave 决定这只手的哪些动作能抵达世界。
+这不只是工程审美。一个你读得懂的内核，也是一个你**治得住**的内核。因为在 Loom 里，一个 agent 是一张明确步骤组成的图、跑在一个可检视的 `State` 上——不是一个松散的 prompt 循环——它的执行是**确定的、可回放的**。而你只能为你预见得到、重建得出的东西去担责。这个属性，正是让一个 agent 去干真活、还受人监督的前提:一只稳的、看得清的手，才是治理层能真正攥住的东西。[Weave](https://github.com/jinyitao123/Weave)（即将开源）就是那一层——它在这个内核之上，建起写审批闸、审计账、和可寻址的运行时。Loom 让手稳;Weave 决定这只手的哪些动作能抵达世界。
 
 ## 控制流是数据，不是临场发挥
 
@@ -224,7 +232,7 @@ Read-only 工具自动并发，stateful 工具严格串行。ToolLoop 读 `ToolD
 
 ## `loom` CLI
 
-Loom 首先是一个库——但仓库也附带了 `loom` 二进制：一个基于这个库构建的独立 Agent 引擎。它是 [weave](https://github.com/jinyitao123/Weave) daemon 的 spawn-harness 后端：stdin 读入 prompt JSON，跑一轮 Agent，stdout 输出 NDJSON 事件流——支持 MCP 工具服务、会话 resume、语义记忆，以及从 Agent Spec 编译出的确定性子代理编排。
+Loom 首先是一个库——但仓库也附带了 `loom` 二进制：一个基于这个库构建的独立 Agent 引擎。它是 [weave](https://github.com/jinyitao123/Weave)（即将开源）daemon 的 spawn-harness 后端：stdin 读入 prompt JSON，跑一轮 Agent，stdout 输出 NDJSON 事件流——支持 MCP 工具服务、会话 resume、语义记忆，以及从 Agent Spec 编译出的确定性子代理编排。
 
 ```bash
 # 从 GitHub Release 安装（linux / macOS）：
@@ -262,6 +270,7 @@ loom/
 ├── pgstore/          PostgreSQL Store
 ├── provider/         LLM Provider（OpenAI 兼容 / DeepSeek）
 ├── cmd/loom/         `loom` CLI —— stdin JSON → Agent 轮次 → NDJSON 流
+├── tests/            黑盒测试套件（仅走公开 API）
 └── docs/             宿主集成契约 & 编排设计
 ```
 

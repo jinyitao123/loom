@@ -94,6 +94,9 @@ in `cmd/loom` (`go test ./cmd/loom/ -run '^$' -fuzz Fuzz... -fuzztime 20s`).
 - **`provider/`** — OpenAI + DeepSeek LLM adapters.
 - **`pgstore/`** — Postgres `Store`.
 - **`cmd/loom/`** — the `loom run` CLI.
+- **`tests/`** — black-box test suite exercising the public API only.
+  White-box tests needing kernel internals stay at the root
+  (e.g. `graph_budget_resume_test.go`).
 - **`docs/`** — `host-integration.md` (how a host drives `loom run`),
   `orchestration.md` (sub-agent routing).
 

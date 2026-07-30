@@ -1,4 +1,4 @@
-package loom_test
+package tests
 
 import (
 	"context"
@@ -104,4 +104,3 @@ func TestE2E_MultiAgent_Workflow_WithHITL(t *testing.T) {
 	assertYielded(t, r2, false)
 	assertState(t, r2, "agent_b_output", "final document")
 }
-
