@@ -1,5 +1,9 @@
 <p align="center">
-  <img src="assets/loom-logo.png" alt="Loom" width="420">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/loom-logo-dark.png">
+    <source media="(prefers-color-scheme: light)" srcset="assets/loom-logo-light.png">
+    <img src="assets/loom-logo-light.png" alt="Loom" width="420">
+  </picture>
 </p>
 
 <p align="center">
