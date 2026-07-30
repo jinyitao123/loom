@@ -31,8 +31,8 @@ scripts/ci/no-business-words.sh  # kernel vocabulary guard
 - New code needs tests. Black-box tests go in `tests/`; white-box tests that
   need kernel internals stay at the root next to the kernel files.
 - Changing the frozen kernel files (`graph.go`, `step.go`, `router.go`,
-  `state.go`, `store.go`) requires `[kernel-ok]` in the commit message after
-  explicit review.
+  `state.go`, `store.go`, `lifecycle.go`, `errors.go`) requires `[kernel-ok]`
+  in the commit message after explicit review.
 - Intentional exported-API changes: `scripts/ci/api-surface.sh --update` in the
   same commit.
 - The CLI wire contract (`loom run --format stream-json`) is stable: add events

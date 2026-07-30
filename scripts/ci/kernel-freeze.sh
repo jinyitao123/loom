@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Guard the frozen kernel files: graph.go, step.go, router.go, state.go, store.go.
+# Guard the frozen kernel files: graph.go, step.go, router.go, state.go,
+# store.go, lifecycle.go, errors.go.
 # Usage: scripts/ci/kernel-freeze.sh [base-ref] (default: HEAD~1).
 # Kernel changes in <base-ref>...HEAD or the staged index require [kernel-ok]
 # in the most recent commit message.
@@ -7,7 +8,7 @@
 set -euo pipefail
 
 base_ref="${1:-HEAD~1}"
-kernel_pattern='^(graph|step|router|state|store)\.go$'
+kernel_pattern='^(graph|step|router|state|store|lifecycle|errors)\.go$'
 
 changed_files="$({ git diff --name-only "$base_ref"...HEAD; git diff --cached --name-only; } | sort -u)"
 kernel_changes="$(printf '%s\n' "$changed_files" | grep -E "$kernel_pattern" || true)"

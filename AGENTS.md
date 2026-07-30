@@ -20,7 +20,7 @@ Layer 0  kernel (root *.go)      the five primitives
 
 Concretely:
 - The kernel (`graph.go`, `state.go`, `step.go`, `router.go`, `store.go`,
-  `options.go`, `memstore.go`) imports **nothing from `contract/`, `stdlib/`,
+  `options.go`, `memstore.go`, `lifecycle.go`, `errors.go`) imports **nothing from `contract/`, `stdlib/`,
   `provider/`, `pgstore/`, or `cmd/`**. It is self-contained.
 - `contract/` is pure interfaces + value types. No behavior.
 - `stdlib/` composes the kernel + contract. **Do not add new primitives here** —
@@ -33,8 +33,8 @@ If a change needs to break the layering, it's the wrong change.
 
 ## Kernel purity guardrails
 
-The five kernel files (`graph.go`, `step.go`, `router.go`, `state.go`,
-`store.go`) are frozen around a single-hop, serial, deterministic design with
+The kernel files (`graph.go`, `step.go`, `router.go`, `state.go`,
+`store.go`, `lifecycle.go`, `errors.go`) are frozen around a single-hop, serial, deterministic design with
 no business vocabulary. `contract/` contains only generally useful mechanism
 types and must not use business-domain names. `stdlib/` contains only
 business-agnostic compositions of the existing mechanisms. Business semantics
@@ -52,7 +52,7 @@ Kernel invariants:
 The kernel business-word blacklist has a single source of truth in
 `scripts/ci/no-business-words.sh`. It currently covers `avatar`, `team`,
 `transfer`, `delegate`, `weave`, `tenant`, `审批`, `团队`, `分身`, `员工` and is
-checked only against the five kernel files above. `agent` is intentionally not
+checked only against the kernel files above. `agent` is intentionally not
 blacklisted: Loom is an agent engine, so `agent` and `CompileAgent` are generic
 Loom vocabulary. If a proposed blacklist word already occurs in the kernel,
 report the hit before changing the list; do not edit kernel code merely to pass
