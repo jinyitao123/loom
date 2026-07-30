@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/loom-social-preview.png" alt="LOOM · 织机" width="800">
+  <img src="assets/loom-logo.png" alt="Loom" width="420">
 </p>
 
 <p align="center">
@@ -14,43 +14,17 @@
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-blue.svg" alt="License: MIT"></a>
 </p>
 
----
+Loom is a small Go library for agent workflows that need to pause for a human, resume later, and survive a crash.
 
-A loom has only three moving parts — warp, weft, shuttle — yet it can weave any pattern.
+An agent in Loom is an explicit graph of steps over an inspectable `State`. The engine executes the steps in graph order, checkpoints after each one through a pluggable `Store`, and can freeze mid-run (`yield`) and continue later (`Resume`) — on another day, in another process. What it does **not** guarantee: your steps are your functions, so a step that calls an LLM or reads a clock is as reproducible as you make it. Loom holds the topology, the execution order, and the recovery; the rest is yours.
 
-Loom works the same way. The entire kernel is ~700 lines of Go and 5 type definitions. Combined, they express everything from a single chatbot to a hundred-agent orchestration.
+Status: `v0.8.0`, pre-1.0. API changes are additive; breaking changes ship with a minor bump and migration notes. Requires Go 1.24+. MIT licensed.
 
-```go
-type State  map[string]any                                           // data
-type Step   func(ctx context.Context, state State) (State, error)    // compute
-type Router func(ctx context.Context, state State) (string, error)   // control flow
-type Store  interface { Get; Put; Delete; List; Tx }                 // persistence
-type Graph  struct { steps; routers; Run(); Resume() }               // orchestration
+## Quickstart
+
+```bash
+go get github.com/jinyitao123/loom   # inside your Go module
 ```
-
-No `Agent` class. No `Chain` abstraction. No `Memory` base type.
-
-Every advanced feature is **composed** from these five primitives — not **inherited** from a framework.
-
-## Why Loom
-
-There is no shortage of agent frameworks. What's missing is one you can actually **own**.
-
-Most frameworks are feature-complete — tens of thousands of lines, rich abstraction layers, batteries included. But when you need to change their behavior, understand their internals, or embed them into your own system, you find yourself wrestling a giant.
-
-Loom's design principle is the inverse: **the kernel is small enough to read in an afternoon.** Not because it does less, but because a mature, complex system must have a lean core. Complexity should emerge from composition, not be pre-baked into the framework.
-
-This is more than an engineering aesthetic. A kernel you can read is a kernel you can **govern**. Because an agent in Loom is a graph of explicit steps over an inspectable `State` — not a loose prompt loop — its execution is **deterministic and replayable**. And you can only safely hold someone accountable for what you can foresee and reconstruct. That property is the precondition for putting an agent to real work under human oversight: a steady, legible hand is the thing a governance layer can actually hold onto. [Weave](https://github.com/jinyitao123/Weave) (repo going public soon) is that layer — it builds the write-approval gate, the audit trail, and the addressable runtime on top of this kernel. Loom makes the hand steady; Weave decides which of its acts may reach the world.
-
-## The control flow is data, not a guess
-
-Most agent frameworks run a **prompt loop**: the model re-decides, every turn, what to do next. Flexible — but you can't foresee the path and you can't replay it; the same input can take two different routes.
-
-In Loom the control flow is a **Graph** — an explicit structure of steps and routers, fixed *before* the run, not improvised during it. The graph owns the **how** (what runs, in what order); the prompt only supplies the **what** (the content, and the criteria for "good"). That single separation is what makes a Loom agent deterministic and replayable: same graph, same state, same path — with every step checkpointed, so you can reconstruct exactly what happened.
-
-And because the flow is a *structure*, not a script, it is also **data**. A graph can be written in Go, or compiled from an agent spec that carries no code (`cmd/loom` does exactly this). Tools can then treat an agent as a versioned, diffable, portable document — while its execution stays exactly as predictable. That is the line between an agent you can put to supervised, consequential work and a chatbot that improvises: when a wrong turn can't be undone, you want the path decided, inspectable, and repeatable — you want a graph.
-
-## 30-Second Quickstart
 
 ```go
 package main
@@ -58,6 +32,8 @@ package main
 import (
     "context"
     "fmt"
+    "log"
+
     "github.com/jinyitao123/loom"
 )
 
@@ -69,156 +45,44 @@ func main() {
     g := loom.NewGraph("greeter", "greet")
     g.AddStep("greet", greet, loom.End())
 
-    result, _ := g.Run(context.Background(), loom.State{"name": "World"}, nil)
+    result, err := g.Run(context.Background(), loom.State{"name": "World"}, nil)
+    if err != nil {
+        log.Fatal(err)
+    }
     fmt.Println(result.State["output"]) // Hello, World!
 }
 ```
 
-```bash
-go get github.com/jinyitao123/loom
-```
+API reference: [pkg.go.dev/github.com/jinyitao123/loom](https://pkg.go.dev/github.com/jinyitao123/loom)
 
-## What Five Primitives Can Do
+## What this buys you
 
-<table>
-<tr>
-<td width="50%">
-
-**Tool-calling Agent**
-
-Three Steps, wired together.
-
-</td>
-<td>
+**Pause for human approval.** A step sets `__yield: true`; the graph freezes with its state checkpointed. Days later, after the human decides, `Resume` picks up exactly where it stopped:
 
 ```go
-g := loom.NewGraph("agent", "guard")
-g.AddStep("guard", guardStep, Always("chat"))
-g.AddStep("chat",  toolLoop,  End())
-```
-
-</td>
-</tr>
-<tr>
-<td>
-
-**Pause for Human Approval**
-
-A Step returns `__yield: true` and the Graph freezes state automatically. After approval, `Resume()` picks up right where it left off.
-
-</td>
-<td>
-
-```go
-result, _ := g.Run(ctx, input, store)
+result, err := g.Run(ctx, input, store)
 // result.StopReason == "yielded"
 
-// After human approval
-result, _ = g.Resume(ctx, result.RunID,
-    State{"approved": true}, store)
+result, err = g.Resume(ctx, result.RunID, loom.State{"approved": true}, store)
 ```
 
-</td>
-</tr>
-<tr>
-<td>
-
-**10 Agents Collaborating**
-
-Each agent is a Graph, nested inside a parent Graph. Shared checkpoints, shared step budget.
-
-</td>
-<td>
+**Survive a crash.** Every step auto-checkpoints. Process dies after step C, restart, resume — it continues at step D with C's state intact:
 
 ```go
-parent := loom.NewGraph("orchestrator", "dispatch",
-    WithStepBudget(500))
-
-parent.AddStep("dispatch", router, Branch(...))
-parent.AddStep("analyst", SubGraphStep(analystGraph), ...)
-parent.AddStep("coder",   SubGraphStep(coderGraph),   ...)
+result, err = g.Resume(ctx, runID, loom.State{}, pgStore)
 ```
 
-`stdlib.NewSubGraphStep` follows the Step contract by returning only the child's
-per-key JSON changes relative to the state it received. By default, changed
-slice values are returned as suffixes, so a parent using `AppendSlice` does not
-append the inherited prefix twice; a child that reorders or replaces that prefix
-fails closed. For `SumInt`, `SumFloat`, or an explicit overwrite policy, pass
-the parent's merge configuration with
-`stdlib.WithParentMergeConfig(parentMergeConfig)` so the step can return the
-numeric difference or full replacement required by that policy. A host using a
-sum policy must always pass this configuration explicitly.
+Newly written checkpoints carry `schema_version: 1`; newer binaries read legacy checkpoints, older binaries fail closed on newer ones. The same rule holds for `Resume`, `ResumeAt`, and history reads.
 
-With the default `YieldBubble` policy, a yielded child is represented in the
-parent checkpoint by a continuation containing the child run and graph plus a
-stable topology revision, the yielded checkpoint sequence, and a fresh random
-yield token. A host resumes that same child run by supplying
-`__child_resume_input` containing only `__resumed_tool_results`; before calling
-the child, the step verifies that its latest checkpoint is still yielded and
-that the topology revision, sequence, and token all match. A parked, incomplete,
-or stale continuation fails closed instead of starting the child again.
-Approval yields also expose a sanitized `__child_pending` envelope containing
-only `park_ref`, `call_id`, and `tool` (never tool arguments). Completion clears
-the continuation and envelope, while a repeated yield refreshes its token and
-sequence and consumes the one-shot resume input.
+## Facts
 
-A host can set `SubGraphOpts.ChildObserver` to inspect the complete, read-only
-`RunResult`, the child run error, and whether the attempt used `Resume` before
-`NewSubGraphStep` projects a parent yield or state delta. The observer is not
-called when continuation validation fails without a result, and it must not
-modify the result or its state. An observer error fails closed before any yield
-handler or parent delta; when the child run also fails, both errors remain
-available through `errors.Is`. A nil observer preserves the default behavior.
+- Five primitives — `State`, `Step`, `Router`, `Graph`, `Store`. No `Agent` class, no `Chain` abstraction, no `Memory` base type; everything else is composed, not inherited.
+- The whole root package is ~1,650 lines across nine files (`wc -l`, comments included). Stdlib ~3,100; contract interfaces ~200.
+- 306 tests and 4 fuzz targets; CI race-checks the CLI on Linux, macOS, and Windows with an 85% coverage gate.
+- The core library has one runtime dependency (`google/uuid`). `pgx` is pulled only if you import `pgstore`.
+- Benchmarks live in `tests/` — step overhead is in the microsecond range with the in-memory store. Run them yourself: `go test ./tests/ -run '^$' -bench=.`
 
-</td>
-</tr>
-<tr>
-<td>
-
-**Process Crashed?**
-
-Nothing to do. Every step auto-checkpoints to PostgreSQL. After restart, `Resume()` continues from the last checkpoint. Not a single step lost.
-
-</td>
-<td>
-
-```go
-// Before crash: A → B → C ✓ → [crash]
-// After restart:
-result, _ = g.Resume(ctx, runID, State{}, pgStore)
-// Continues from D, C's state fully preserved
-```
-
-</td>
-</tr>
-</table>
-
-### Checkpoint schema compatibility
-
-Every newly written checkpoint carries `schema_version: 1`. A newer Loom binary
-accepts legacy checkpoints that have no version field (treated as version 0),
-while an older binary rejects checkpoints whose version is newer than it
-supports. This applies consistently to `Resume`, `ResumeAt`, and history reads;
-unsupported formats fail closed with both versions in the error.
-
-The checkpoint envelope also reserves optional `meta` data for future
-provenance, such as the source of sensitive state keys or the policy version
-that produced them. Loom does not consume this field yet.
-
-Each yielded checkpoint exposes a fresh `__yield_token` and its monotonically
-increasing `__checkpoint_seq` in the yielded state. Continuation validation
-compares these values before resume; an atomic expected-token/sequence
-checkpoint CAS remains the follow-up required for complete concurrent-resume
-protection.
-
-When rolling back Loom, keep the existing deployment discipline: isolate the
-checkpoint store from checkpoints written by the newer binary before starting
-the older binary. Schema rejection prevents unsafe resume; it does not make a
-newer checkpoint readable by older code.
-
-## What the Kernel Deliberately Doesn't Know
-
-This is Loom's most important design decision.
+## What the kernel deliberately doesn't know
 
 | The kernel doesn't know | So you can |
 |---|---|
@@ -227,106 +91,44 @@ This is Loom's most important design decision.
 | How to store memory | RAG, graph DB, full-text search — what goes in State is your call |
 | How to serve HTTP | Gin, Echo, net/http — Loom is a library, not a service |
 
-The kernel does one thing: **execute Steps in the order defined by the Graph, checkpoint along the way, pause on yield.**
+The kernel executes steps in graph order, checkpoints along the way, and pauses on yield. Everything else — prompts, tools, memory, transport — is your domain, assembled from `stdlib` building blocks (tool loop, permissions, budgets, sessions, sub-graphs) or your own code.
 
-Everything else is your domain. That's freedom, not omission.
+## When not to use Loom
 
-## Architecture
+- **You want batteries included.** Built-in RAG, vector memory, a visual flow designer, a hosted platform — Loom has none of these, on purpose. LangGraph or the OpenAI Agents SDK will get you there faster.
+- **Your stack is Python or TypeScript.** Loom is Go only.
+- **You need a control plane.** Multi-tenant auth, an approval UI, audit trails, addressable agents — that's [Weave](https://github.com/jinyitao123/Weave) (repo going public soon), the platform layer built on top of Loom. Loom itself stays a library plus a single-process CLI.
 
-```
-┌──────────────────────────────────────────────────┐
-│  Layer 3 · Your App                              │  ← HTTP / Auth / Multi-tenancy / Your business
-├──────────────────────────────────────────────────┤
-│  Layer 2 · Stdlib                    ~1500 LOC   │  ← Building blocks: ToolLoop / Guard / Handoff
-├──────────────────────────────────────────────────┤
-│  Layer 1 · Contract                   ~150 LOC   │  ← Pure interfaces: LLM / ToolDispatcher / Embedder
-├──────────────────────────────────────────────────┤
-│  Layer 0 · Kernel                     ~700 LOC   │  ← Five primitives. That's it.
-└──────────────────────────────────────────────────┘
-```
+Note the layers differ: the *kernel* knows nothing about LLMs or memory; `stdlib` ships session and prompt utilities; the `loom` *CLI* adds MCP tools, session resume, and semantic memory on top.
 
-**Dependency rule: Layer N may only import Layer N-1 or below. No exceptions.**
+## Comparison
 
-## Stdlib
+| | Loom | LangGraph | OpenAI Agents SDK |
+|---|---|---|---|
+| Language | Go | Python | Python |
+| Core library size¹ | ~1.6K LOC (root package, 9 files) | ~27.9K LOC (`libs/langgraph/langgraph`) | — |
+| Persistence | Auto checkpoint per step | Checkpointer (opt-in) | None built in |
+| LLM coupling | Zero | LangChain ecosystem | OpenAI-first |
+| Tool protocol | Any | LangChain tools | function calling |
+| Sub-graph nesting | Native | Native | Handoffs |
+| Human-in-the-loop | yield / resume, state checkpointed | interrupt | Limited |
 
-Every component in the standard library is a composition of Steps or Routers. No new primitives, no special channels.
-
-```go
-// ToolLoop: LLM call → tool execution → result → loop until done
-chat := stdlib.NewToolLoopStep(llm, tools, stdlib.ToolLoopOpts{
-    MaxIterations: 20,
-    Compaction:    &compactionPolicy,
-    ToolHooks:     []contract.ToolHook{auditHook},
-})
-
-// Declarative tool permissions, three levels: deny → ask → allow
-safeTool := stdlib.NewPermissionDispatcherWithAsk(tools,
-    []string{"rm_rf", "drop_table"},   // deny: always blocked
-    []string{"send_email"},            // ask: executed with a user-confirmation hint
-    []string{"read_*", "search_*"},    // allow: whitelist
-)
-
-// Auto-stop at $5
-g.SetHooks(loom.HookPoints{
-    After: []loom.StepHook{stdlib.CostBudgetHook(5.00)},
-})
-```
-
-Read-only tools run in parallel automatically; stateful tools run serially. ToolLoop reads `ToolDef.ReadOnly` to decide.
-
-Tool results may optionally carry control-plane `StatePatch` v1 and `StateOps` v2. Both channels are fail-closed
-and opt-in: configure `ToolLoopOpts.StatePatchPolicy` by actual dispatched tool name, key, and validator, otherwise
-any patch or operation is a protocol error. Unknown or empty tool names fail closed. The `__` namespace requires
-explicit tool-by-key authorization and a non-nil validator. `output`, `usage`, `__deleted_keys`, `__toolloop_*`,
-`__yield*`, and `__resumed_tool_results` are always reserved. A nil validator for a non-`__` key is an explicit
-choice to accept any JSON value. `ValidateWithState` optionally receives the old and proposed new values without
-changing the v1 validator signature.
-
-StatePatch v1 replaces each authorized key as a whole: it does not deep-merge, increment, or delete. A `nil` value
-means JSON `null`, not deletion. StateOps v2 carries an ordered array of typed operations: `replace` performs the
-same whole-value replacement, `debit` subtracts a JSON number from the old JSON number (or zero when absent),
-`delete` removes the key, and `cas` replaces only when the current value deeply equals `expect`. A failed CAS is a
-protocol error for the entire step. When one result carries both versions, its patch is applied first and its ops
-then run in array order, so multiple operations on one key observe preceding changes.
-
-Valid patches and ops are staged until the ToolLoop finishes naturally with no tool calls and are then returned
-in the step delta for the engine to merge; forced completion after tool-budget exhaustion or cycle detection
-discards them. Park checkpoints preserve the staged results, and Resume revalidates them through the same policy
-before eventual commit. State changes are never copied into tool messages. Future operation types extend the
-`type` enumeration; they do not reinterpret or change the existing fields or v1 map semantics.
-
-The commit is atomic only for the state delta; it does not roll back external side effects already performed by
-tools. An invalid or malicious state change fails the entire ToolLoop step. An ordinary `IsError` result without
-state changes does not prevent a valid sibling result from being staged.
-
-A tool result may also set `stop_loop: true` to commit-and-stop. This is valid only when that same result carries
-a `StatePatch` or `StateOps`, the state change passes the tool-by-key `StatePatchPolicy`, and the result is neither
-`IsError` nor `Park`; a bare or otherwise invalid stop is a protocol error. The entire tool-call batch still runs
-and every patch is validated and staged before stop takes effect. If any sibling result parks, park takes priority:
-the stop-bearing result and accumulated usage are checkpointed with the staged patches, and a completed Resume
-commits and stops immediately when the saved stop is still valid.
-
-Commit-and-stop is a normal completion, so it commits staged patches even when it occurs on the final iteration or
-at the cycle limit. Unlike natural completion, it makes no final LLM call; unlike forced completion after tool-budget
-exhaustion or cycle detection, it does not discard staged patches. The step `output` is the last assistant message's
-content (which may be empty), and `usage` is the cumulative usage of LLM calls already made. Because there is no final
-LLM text, the host is responsible for the final presentation.
+¹ `wc -l` on the core package, comments included, measured 2026-07-30: loom@`9f4c974`, langgraph@`4134145`. Same tool, same rules on both sides.
 
 ## The `loom` CLI
 
-Loom is a library first — but the repo also ships `loom`, a standalone agent engine built on that library. It is the [weave](https://github.com/jinyitao123/Weave) (going public soon) daemon's spawn-harness backend: prompt JSON on stdin, one agent turn, NDJSON events on stdout — with MCP tool servers, session resume, semantic memory, and deterministic sub-agent orchestration compiled from an agent spec.
+The repo also ships `loom`, a standalone agent engine built on the library — prompt JSON on stdin, one agent turn, NDJSON events on stdout, with MCP tool servers, session resume, semantic memory, and sub-agent orchestration compiled from an agent spec.
 
 ```bash
-# from a GitHub Release (linux / macOS):
-curl -fsSL https://raw.githubusercontent.com/jinyitao123/loom/main/install.sh | sh
-
-# or with Go (any platform):
 go install github.com/jinyitao123/loom/cmd/loom@latest
+
+# or from a GitHub Release tarball (linux / macOS):
+curl -fsSL https://raw.githubusercontent.com/jinyitao123/loom/main/install.sh | sh
 ```
 
-See [cmd/loom/README.md](cmd/loom/README.md) for usage and the event wire format, and [docs/host-integration.md](docs/host-integration.md) for how any host process can drive it.
+See [cmd/loom/README.md](cmd/loom/README.md) for the event wire format, and [docs/host-integration.md](docs/host-integration.md) for driving it from any host process.
 
-## Project Structure
+## Project structure
 
 ```
 loom/
@@ -335,54 +137,23 @@ loom/
 ├── step.go           type Step func(ctx, State) (State, error)
 ├── router.go         Control flow: Always / Branch / Condition
 ├── store.go          5-method persistence interface
+├── lifecycle.go      Host observation seams (allocation / terminal / checkpoint)
 ├── options.go        GraphOption: merge / checkpoint / budget
 ├── memstore.go       In-memory Store (for testing)
 │
 ├── contract/         Pure interfaces: LLM / ToolDispatcher / Embedder
-├── stdlib/           Pre-built Steps & Hooks
-│   ├── toolloop.go   LLM ↔ Tool loop
-│   ├── steps.go      Guard / HumanWait / SubGraph / Handoff
-│   ├── permission.go Declarative tool permissions (deny / ask / allow)
-│   ├── budget.go     Token & USD budget hooks
-│   ├── prompt.go     Tiered prompt assembly
-│   ├── session.go    Session history persistence
-│   ├── specloader.go Agent-spec loading (identity / skills / sub-agents)
-│   └── compiler/     AgentSpec → Graph: deterministic sub-agent orchestration
-│
+├── stdlib/           Pre-built Steps & Hooks (tool loop, permissions, budget, session, …)
 ├── pgstore/          PostgreSQL Store
-├── provider/         LLM Providers (OpenAI-compatible / DeepSeek)
-├── cmd/loom/         The `loom` CLI — stdin JSON → agent turn → NDJSON stream
+├── provider/         LLM providers (OpenAI-compatible / DeepSeek)
+├── cmd/loom/         The `loom` CLI
 ├── tests/            Black-box test suite (public API only)
 └── docs/             Host-integration contract & orchestration design
 ```
 
-## Comparison
+## Contributing
 
-| | Loom | LangGraph | OpenAI Agents SDK |
-|---|---|---|---|
-| Language | Go | Python | Python |
-| Kernel | ~700 LOC | ~15K LOC | ~3K LOC |
-| Persistence | Auto checkpoint | Auto checkpoint | None |
-| LLM coupling | Zero | Medium | Strong (OpenAI-bound) |
-| Tool protocol | Any | LangChain Tools | function calling |
-| Sub-graph nesting | Native | Native | Not supported |
-| Human-in-the-loop | yield / resume | interrupt | Limited |
-| Embeddable | Yes (Go package) | No (Python service) | No (Python service) |
-
-## Who Is This For
-
-- Long-running agents that need **crash recovery**
-- Enterprise workflows that need **human-in-the-loop** approval
-- **Multi-agent orchestration** without a heavyweight framework
-- **Budget control** (token / USD) to prevent runaway agents
-- Embedding agent capabilities in the **Go ecosystem**
+See [CONTRIBUTING.md](CONTRIBUTING.md). The short version: five primitives, layered imports, no business vocabulary in the kernel — and the CI guards to prove it.
 
 ## License
 
-MIT
-
----
-
-<p align="center">
-  <sub>A mature, complex product must have a lean, precise kernel.</sub>
-</p>
+[MIT](LICENSE)
