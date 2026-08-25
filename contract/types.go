@@ -73,6 +73,14 @@ type StreamChunk struct {
 	ToolCalls []ToolCall `json:"tool_calls,omitempty"` // 本块携带的工具调用片段，由消费方自行累积
 	Done      bool       `json:"done,omitempty"`       // true 表示流结束：终止块通常不带内容、只带 Usage
 	Usage     *Usage     `json:"usage,omitempty"`      // 用量统计，一般仅在终止块出现；指针以区分"未上报"
+	// FinishReason 中文：provider 的结束原因（stop / tool_calls / length ...），
+	// 只出现在终止块（Done 或 Err）上，供消费方与适配层做收尾语义校验。
+	FinishReason string `json:"finish_reason,omitempty"`
+	// Err 中文：非 nil 表示流以协议错误收尾（EOF 无 Done / scanner error / ctx cancel /
+	// 空响应等）。错误块不带 Done——消费方必须先检查 Err 再检查 Done，绝不能把
+	// 错误块当作干净完成。该字段永不出现在 JSON 序列化中（错误以 errors.Is 分类，
+	// 正文与上下文不落序列化通道）。
+	Err error `json:"-"`
 }
 
 // EffortLevel controls LLM reasoning depth / token budget.
