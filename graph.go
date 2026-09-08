@@ -304,10 +304,18 @@ func (g *Graph) run(ctx context.Context, input State, store Store) (*RunResult, 
 		// Global step budget check (shared with sub-graphs).
 		// 第二层熔断（全局预算）：从 context 取共享的 atomic 计数器（根图未启用则直接跳过）。
 		if budget, ok := ctx.Value(budgetKey{}).(*atomic.Int64); ok {
-			// 原子扣减一步：结果为负说明预算已被本图或其他子图用尽，立即带错停机。
+			// 原子预扣一步；被拒绝的步骤不会执行，退还预扣后保存其恢复位置。
 			if budget.Add(-1) < 0 {
+				budget.Add(1)
+				budgetErr := fmt.Errorf("%w in graph %q", ErrBudgetExhausted, g.Name)
+				// The previous checkpoint may describe a completed step with a legacy empty phase.
+				// Save the blocked step explicitly so Resume and ResumeAt both enter it next.
+				if err := g.doCheckpoint(ctx, store, runID, current, state, "mid_step"); err != nil {
+					return &RunResult{State: state, LastStep: current, Steps: steps, RunID: runID, StopReason: StopError},
+						fmt.Errorf("%w: %w", budgetErr, err)
+				}
 				return &RunResult{State: state, LastStep: current, Steps: steps, RunID: runID, StopReason: StopBudget},
-					fmt.Errorf("loom: global step budget exhausted in graph %q", g.Name)
+					budgetErr
 			}
 		}
 
