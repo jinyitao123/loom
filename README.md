@@ -97,6 +97,8 @@ Newly written checkpoints carry `schema_version: 1`; newer binaries read legacy 
 
 The kernel executes steps in graph order, checkpoints along the way, and pauses on yield. Everything else — prompts, tools, memory, transport — is your domain, assembled from `stdlib` building blocks (tool loop, permissions, budgets, sessions, sub-graphs) or your own code.
 
+Tool loops can opt into [controlled model-round pauses](docs/toolloop-control.md), reusing the existing yield and checkpoint protocol while leaving continuation authorization and journal fencing to the host.
+
 ## When not to use Loom
 
 - **You want batteries included.** Built-in RAG, vector memory, a visual flow designer, a hosted platform — Loom has none of these, on purpose. LangGraph or the OpenAI Agents SDK will get you there faster.

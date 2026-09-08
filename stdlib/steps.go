@@ -184,6 +184,10 @@ type childCheckpoint struct {
 	State      loom.State `json:"state"`
 }
 
+// Controlled ToolLoop continuation is not yet part of the child resume protocol.
+// The marker is checked at that step's entry; it does not preflight child steps.
+type childContinuationContextKey struct{}
+
 func runChildContinuation(
 	ctx context.Context,
 	parent loom.State,
@@ -192,6 +196,7 @@ func runChildContinuation(
 	lifecycleHooks *loom.LifecycleHooks,
 	initial func() loom.State,
 ) (*loom.RunResult, bool, error) {
+	ctx = context.WithValue(ctx, childContinuationContextKey{}, true)
 	runID, runPresent := parent["__child_run_id"]
 	graphName, graphPresent := parent["__child_graph"]
 	resumeRaw, inputPresent := parent["__child_resume_input"]

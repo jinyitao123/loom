@@ -66,6 +66,7 @@ type ToolLoopOpts struct {
 	// Compaction：上下文压缩策略，nil 表示不做压缩。
 	StatePatchPolicy *StatePatchPolicy
 	// StatePatchPolicy：工具状态增量白名单；nil 时任何 StatePatch 都是协议错误。
+	Control *ToolLoopControl // optional durable model-round slices; nil preserves legacy behavior
 }
 
 // toolLoopPendingCall is the checkpoint-safe description of one parked tool call.
@@ -93,8 +94,14 @@ func NewToolLoopStep(llm contract.LLM, tools contract.ToolDispatcher, opts ToolL
 	if opts.MaxIterations <= 0 {
 		opts.MaxIterations = 20
 	}
+	if opts.Control != nil {
+		return newControlledToolLoopStep(llm, tools, opts)
+	}
 
 	return func(ctx context.Context, state loom.State) (loom.State, error) {
+		if _, controlled := state["__toolloop_control"]; controlled {
+			return nil, fmt.Errorf("loom/toolloop: a controlled snapshot requires Control configuration")
+		}
 		pending, err := decodeToolLoopPending(state["__toolloop_pending"])
 		if err != nil {
 			return nil, err
