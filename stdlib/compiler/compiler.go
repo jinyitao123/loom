@@ -169,9 +169,9 @@ func CompileAgent(spec *stdlib.AgentSpec, llm contract.LLM, tools contract.ToolD
 	// 步骤二：chat（工具循环）。先组装钩子链，再决定路由器，最后构建步骤本体。
 	// 拷贝一份宿主注入的钩子切片，避免 append 触碰调用方的底层数组。
 	toolHooks := append([]contract.ToolHook{}, opts.ToolHooks...)
-	// 按需追加防重复护栏：同一工具带相同参数连续调用达阈值即拦截（见 loop_detector.go）。
+	// 按需追加标准库防重复护栏：同一工具带相同参数连续调用达阈值即拦截。
 	if opts.MaxToolRepeats > 0 {
-		toolHooks = append(toolHooks, newLoopDetector(opts.MaxToolRepeats).hook())
+		toolHooks = append(toolHooks, stdlib.NewToolRepeatGuard(opts.MaxToolRepeats))
 	}
 	// chat 的缺省路由是 End()——单 agent 拓扑下对话结束即整图结束。
 	chatRouter := loom.End()

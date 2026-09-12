@@ -16,6 +16,7 @@ type ToolHook struct{ ... }
 type ToolResult struct{ ... }
 type Usage struct{ ... }
 # stdlib
+var ErrJournalStreamingUnsupported = errors.New("journaled execution does not support streaming")
 func CostBudgetHook(maxUSD float64) loom.StepHook
 func DispatchWithHooks(ctx context.Context, tools contract.ToolDispatcher, calls []contract.ToolCall, ...) ([]contract.ToolResult, error)
 func GetBool(s loom.State, key string, fallback bool) bool
@@ -27,12 +28,15 @@ func MustGetMessages(s loom.State) []contract.Message
 func NewGuardStep(checks ...StepHook) loom.Step
 func NewHandoffStep(target *loom.Graph, store loom.Store, compressor ContextCompressor) loom.Step
 func NewHumanWaitStep(promptKey, responseKey string) loom.Step
+func NewJournaledLLM(inner contract.LLM, journal ExecutionJournal) contract.LLM
+func NewJournaledToolDispatcher(inner contract.ToolDispatcher, journal ExecutionJournal, ...) contract.ToolDispatcher
 func NewLLMCallStep(llm interface{ ... }) loom.Step
 func NewPromptAssembleStep(cfg PromptConfig) loom.Step
 func NewSkillDispatcher(inner contract.ToolDispatcher, skills []SkillDef) contract.ToolDispatcher
 func NewStreamingLLM(inner contract.LLM, sink contract.StreamSink) contract.LLM
 func NewSubGraphStep(child *loom.Graph, store loom.Store, opts ...SubGraphOpts) loom.Step
 func NewToolLoopStep(llm contract.LLM, tools contract.ToolDispatcher, opts ToolLoopOpts) loom.Step
+func NewToolRepeatGuard(maxRepeats int) contract.ToolHook
 func PrepareToolLoopResume(state loom.State, grant ToolLoopResumeGrant) (loom.State, error)
 func SaveSession(store loom.Store, sessionID string, msgs []contract.Message) error
 func SetOutput(content string, usage contract.Usage) loom.State
@@ -41,10 +45,17 @@ type AgentSpec struct{ ... }
     func LoadFromDirectory(dir string) (*AgentSpec, error)
 type ChildLifecycleObserver func(ctx context.Context, result *loom.RunResult, runErr error, resumed bool) error
 type CompactionPolicy struct{ ... }
+    func NewSummaryCompactionPolicy(llm contract.LLM, opts SummaryCompactionOpts) *CompactionPolicy
 type ContextCompressor interface{ ... }
+type ExecutionJournal interface{ ... }
 type HealthCheckDef struct{ ... }
 type IdentitySpec struct{ ... }
+type JournalOperation struct{ ... }
+type JournalPerform func() (any, error)
+type JournaledToolOpts struct{ ... }
 type KeywordMatcher struct{}
+type OperationKind string
+    const OperationModel OperationKind = "model" ...
 type PermissionDispatcher struct{ ... }
     func NewPermissionDispatcher(inner contract.ToolDispatcher, deny, allow []string) *PermissionDispatcher
     func NewPermissionDispatcherWithAsk(inner contract.ToolDispatcher, deny, ask, allow []string) *PermissionDispatcher
@@ -59,6 +70,7 @@ type StepHook func(ctx context.Context, stepName string, state loom.State) error
 type SubAgentRef struct{ ... }
 type SubGraphOpts struct{ ... }
     func WithParentMergeConfig(cfg *loom.MergeConfig) SubGraphOpts
+type SummaryCompactionOpts struct{ ... }
 type ToolLoopControl struct{ ... }
 type ToolLoopOpts struct{ ... }
 type ToolLoopOutcome struct{ ... }
