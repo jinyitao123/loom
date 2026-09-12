@@ -11,6 +11,14 @@ import (
 
 var ErrJournalStreamingUnsupported = errors.New("journaled execution does not support streaming")
 
+// ErrJournalExecution marks a journal-controlled tool operation that the
+// agent loop must stop instead of turning into a model-visible tool error.
+var ErrJournalExecution = errors.New("journaled operation failed")
+
+// ErrJournalOutcomeUnknown marks an operation whose effect may have happened
+// without a durable response. It must be reconciled, never retried blindly.
+var ErrJournalOutcomeUnknown = errors.New("journaled operation outcome is unknown")
+
 type OperationKind string
 
 const (
@@ -26,7 +34,10 @@ type JournalOperation struct {
 type JournalPerform func() (any, error)
 
 // ExecutionJournal supplies durable operation identity and fencing while Loom
-// owns the model/tool decoration and replay contract.
+// owns the model/tool decoration and replay contract. Execute implementations
+// must return an error wrapping ErrJournalOutcomeUnknown when an effect may have
+// happened without a durable response, and must not call perform again for that
+// unresolved operation.
 type ExecutionJournal interface {
 	Active(context.Context) bool
 	Execute(context.Context, JournalOperation, JournalPerform) (json.RawMessage, error)
@@ -101,11 +112,11 @@ func (tools *journaledTools) Dispatch(ctx context.Context, call contract.ToolCal
 		return tools.inner.Dispatch(ctx, call)
 	})
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("%w: %w", ErrJournalExecution, err)
 	}
 	var result contract.ToolResult
 	if len(raw) == 0 || json.Unmarshal(raw, &result) != nil {
-		return nil, fmt.Errorf("journaled tool %q response is invalid", call.Name)
+		return nil, fmt.Errorf("%w: journaled tool %q response is invalid", ErrJournalExecution, call.Name)
 	}
 	return &result, nil
 }

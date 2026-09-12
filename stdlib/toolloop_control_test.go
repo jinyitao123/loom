@@ -127,6 +127,67 @@ func TestControlledToolLoopSlicesAndTotal(t *testing.T) {
 	}
 }
 
+func TestControlledCompletionCorrectionPersistsAcrossResume(t *testing.T) {
+	m := &parkScriptLLM{t: t, scripts: []func(contract.ChatRequest) contract.ChatResponse{
+		func(contract.ChatRequest) contract.ChatResponse {
+			return contract.ChatResponse{Content: "draft", StopReason: "stop"}
+		},
+		func(request contract.ChatRequest) contract.ChatResponse {
+			if len(request.Messages) < 3 || !strings.Contains(request.Messages[len(request.Messages)-1].Content, "missing evidence") {
+				t.Fatalf("resume lost completion feedback: %#v", request.Messages)
+			}
+			return contract.ChatResponse{Content: "accepted", StopReason: "stop"}
+		},
+	}}
+	verifier := stdlib.CompletionVerifierFunc(func(_ context.Context, candidate stdlib.CompletionCandidate) (stdlib.CompletionDecision, error) {
+		if candidate.Content == "accepted" {
+			return stdlib.CompletionDecision{Accepted: true}, nil
+		}
+		return stdlib.CompletionDecision{Feedback: "missing evidence"}, nil
+	})
+	opts := stdlib.ToolLoopOpts{
+		MaxIterations:      1,
+		Control:            &stdlib.ToolLoopControl{ID: "chat", InitialTotalRounds: 2},
+		CompletionVerifier: verifier, CompletionVerifierID: "fixture-v1",
+	}
+	graph, store := controlGraph(t.Name(), m, &parkToolDispatcher{}, opts), loom.NewMemStore()
+	paused, err := graph.Run(context.Background(), controlInput(), store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	controlOutcome(t, paused, stdlib.ToolLoopSliceLimit, 1)
+	delta, err := stdlib.PrepareToolLoopResume(paused.State, controlGrant(t, paused, "grant", 2))
+	if err != nil {
+		t.Fatal(err)
+	}
+	completed, err := graph.Resume(context.Background(), paused.RunID, delta, store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	controlOutcome(t, completed, stdlib.ToolLoopFinalResponse, 2)
+	if completed.State["output"] != "accepted" {
+		t.Fatalf("corrected output = %#v", completed.State["output"])
+	}
+}
+
+func TestControlledCompletionVerifierRequiresStablePolicyID(t *testing.T) {
+	verifier := stdlib.CompletionVerifierFunc(func(context.Context, stdlib.CompletionCandidate) (stdlib.CompletionDecision, error) {
+		return stdlib.CompletionDecision{Accepted: true}, nil
+	})
+	for name, opts := range map[string]stdlib.ToolLoopOpts{
+		"missing id":       {MaxIterations: 1, Control: &stdlib.ToolLoopControl{ID: "chat", InitialTotalRounds: 1}, CompletionVerifier: verifier},
+		"missing verifier": {MaxIterations: 1, Control: &stdlib.ToolLoopControl{ID: "chat", InitialTotalRounds: 1}, CompletionVerifierID: "fixture-v1"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			model := &parkScriptLLM{t: t}
+			result, err := controlGraph(t.Name(), model, &parkToolDispatcher{}, opts).Run(context.Background(), controlInput(), loom.NewMemStore())
+			if err == nil || result.StopReason != loom.StopError || model.calls != 0 {
+				t.Fatalf("invalid verifier policy reached model: result=%#v calls=%d err=%v", result, model.calls, err)
+			}
+		})
+	}
+}
+
 func TestControlledToolLoopGrantBoundary(t *testing.T) {
 	m, d := toolRounds(t, 2, false)
 	graph, store := controlGraph(t.Name(), m, d, stdlib.ToolLoopOpts{MaxIterations: 1, Control: &stdlib.ToolLoopControl{ID: "chat", InitialTotalRounds: 4}}), loom.NewMemStore()

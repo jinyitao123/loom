@@ -16,6 +16,9 @@ type ToolHook struct{ ... }
 type ToolResult struct{ ... }
 type Usage struct{ ... }
 # stdlib
+var ErrCompletionUnverified = errors.New("agent completion was not verified")
+var ErrJournalExecution = errors.New("journaled operation failed")
+var ErrJournalOutcomeUnknown = errors.New("journaled operation outcome is unknown")
 var ErrJournalStreamingUnsupported = errors.New("journaled execution does not support streaming")
 func CostBudgetHook(maxUSD float64) loom.StepHook
 func DispatchWithHooks(ctx context.Context, tools contract.ToolDispatcher, calls []contract.ToolCall, ...) ([]contract.ToolResult, error)
@@ -46,6 +49,10 @@ type AgentSpec struct{ ... }
 type ChildLifecycleObserver func(ctx context.Context, result *loom.RunResult, runErr error, resumed bool) error
 type CompactionPolicy struct{ ... }
     func NewSummaryCompactionPolicy(llm contract.LLM, opts SummaryCompactionOpts) *CompactionPolicy
+type CompletionCandidate struct{ ... }
+type CompletionDecision struct{ ... }
+type CompletionVerifier interface{ ... }
+type CompletionVerifierFunc func(context.Context, CompletionCandidate) (CompletionDecision, error)
 type ContextCompressor interface{ ... }
 type ExecutionJournal interface{ ... }
 type HealthCheckDef struct{ ... }

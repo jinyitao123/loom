@@ -326,6 +326,21 @@ func toolLoopPolicyHash(opts ToolLoopOpts, state loom.State) (string, error) {
 	if value, ok := state["__system_prompt"].(string); ok && value != "" {
 		system = value
 	}
+	if opts.CompletionVerifier == nil && opts.CompletionVerifierID == "" {
+		data, err := json.Marshal(struct {
+			Version                     uint32
+			Control                     ToolLoopControl
+			Model, System               string
+			Iterations, Repeats, Tokens int
+			Effort                      contract.EffortLevel
+			Schema                      *json.RawMessage
+		}{1, *opts.Control, opts.Model, system, opts.MaxIterations, opts.MaxToolRepeats, opts.MaxTokens, opts.Effort, opts.OutputSchema})
+		if err != nil {
+			return "", fmt.Errorf("loom/toolloop: invalid control policy: %w", err)
+		}
+		digest := sha256.Sum256(data)
+		return hex.EncodeToString(digest[:]), nil
+	}
 	data, err := json.Marshal(struct {
 		Version                     uint32
 		Control                     ToolLoopControl
@@ -333,7 +348,8 @@ func toolLoopPolicyHash(opts ToolLoopOpts, state loom.State) (string, error) {
 		Iterations, Repeats, Tokens int
 		Effort                      contract.EffortLevel
 		Schema                      *json.RawMessage
-	}{1, *opts.Control, opts.Model, system, opts.MaxIterations, opts.MaxToolRepeats, opts.MaxTokens, opts.Effort, opts.OutputSchema})
+		CompletionVerifierID        string
+	}{2, *opts.Control, opts.Model, system, opts.MaxIterations, opts.MaxToolRepeats, opts.MaxTokens, opts.Effort, opts.OutputSchema, opts.CompletionVerifierID})
 	if err != nil {
 		return "", fmt.Errorf("loom/toolloop: invalid control policy: %w", err)
 	}

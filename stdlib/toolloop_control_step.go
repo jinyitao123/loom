@@ -31,6 +31,9 @@ func newControlledToolLoopStep(llm contract.LLM, tools contract.ToolDispatcher, 
 			controlOpts.InitialTotalRounds > maxToolLoopCounter || uint64(opts.MaxIterations) > maxToolLoopCounter {
 			return nil, fmt.Errorf("loom/toolloop: invalid control configuration")
 		}
+		if (opts.CompletionVerifier == nil) != (strings.TrimSpace(opts.CompletionVerifierID) == "") {
+			return nil, fmt.Errorf("loom/toolloop: controlled completion verifier requires a stable policy id")
+		}
 		runID, _ := state["__run_id"].(string)
 		if runID == "" {
 			return nil, fmt.Errorf("loom/toolloop: control requires a graph run identity")
@@ -200,6 +203,14 @@ func newControlledToolLoopStep(llm contract.LLM, tools contract.ToolDispatcher, 
 				return loop.pause(ToolLoopProviderStop, resp), nil
 			}
 			if len(resp.ToolCalls) == 0 {
+				accepted, continued, err := verifyToolLoopCompletion(ctx, opts, loop.messages, resp, loop.usage)
+				if err != nil {
+					return nil, err
+				}
+				if !accepted {
+					loop.messages = continued
+					continue
+				}
 				loop.messages = append(loop.messages, resp.AsMessage())
 				return loop.finish(ToolLoopFinalResponse, resp.Content), nil
 			}

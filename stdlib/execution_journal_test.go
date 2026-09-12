@@ -97,3 +97,16 @@ func TestJournalWrappersAreTransparentOutsideActiveExecution(t *testing.T) {
 		t.Fatalf("inactive journal did not pass through: calls=%d err=%v", inner.calls, err)
 	}
 }
+
+func TestJournaledToolRejectsInvalidDurableResponseAsFatal(t *testing.T) {
+	journal := &replayJournal{
+		responses: map[stdlib.OperationKind]json.RawMessage{stdlib.OperationTool: json.RawMessage(`{"broken":`)},
+		performed: map[stdlib.OperationKind]int{},
+	}
+	tools := stdlib.NewJournaledToolDispatcher(&journalTools{}, journal, stdlib.JournaledToolOpts{})
+	ctx := context.WithValue(context.Background(), journalContextKey{}, true)
+	_, err := tools.Dispatch(ctx, contract.ToolCall{ID: "call", Name: "write", Args: `{}`})
+	if !errors.Is(err, stdlib.ErrJournalExecution) {
+		t.Fatalf("invalid journal response was not fatal: %v", err)
+	}
+}
