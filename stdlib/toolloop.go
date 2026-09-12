@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"reflect"
@@ -38,6 +39,34 @@ type StatePatchPolicy struct {
 	ValidateWithState map[string]map[string]func(old, new any) error
 }
 
+// CompletionCandidate is the model's proposed final response together with the
+// transcript that led to it. Verification is read-only; business-specific
+// acceptance rules remain supplied by the host.
+type CompletionCandidate struct {
+	Content    string
+	Transcript []contract.Message
+	TotalUsage contract.Usage
+}
+
+// CompletionDecision accepts a candidate or returns actionable feedback for
+// the next model round.
+type CompletionDecision struct {
+	Accepted bool
+	Feedback string
+}
+
+// CompletionVerifier applies host-supplied, read-only acceptance rules.
+type CompletionVerifier interface {
+	VerifyCompletion(context.Context, CompletionCandidate) (CompletionDecision, error)
+}
+
+// CompletionVerifierFunc adapts a function to CompletionVerifier.
+type CompletionVerifierFunc func(context.Context, CompletionCandidate) (CompletionDecision, error)
+
+func (verify CompletionVerifierFunc) VerifyCompletion(ctx context.Context, candidate CompletionCandidate) (CompletionDecision, error) {
+	return verify(ctx, candidate)
+}
+
 // AllowKeys allows the named tool to replace the listed non-protocol state keys with any JSON value.
 func AllowKeys(tool string, keys ...string) *StatePatchPolicy {
 	allowed := make(map[string]func(value any) error, len(keys))
@@ -66,6 +95,11 @@ type ToolLoopOpts struct {
 	// Compaction：上下文压缩策略，nil 表示不做压缩。
 	StatePatchPolicy *StatePatchPolicy
 	// StatePatchPolicy：工具状态增量白名单；nil 时任何 StatePatch 都是协议错误。
+	Control *ToolLoopControl // optional durable model-round slices; nil preserves legacy behavior
+	// CompletionVerifier gates a model's proposed final response. A rejection is
+	// appended to the transcript as an observation so the model can correct it.
+	CompletionVerifier   CompletionVerifier
+	CompletionVerifierID string // stable policy identity, required for controlled loops
 }
 
 // toolLoopPendingCall is the checkpoint-safe description of one parked tool call.
@@ -93,8 +127,14 @@ func NewToolLoopStep(llm contract.LLM, tools contract.ToolDispatcher, opts ToolL
 	if opts.MaxIterations <= 0 {
 		opts.MaxIterations = 20
 	}
+	if opts.Control != nil {
+		return newControlledToolLoopStep(llm, tools, opts)
+	}
 
 	return func(ctx context.Context, state loom.State) (loom.State, error) {
+		if _, controlled := state["__toolloop_control"]; controlled {
+			return nil, fmt.Errorf("loom/toolloop: a controlled snapshot requires Control configuration")
+		}
 		pending, err := decodeToolLoopPending(state["__toolloop_pending"])
 		if err != nil {
 			return nil, err
@@ -254,7 +294,19 @@ func NewToolLoopStep(llm contract.LLM, tools contract.ToolDispatcher, opts ToolL
 
 			// 模型没有再请求工具 ⇒ 任务在本轮完成，把文本答案与用量写入输出状态，正常收官。
 			if len(resp.ToolCalls) == 0 {
-				return finishToolLoop(resp.Content, resp.Usage, resumedFromPark, stagedPatch), nil
+				accepted, continued, err := verifyToolLoopCompletion(ctx, opts, msgs, resp, accumulatedUsage)
+				if err != nil {
+					return loom.State{"__error": err.Error()}, err
+				}
+				if !accepted {
+					msgs = continued
+					continue
+				}
+				usage := resp.Usage
+				if opts.CompletionVerifier != nil {
+					usage = accumulatedUsage
+				}
+				return finishToolLoop(resp.Content, usage, resumedFromPark, stagedPatch), nil
 			}
 
 			// Cycle detection: hash current tool call batch and compare to previous.
@@ -267,6 +319,10 @@ func NewToolLoopStep(llm contract.LLM, tools contract.ToolDispatcher, opts ToolL
 				if repeatCount >= maxRepeats {
 					slog.Warn("loom/toolloop: cycle detected, breaking",
 						"repeat_count", repeatCount, "batch_hash", batchHash[:8]) // 哈希只记前 8 位，够日志检索用
+					if opts.CompletionVerifier != nil {
+						err := fmt.Errorf("%w: repeated actions reached the hard stop", ErrCompletionUnverified)
+						return loom.State{"__error": err.Error()}, err
+					}
 					return finishToolLoop(resp.Content, resp.Usage, resumedFromPark, nil), nil
 				}
 			} else {
@@ -330,6 +386,11 @@ func NewToolLoopStep(llm contract.LLM, tools contract.ToolDispatcher, opts ToolL
 			}
 		}
 
+		if opts.CompletionVerifier != nil {
+			err := fmt.Errorf("%w: tool budget exhausted", ErrCompletionUnverified)
+			return loom.State{"__error": err.Error()}, err
+		}
+
 		// Tool budget exhausted. Don't fail the whole turn (which surfaces to the
 		// end user as a raw error) — inject a wrap-up note and make one final call
 		// with NO tools offered, so the model must close out in text: summarize
@@ -361,6 +422,35 @@ func NewToolLoopStep(llm contract.LLM, tools contract.ToolDispatcher, opts ToolL
 		// 把收尾总结作为本轮的最终输出返回。
 		return finishToolLoop(resp.Content, resp.Usage, resumedFromPark, nil), nil
 	}
+}
+
+// ErrCompletionUnverified means a verifier was configured but no candidate was
+// accepted before a hard stop.
+var ErrCompletionUnverified = errors.New("agent completion was not verified")
+
+func verifyToolLoopCompletion(ctx context.Context, opts ToolLoopOpts, messages []contract.Message, response *contract.ChatResponse, totalUsage contract.Usage) (bool, []contract.Message, error) {
+	if opts.CompletionVerifier == nil {
+		return true, nil, nil
+	}
+	transcript := append([]contract.Message(nil), messages...)
+	transcript = append(transcript, response.AsMessage())
+	decision, err := opts.CompletionVerifier.VerifyCompletion(ctx, CompletionCandidate{
+		Content: response.Content, Transcript: append([]contract.Message(nil), transcript...), TotalUsage: totalUsage,
+	})
+	if err != nil {
+		return false, nil, fmt.Errorf("loom/toolloop: verify completion: %w", err)
+	}
+	if decision.Accepted {
+		return true, nil, nil
+	}
+	feedback := strings.TrimSpace(decision.Feedback)
+	if feedback == "" {
+		return false, nil, errors.New("loom/toolloop: completion verifier rejected without feedback")
+	}
+	transcript = append(transcript, contract.Message{
+		Role: "user", Content: "[loom completion verification]\nThe proposed result was rejected. Correct the result using this evidence:\n" + feedback,
+	})
+	return false, transcript, nil
 }
 
 // decodeToolLoopMessages restores a private message snapshot after checkpoint JSON round-tripping.
@@ -806,6 +896,7 @@ func DispatchWithHooks(ctx context.Context, tools contract.ToolDispatcher,
 	// 只读工具无副作用，可安全并行执行；用 WaitGroup 等待全部 goroutine 结束。
 	if len(readOnly) > 0 {
 		var wg sync.WaitGroup
+		fatal := make(chan error, len(readOnly))
 		for _, ic := range readOnly {
 			wg.Add(1)
 			// 下标与调用通过参数传入 goroutine，规避闭包捕获循环变量的经典陷阱；
@@ -814,6 +905,10 @@ func DispatchWithHooks(ctx context.Context, tools contract.ToolDispatcher,
 				defer wg.Done()
 				result, err := tools.Dispatch(ctx, c)
 				if err != nil {
+					if errors.Is(err, ErrJournalExecution) {
+						fatal <- err
+						return
+					}
 					// 单个工具失败不连坐：转成 IsError 结果，让模型自行决定如何应对。
 					results[idx] = contract.ToolResult{
 						CallID: c.ID, Content: fmt.Sprintf("error: %v", err),
@@ -827,6 +922,11 @@ func DispatchWithHooks(ctx context.Context, tools contract.ToolDispatcher,
 			}(ic.idx, ic.call)
 		}
 		wg.Wait() // 汇合点：所有只读调用完成后才进入串行阶段
+		select {
+		case err := <-fatal:
+			return nil, err
+		default:
+		}
 	}
 
 	// Stateful: serial (order matters).
@@ -834,6 +934,9 @@ func DispatchWithHooks(ctx context.Context, tools contract.ToolDispatcher,
 	for _, ic := range stateful {
 		result, err := tools.Dispatch(ctx, ic.call)
 		if err != nil {
+			if errors.Is(err, ErrJournalExecution) {
+				return nil, err
+			}
 			// 失败同样转成 IsError 结果并继续执行后续调用，不中断整批。
 			results[ic.idx] = contract.ToolResult{
 				CallID: ic.call.ID, Content: fmt.Sprintf("error: %v", err),

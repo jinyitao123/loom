@@ -134,6 +134,32 @@ same graph remains safe for concurrent callers with different host policies.
 The event types contain only engine facts. Hosts remain responsible for
 storage transactions, fencing, retries, and domain-specific records.
 
+## Resuming after a graph step budget stop
+
+`WithStepBudget` limits graph steps across a parent and its subgraphs. When
+the budget rejects the next step before execution, the graph returns
+`StopBudget` and an error matching `errors.Is(err, loom.ErrBudgetExhausted)`.
+The rejected step consumes no budget. With a store, the graph checkpoints
+that unexecuted step with `mid_step` phase and the remaining balance. For
+example, if a budget of one allows `a` in `a → b`, the new checkpoint points
+to `b`. After the host explicitly provides a positive `__budget_remaining`
+through resume input, `Resume` continues at `b`; `a` is not repeated.
+`ResumeAt` from this checkpoint uses the same entry position in a new run.
+Resuming with no additional balance stops again before executing a step.
+
+Checkpoint policy still applies. A failed required checkpoint returns
+`StopError`; its error retains both the budget sentinel and the persistence
+error. The default best-effort policy logs a failed store write and returns
+`StopBudget`, leaving the previous stored checkpoint in place. That older
+checkpoint does not prove the new continuation position was saved. A nil
+store performs no persistence. Hosts requiring reliable continuation must
+provide a store and use `CheckpointRequired`; lifecycle terminalization also
+reports `LatestCheckpointPersisted`.
+
+This changes graph-level budget stops only. Ordinary step errors, ToolLoop
+iteration limits, CLI events, and legacy checkpoints with an empty phase
+retain their existing behavior.
+
 ## What stays out of the engine
 
 By design, the following are **host** responsibilities, deliberately not baked

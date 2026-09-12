@@ -3,6 +3,7 @@ package stdlib_test
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"reflect"
 	"strings"
@@ -109,6 +110,56 @@ func TestToolLoop_SingleToolCall(t *testing.T) {
 	assertNoError(t, err)
 	if result["output"] != "The answer is 42." {
 		t.Errorf("output = %v", result["output"])
+	}
+}
+
+func TestToolLoopCompletionRejectionBecomesCorrectionObservation(t *testing.T) {
+	llm := &statePatchLLM{responses: []contract.ChatResponse{
+		{Content: "draft", Usage: contract.Usage{InputTokens: 2, OutputTokens: 1}},
+		{Content: "corrected", Usage: contract.Usage{InputTokens: 3, OutputTokens: 1}},
+	}}
+	verifications := 0
+	step := stdlib.NewToolLoopStep(llm, &mockTools{}, stdlib.ToolLoopOpts{
+		Model: "test", MaxIterations: 3,
+		CompletionVerifier: stdlib.CompletionVerifierFunc(func(_ context.Context, candidate stdlib.CompletionCandidate) (stdlib.CompletionDecision, error) {
+			verifications++
+			if candidate.Content == "draft" {
+				if candidate.TotalUsage != (contract.Usage{InputTokens: 2, OutputTokens: 1}) {
+					t.Fatalf("draft total usage = %#v", candidate.TotalUsage)
+				}
+				return stdlib.CompletionDecision{Feedback: "required total is missing"}, nil
+			}
+			if candidate.TotalUsage != (contract.Usage{InputTokens: 5, OutputTokens: 2}) {
+				t.Fatalf("corrected total usage = %#v", candidate.TotalUsage)
+			}
+			return stdlib.CompletionDecision{Accepted: candidate.Content == "corrected"}, nil
+		}),
+	})
+	result, err := step(context.Background(), loom.State{"messages": []contract.Message{{Role: "user", Content: "produce result"}}})
+	assertNoError(t, err)
+	if result["output"] != "corrected" || verifications != 2 || len(llm.requests) != 2 {
+		t.Fatalf("completion correction did not converge: result=%#v verifications=%d requests=%d", result, verifications, len(llm.requests))
+	}
+	if result["usage"] != (contract.Usage{InputTokens: 5, OutputTokens: 2}) {
+		t.Fatalf("verification rounds missing from usage: %#v", result["usage"])
+	}
+	last := llm.requests[1].Messages
+	if len(last) < 3 || !strings.Contains(last[len(last)-1].Content, "required total is missing") {
+		t.Fatalf("verification feedback missing from next model turn: %#v", last)
+	}
+}
+
+func TestToolLoopDoesNotReportRejectedCompletionWhenBudgetEnds(t *testing.T) {
+	llm := &mockLLM{responses: []contract.ChatResponse{{Content: "draft"}}}
+	step := stdlib.NewToolLoopStep(llm, &mockTools{}, stdlib.ToolLoopOpts{
+		MaxIterations: 1,
+		CompletionVerifier: stdlib.CompletionVerifierFunc(func(context.Context, stdlib.CompletionCandidate) (stdlib.CompletionDecision, error) {
+			return stdlib.CompletionDecision{Feedback: "still incomplete"}, nil
+		}),
+	})
+	result, err := step(context.Background(), loom.State{"messages": []contract.Message{{Role: "user", Content: "work"}}})
+	if !errors.Is(err, stdlib.ErrCompletionUnverified) || result["output"] != nil {
+		t.Fatalf("rejected completion became success: result=%#v err=%v", result, err)
 	}
 }
 

@@ -121,8 +121,8 @@ func TestCtxCounterWinsOverState(t *testing.T) {
 	if executions != 1 {
 		t.Fatalf("executions = %d, want 1 from context budget", executions)
 	}
-	if got := remaining.Load(); got != -1 {
-		t.Fatalf("context counter = %d, want -1 after rejected second step", got)
+	if got := remaining.Load(); got != 0 {
+		t.Fatalf("context counter = %d, want 0 after rejected second step", got)
 	}
 	latest := readBudgetCheckpoint(t, store, g.Name, result.RunID)
 	assertBudgetRemaining(t, latest.State, 0)
@@ -241,6 +241,9 @@ func assertBudgetStop(t *testing.T, result *RunResult, err error) {
 	t.Helper()
 	if err == nil {
 		t.Fatal("expected step budget error, got nil")
+	}
+	if !errors.Is(err, ErrBudgetExhausted) {
+		t.Fatalf("budget error does not wrap ErrBudgetExhausted: %v", err)
 	}
 	if result == nil {
 		t.Fatalf("budget result is nil: %v", err)

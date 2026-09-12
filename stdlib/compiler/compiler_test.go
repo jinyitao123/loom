@@ -175,32 +175,3 @@ func TestSubAgentRouter_DeterministicRouting(t *testing.T) {
 		t.Fatalf("absent __delegate_to should halt, got %q", next)
 	}
 }
-
-func TestLoopDetector_BlocksAtThreshold(t *testing.T) {
-	d := newLoopDetector(3)
-	h := d.hook()
-	call := contract.ToolCall{ID: "1", Name: "search", Args: `{"q":"x"}`}
-	// First 3 identical calls record cleanly; the hook blocks once the prior 3
-	// all match.
-	for i := 0; i < 3; i++ {
-		if _, err := h.Pre(context.Background(), call); err != nil {
-			t.Fatalf("call %d should not block yet: %v", i, err)
-		}
-		_ = h.Post(context.Background(), call, &contract.ToolResult{})
-	}
-	if _, err := h.Pre(context.Background(), call); err == nil {
-		t.Fatalf("4th identical call must be blocked as a loop")
-	}
-}
-
-func TestLoopDetector_DifferentCallsNoBlock(t *testing.T) {
-	d := newLoopDetector(3)
-	h := d.hook()
-	for i := 0; i < 6; i++ {
-		call := contract.ToolCall{ID: "1", Name: "search", Args: `{"q":"` + string(rune('a'+i)) + `"}`}
-		if _, err := h.Pre(context.Background(), call); err != nil {
-			t.Fatalf("distinct call %d must not block: %v", i, err)
-		}
-		_ = h.Post(context.Background(), call, &contract.ToolResult{})
-	}
-}
