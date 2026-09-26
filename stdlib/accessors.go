@@ -1,6 +1,7 @@
 package stdlib
 
 import (
+	"encoding/json"
 	"fmt" // 类型不匹配时构造带实际类型的错误信息
 
 	"github.com/jinyitao123/loom"          // 内核包：State 就是 map[string]any
@@ -26,40 +27,31 @@ func GetMessages(s loom.State) ([]contract.Message, error) {
 		return msgs, nil
 	case []any:
 		// After JSON roundtrip, messages are []any of map[string]any.
-		// 检查点恢复路径：逐条把 map[string]any 手工还原成 Message。
-		var result []contract.Message
-		for _, m := range msgs {
+		// The assistant's tool_calls must survive beside their tool results.
+		result := make([]contract.Message, 0, len(msgs))
+		for index, m := range msgs {
 			if mm, ok := m.(map[string]any); ok {
-				// 用容错的 stringVal 取字段：缺失或类型不对时得到空串而不是 panic。
-				msg := contract.Message{
-					Role:    stringVal(mm, "role"),
-					Content: stringVal(mm, "content"),
+				encoded, err := json.Marshal(mm)
+				if err != nil {
+					return nil, fmt.Errorf("loom: encode message %d: %w", index, err)
 				}
-				// tool_call_id 是可选字段，仅在存在且为字符串时回填。
-				if tcid, ok := mm["tool_call_id"].(string); ok {
-					msg.ToolCallID = tcid
+				var msg contract.Message
+				if err := json.Unmarshal(encoded, &msg); err != nil {
+					return nil, fmt.Errorf("loom: decode message %d: %w", index, err)
 				}
 				result = append(result, msg)
 			} else if typed, ok := m.(contract.Message); ok {
 				// 兼容混合形态：[]any 里也可能直接装着强类型 Message（部分手工构造场景）。
 				result = append(result, typed)
+			} else {
+				return nil, fmt.Errorf("loom: message %d is %T, want Message", index, m)
 			}
-			// 其余无法识别的元素被静默跳过：宁可丢弃脏数据也不让恢复流程失败。
 		}
 		return result, nil
 	default:
 		// 键存在但类型完全不对：这是调用方的编程错误，必须显式报错并带上实际类型。
 		return nil, fmt.Errorf("loom: messages is %T, want []Message", raw)
 	}
-}
-
-// stringVal 从 map 中容错地取字符串字段：缺失或非字符串一律返回空串，
-// 供 JSON 恢复路径安全读取可选字段。
-func stringVal(m map[string]any, key string) string {
-	if v, ok := m[key].(string); ok {
-		return v
-	}
-	return ""
 }
 
 // MustGetMessages panics on type mismatch.
