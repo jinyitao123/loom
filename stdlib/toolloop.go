@@ -276,6 +276,9 @@ func NewToolLoopStep(llm contract.LLM, tools contract.ToolDispatcher, opts ToolL
 					}
 				}
 			}
+			if err := validateToolTranscript(msgs, nil); err != nil {
+				return nil, err
+			}
 
 			// 本轮询问 LLM：携带完整历史、工具清单与输出约束。
 			resp, err := llm.Chat(ctx, contract.ChatRequest{

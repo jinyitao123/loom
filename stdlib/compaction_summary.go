@@ -53,8 +53,19 @@ func NewSummaryCompactionPolicy(llm contract.LLM, opts SummaryCompactionOpts) *C
 			if len(messages)-start <= keepLast {
 				return messages, nil
 			}
+			// A single assistant message can request several tools. Keeping a fixed
+			// number of trailing messages could retain their results while
+			// summarizing away the assistant's tool_calls. Move the cut to the
+			// beginning of that whole exchange instead.
+			cut := len(messages) - keepLast
+			for cut > start && messages[cut].Role == "tool" {
+				cut--
+			}
+			if cut == start {
+				return messages, nil
+			}
 			var transcript strings.Builder
-			for _, message := range messages[start : len(messages)-keepLast] {
+			for _, message := range messages[start:cut] {
 				transcript.WriteString(fmt.Sprintf("[%s]: %s\n", message.Role, message.Content))
 			}
 			response, err := llm.Chat(ctx, contract.ChatRequest{
@@ -67,12 +78,12 @@ func NewSummaryCompactionPolicy(llm contract.LLM, opts SummaryCompactionOpts) *C
 			if err != nil || response == nil {
 				return messages, nil
 			}
-			compacted := make([]contract.Message, 0, keepLast+2)
+			compacted := make([]contract.Message, 0, len(messages)-cut+2)
 			if system != nil {
 				compacted = append(compacted, *system)
 			}
 			compacted = append(compacted, contract.Message{Role: "assistant", Content: prefix + response.Content})
-			compacted = append(compacted, messages[len(messages)-keepLast:]...)
+			compacted = append(compacted, messages[cut:]...)
 			return compacted, nil
 		},
 	}

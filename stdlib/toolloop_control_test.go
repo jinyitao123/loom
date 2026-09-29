@@ -127,6 +127,47 @@ func TestControlledToolLoopSlicesAndTotal(t *testing.T) {
 	}
 }
 
+func TestControlledToolLoopCompactionPreservesTwoToolResults(t *testing.T) {
+	calls := []contract.ToolCall{
+		{ID: "first", Name: "read", Args: `{}`},
+		{ID: "second", Name: "read", Args: `{}`},
+	}
+	m := &parkScriptLLM{t: t}
+	m.scripts = []func(contract.ChatRequest) contract.ChatResponse{
+		func(contract.ChatRequest) contract.ChatResponse {
+			return contract.ChatResponse{ToolCalls: calls, StopReason: "tool_calls"}
+		},
+		func(request contract.ChatRequest) contract.ChatResponse {
+			messages := request.Messages
+			if len(messages) != 5 || messages[2].Role != "assistant" ||
+				!reflect.DeepEqual(messages[2].ToolCalls, calls) ||
+				messages[3].ToolCallID != calls[0].ID || messages[4].ToolCallID != calls[1].ID {
+				t.Fatalf("controlled compaction split a tool-call batch: %#v", messages)
+			}
+			return contract.ChatResponse{Content: "done", StopReason: "stop"}
+		},
+	}
+	d := &parkToolDispatcher{
+		defs: []contract.ToolDef{{Name: "read"}},
+		results: map[string]contract.ToolResult{
+			"first":  {Content: strings.Repeat("x", 13_000)},
+			"second": {Content: strings.Repeat("x", 13_000)},
+		},
+	}
+	opts := stdlib.ToolLoopOpts{
+		Model: "test", SystemPrompt: "stable identity", MaxIterations: 3,
+		Control: &stdlib.ToolLoopControl{ID: "chat", InitialTotalRounds: 3},
+		Compaction: stdlib.NewSummaryCompactionPolicy(&summaryLLM{}, stdlib.SummaryCompactionOpts{
+			TokenThreshold: 6000,
+		}),
+	}
+	graph := controlGraph(t.Name(), m, d, opts)
+	result, err := graph.Run(context.Background(), controlInput(), loom.NewMemStore())
+	if err != nil || result.State["output"] != "done" || m.calls != 2 {
+		t.Fatalf("controlled run = %#v, calls = %d, err = %v", result, m.calls, err)
+	}
+}
+
 func TestControlledCompletionCorrectionPersistsAcrossResume(t *testing.T) {
 	m := &parkScriptLLM{t: t, scripts: []func(contract.ChatRequest) contract.ChatResponse{
 		func(contract.ChatRequest) contract.ChatResponse {

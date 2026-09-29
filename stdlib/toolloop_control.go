@@ -274,31 +274,33 @@ func readToolLoopControl(state loom.State) (toolLoopControlState, bool, error) {
 	default:
 		return invalid()
 	}
-	if err := validateControlTranscript(msgs, pending); err != nil {
+	if err := validateToolTranscript(msgs, pending); err != nil {
 		return control, true, err
 	}
 	return control, true, nil
 }
 
-func validateControlTranscript(messages []contract.Message, pending []toolLoopPendingCall) error {
+// validateToolTranscript checks the tool-call/result pairing used by both
+// ordinary and controlled loops before either sends history to a provider.
+func validateToolTranscript(messages []contract.Message, pending []toolLoopPendingCall) error {
 	unresolved := map[string]contract.ToolCall{}
 	for _, message := range messages {
 		if message.Role == "tool" {
 			if _, ok := unresolved[message.ToolCallID]; !ok {
-				return fmt.Errorf("loom/toolloop: private transcript has an unmatched tool result")
+				return fmt.Errorf("loom/toolloop: transcript has an unmatched tool result")
 			}
 			delete(unresolved, message.ToolCallID)
 			continue
 		}
 		if len(unresolved) > 0 {
-			return fmt.Errorf("loom/toolloop: private transcript has unresolved tool calls")
+			return fmt.Errorf("loom/toolloop: transcript has unresolved tool calls")
 		}
 		if len(message.ToolCalls) > 0 && message.Role != "assistant" {
 			return fmt.Errorf("loom/toolloop: tool calls must belong to an assistant message")
 		}
 		for _, call := range message.ToolCalls {
 			if _, duplicate := unresolved[call.ID]; duplicate || call.ID == "" || call.Name == "" {
-				return fmt.Errorf("loom/toolloop: invalid tool call identity in private transcript")
+				return fmt.Errorf("loom/toolloop: invalid tool call identity in transcript")
 			}
 			unresolved[call.ID] = call
 		}
@@ -306,12 +308,12 @@ func validateControlTranscript(messages []contract.Message, pending []toolLoopPe
 	for _, call := range pending {
 		original, ok := unresolved[call.CallID]
 		if !ok || original.Name != call.Tool || original.Args != call.Args {
-			return fmt.Errorf("loom/toolloop: pending call does not match the private transcript")
+			return fmt.Errorf("loom/toolloop: pending call does not match the transcript")
 		}
 		delete(unresolved, call.CallID)
 	}
 	if len(unresolved) > 0 {
-		return fmt.Errorf("loom/toolloop: private transcript is missing pending tool calls")
+		return fmt.Errorf("loom/toolloop: transcript is missing pending tool calls")
 	}
 	return nil
 }

@@ -137,7 +137,7 @@ func newControlledToolLoopStep(llm contract.LLM, tools contract.ToolDispatcher, 
 				Slice: 1, SliceLimit: uint64(opts.MaxIterations), AuthorizedTotalRounds: controlOpts.InitialTotalRounds,
 			}
 		}
-		if err := validateControlTranscript(loop.messages, loop.pending); err != nil {
+		if err := validateToolTranscript(loop.messages, loop.pending); err != nil {
 			return nil, err
 		}
 		if reason := loop.roundLimit(); reason != "" {
@@ -163,7 +163,7 @@ func newControlledToolLoopStep(llm contract.LLM, tools contract.ToolDispatcher, 
 					if err != nil {
 						return nil, fmt.Errorf("loom/toolloop: compaction failed: %w", err)
 					}
-					if err := validateControlTranscript(loop.messages, nil); err != nil {
+					if err := validateToolTranscript(loop.messages, nil); err != nil {
 						return nil, err
 					}
 				}
@@ -214,7 +214,7 @@ func newControlledToolLoopStep(llm contract.LLM, tools contract.ToolDispatcher, 
 				loop.messages = append(loop.messages, resp.AsMessage())
 				return loop.finish(ToolLoopFinalResponse, resp.Content), nil
 			}
-			if err := validateControlTranscript([]contract.Message{resp.AsMessage()}, pendingCalls(resp.ToolCalls)); err != nil {
+			if err := validateToolTranscript([]contract.Message{resp.AsMessage()}, pendingCalls(resp.ToolCalls)); err != nil {
 				return nil, err
 			}
 			batchHash := hashToolCalls(resp.ToolCalls)

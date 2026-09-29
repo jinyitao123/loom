@@ -113,6 +113,78 @@ func TestToolLoop_SingleToolCall(t *testing.T) {
 	}
 }
 
+func TestToolLoopCompactionPreservesTwoLargeToolResults(t *testing.T) {
+	calls := []contract.ToolCall{
+		{ID: "first", Name: "read", Args: `{}`},
+		{ID: "second", Name: "read", Args: `{}`},
+	}
+	llm := &statePatchLLM{responses: []contract.ChatResponse{
+		{ToolCalls: calls}, {Content: "done"},
+	}}
+	tools := &mockTools{
+		tools: []contract.ToolDef{{Name: "read", InputSchema: json.RawMessage(`{"type":"object"}`)}},
+		handler: func(call contract.ToolCall) *contract.ToolResult {
+			return &contract.ToolResult{CallID: call.ID, Content: strings.Repeat("x", 13_000)}
+		},
+	}
+	step := stdlib.NewToolLoopStep(llm, tools, stdlib.ToolLoopOpts{
+		Model: "test", SystemPrompt: "stable identity",
+		Compaction: stdlib.NewSummaryCompactionPolicy(&summaryLLM{}, stdlib.SummaryCompactionOpts{
+			TokenThreshold: 6000,
+		}),
+	})
+	result, err := step(context.Background(), loom.State{
+		"messages": []contract.Message{{Role: "user", Content: "read both materials"}},
+	})
+	assertNoError(t, err)
+	if result["output"] != "done" || len(llm.requests) != 2 {
+		t.Fatalf("result = %#v, model calls = %d", result, len(llm.requests))
+	}
+	history := llm.requests[1].Messages
+	if len(history) != 5 || history[2].Role != "assistant" ||
+		!reflect.DeepEqual(history[2].ToolCalls, calls) ||
+		history[3].ToolCallID != calls[0].ID || history[4].ToolCallID != calls[1].ID {
+		t.Fatalf("compacted request lost the assistant/tool batch: %#v", history)
+	}
+}
+
+func TestToolLoopRejectsOrphanToolResultFromCheckpoint(t *testing.T) {
+	messages := []contract.Message{
+		{Role: "user", Content: "read"},
+		{Role: "tool", ToolCallID: "missing-call", Content: "result"},
+	}
+	raw, err := json.Marshal(messages)
+	assertNoError(t, err)
+	var restored []any
+	assertNoError(t, json.Unmarshal(raw, &restored))
+	llm := &statePatchLLM{responses: []contract.ChatResponse{{Content: "done"}}}
+	step := stdlib.NewToolLoopStep(llm, &mockTools{}, stdlib.ToolLoopOpts{Model: "test"})
+	_, err = step(context.Background(), loom.State{"messages": restored})
+	assertError(t, err, "unmatched tool result")
+	if len(llm.requests) != 0 {
+		t.Fatalf("invalid checkpoint reached the provider: %#v", llm.requests)
+	}
+}
+
+func TestToolLoopRestoredCheckpointRetainsAssistantToolCalls(t *testing.T) {
+	messages := []contract.Message{
+		{Role: "user", Content: "read"},
+		{Role: "assistant", ToolCalls: []contract.ToolCall{{ID: "read-1", Name: "read", Args: `{}`}}},
+		{Role: "tool", ToolCallID: "read-1", Content: "result"},
+	}
+	raw, err := json.Marshal(messages)
+	assertNoError(t, err)
+	var restored []any
+	assertNoError(t, json.Unmarshal(raw, &restored))
+	llm := &statePatchLLM{responses: []contract.ChatResponse{{Content: "done"}}}
+	step := stdlib.NewToolLoopStep(llm, &mockTools{}, stdlib.ToolLoopOpts{Model: "test"})
+	_, err = step(context.Background(), loom.State{"messages": restored})
+	assertNoError(t, err)
+	if len(llm.requests) != 1 || !reflect.DeepEqual(llm.requests[0].Messages, messages) {
+		t.Fatalf("restored request changed the tool-call pair: %#v", llm.requests)
+	}
+}
+
 func TestToolLoopCompletionRejectionBecomesCorrectionObservation(t *testing.T) {
 	llm := &statePatchLLM{responses: []contract.ChatResponse{
 		{Content: "draft", Usage: contract.Usage{InputTokens: 2, OutputTokens: 1}},
