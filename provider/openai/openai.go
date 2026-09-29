@@ -414,6 +414,11 @@ func (c *Client) applyThinkingControl(oaiReq *oaiRequest) {
 		// 官方文档：thinking 模式不支持 temperature/top_p/presence/frequency
 		// penalty；裁剪 temperature，避免平台显示一个实际不生效的配置。
 		oaiReq.Temperature = nil
+	} else {
+		// DeepSeek also treats reasoning_effort=low/high/max as enabling
+		// thinking. Do not contradict the explicit disabled switch on a tool
+		// request: this adapter cannot replay reasoning_content yet.
+		oaiReq.ReasoningEffort = "none"
 	}
 }
 

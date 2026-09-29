@@ -147,6 +147,7 @@ func TestThinkingOptInToolsDisabled(t *testing.T) {
 				openai.WithThinkingControl("enabled", true),
 			)
 			req := chatReq(true, 0.7)
+			req.Effort = contract.EffortHigh
 			if stream {
 				runStream(t, client, req)
 			} else {
@@ -159,6 +160,12 @@ func TestThinkingOptInToolsDisabled(t *testing.T) {
 			}
 			if typ != "disabled" {
 				t.Fatalf("thinking.type = %q, want disabled", typ)
+			}
+			var wire struct {
+				ReasoningEffort string `json:"reasoning_effort"`
+			}
+			if err := json.Unmarshal(body, &wire); err != nil || wire.ReasoningEffort != "none" {
+				t.Fatalf("disabled thinking must not be re-enabled by effort: %q, %v", wire.ReasoningEffort, err)
 			}
 			if !hasWireField(t, body, "temperature") {
 				t.Fatal("temperature must stay when thinking is disabled")
