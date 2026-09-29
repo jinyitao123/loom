@@ -393,6 +393,9 @@ func NewToolLoopStep(llm contract.LLM, tools contract.ToolDispatcher, opts ToolL
 			err := fmt.Errorf("%w: tool budget exhausted", ErrCompletionUnverified)
 			return loom.State{"__error": err.Error()}, err
 		}
+		if err := validateToolTranscript(msgs, nil); err != nil {
+			return nil, err
+		}
 
 		// Tool budget exhausted. Don't fail the whole turn (which surfaces to the
 		// end user as a raw error) — inject a wrap-up note and make one final call

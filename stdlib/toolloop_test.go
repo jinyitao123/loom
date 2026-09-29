@@ -166,6 +166,27 @@ func TestToolLoopRejectsOrphanToolResultFromCheckpoint(t *testing.T) {
 	}
 }
 
+func TestToolLoopRejectsOrphanBeforeBudgetWrapUp(t *testing.T) {
+	llm := &statePatchLLM{responses: []contract.ChatResponse{
+		{ToolCalls: []contract.ToolCall{{ID: "expected", Name: "read", Args: `{}`}}},
+		{Content: "wrap-up"},
+	}}
+	tools := &mockTools{
+		tools: []contract.ToolDef{{Name: "read"}},
+		handler: func(contract.ToolCall) *contract.ToolResult {
+			return &contract.ToolResult{CallID: "wrong", Content: "result"}
+		},
+	}
+	step := stdlib.NewToolLoopStep(llm, tools, stdlib.ToolLoopOpts{Model: "test", MaxIterations: 1})
+	_, err := step(context.Background(), loom.State{
+		"messages": []contract.Message{{Role: "user", Content: "read"}},
+	})
+	assertError(t, err, "unmatched tool result")
+	if len(llm.requests) != 1 {
+		t.Fatalf("invalid wrap-up history reached the provider: %#v", llm.requests)
+	}
+}
+
 func TestToolLoopRestoredCheckpointRetainsAssistantToolCalls(t *testing.T) {
 	messages := []contract.Message{
 		{Role: "user", Content: "read"},
