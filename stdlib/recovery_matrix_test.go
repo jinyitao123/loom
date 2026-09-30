@@ -42,6 +42,7 @@ const (
 var allCrashModes = []crashMode{crashBeforeStart, crashAfterStart, crashAfterEffect, crashAfterResponse}
 
 type journalEntry struct {
+	segment  string
 	kind     stdlib.OperationKind
 	inputSum string
 	done     bool
@@ -53,7 +54,8 @@ type journalEntry struct {
 // volatile and restarts with every attempt, like a host replaying from scratch.
 type sequenceJournal struct {
 	entries []journalEntry
-	cursor  int
+	cursor  int    // position within the current segment
+	segment string // a controlled loop journals each resumed slice separately
 
 	crashAt   int // operation index to crash at; -1 for none
 	crashMode crashMode
@@ -75,20 +77,21 @@ func inputChecksum(input any) string {
 }
 
 func (journal *sequenceJournal) Execute(_ context.Context, operation stdlib.JournalOperation, perform stdlib.JournalPerform) (json.RawMessage, error) {
-	index := journal.cursor
+	position := journal.cursor
 	journal.cursor++
 	sum := inputChecksum(operation.Input)
-	if index < len(journal.entries) {
-		entry := journal.entries[index]
+	if found := journal.find(position); found >= 0 {
+		entry := journal.entries[found]
 		if entry.kind != operation.Kind || entry.inputSum != sum {
-			journal.diverged = fmt.Errorf("replay diverged at operation %d: recorded %s, now %s", index, entry.kind, operation.Kind)
+			journal.diverged = fmt.Errorf("replay diverged at %s operation %d: recorded %s, now %s", journal.segment, position, entry.kind, operation.Kind)
 			return nil, journal.diverged
 		}
 		if !entry.done {
-			return nil, fmt.Errorf("operation %d: %w", index, stdlib.ErrJournalOutcomeUnknown)
+			return nil, fmt.Errorf("operation %d: %w", found, stdlib.ErrJournalOutcomeUnknown)
 		}
 		return entry.response, nil
 	}
+	index := len(journal.entries)
 	fire := func(mode crashMode) bool {
 		if journal.crashAt == index && journal.crashMode == mode && !journal.spent[index] {
 			if journal.spent == nil {
@@ -102,7 +105,7 @@ func (journal *sequenceJournal) Execute(_ context.Context, operation stdlib.Jour
 	if fire(crashBeforeStart) {
 		return nil, errRecoveryCrash
 	}
-	entry := journalEntry{kind: operation.Kind, inputSum: sum}
+	entry := journalEntry{segment: journal.segment, kind: operation.Kind, inputSum: sum}
 	if call, ok := operation.Input.(contract.ToolCall); ok {
 		entry.callID = call.ID
 	}
@@ -127,6 +130,26 @@ func (journal *sequenceJournal) Execute(_ context.Context, operation stdlib.Jour
 		return nil, errRecoveryCrash
 	}
 	return raw, nil
+}
+
+// find returns the index of the position-th entry of the current segment, or -1.
+func (journal *sequenceJournal) find(position int) int {
+	seen := 0
+	for index, entry := range journal.entries {
+		if entry.segment != journal.segment {
+			continue
+		}
+		if seen == position {
+			return index
+		}
+		seen++
+	}
+	return -1
+}
+
+// beginSegment restarts the position counter, as a host does at every loop step.
+func (journal *sequenceJournal) beginSegment(segment string) {
+	journal.segment, journal.cursor = segment, 0
 }
 
 // reconcile is what a host does with an unresolved operation: a model call
@@ -280,6 +303,12 @@ type recoveryRun struct {
 	journal *sequenceJournal
 	ledger  *effectLedger
 	model   *scriptedModel
+
+	// controlled runs the loop in durable model-round slices: the host's
+	// checkpoint store and the last pause survive a crash, like its database.
+	controlled bool
+	store      loom.Store
+	lastPause  *loom.RunResult
 }
 
 func newRecoveryRun() *recoveryRun {
@@ -293,6 +322,9 @@ func newRecoveryRun() *recoveryRun {
 // attempt replays the whole step from the start against the durable journal.
 func (run *recoveryRun) attempt(t *testing.T) (string, error) {
 	t.Helper()
+	if run.controlled {
+		return run.attemptControlled(t)
+	}
 	run.journal.cursor = 0
 	llm := stdlib.NewJournaledLLM(run.model, run.journal)
 	tools := stdlib.NewJournaledToolDispatcher(&ledgerTools{ledger: run.ledger}, run.journal, stdlib.JournaledToolOpts{SerializeWhenActive: true})
@@ -456,5 +488,104 @@ func TestRecoveryHistoryValidatorRejectsBrokenTranscripts(t *testing.T) {
 	ok := []contract.Message{{Role: "user", Content: "u"}, {Role: "assistant", ToolCalls: []contract.ToolCall{call}}, {Role: "tool", ToolCallID: "x", Content: "r"}}
 	if err := strictOpenAIHistory(ok); err != nil {
 		t.Fatalf("validator rejected a valid transcript: %v", err)
+	}
+}
+
+// attemptControlled drives a sliced loop the way a host does: run until the
+// loop pauses at its round limit, grant more rounds, and resume from the
+// pause. A crash inside a slice leaves the last pause in place, so recovery
+// resumes that same pause and the slice's journal segment is replayed.
+func (run *recoveryRun) attemptControlled(t *testing.T) (string, error) {
+	t.Helper()
+	run.journal.beginSegment("")
+	llm := stdlib.NewJournaledLLM(run.model, run.journal)
+	tools := stdlib.NewJournaledToolDispatcher(&ledgerTools{ledger: run.ledger}, run.journal, stdlib.JournaledToolOpts{SerializeWhenActive: true})
+	graph := loom.NewGraph("recovery-controlled", "chat", loom.WithCheckpointPolicy(loom.CheckpointRequired))
+	graph.SetHooks(loom.HookPoints{Before: []loom.StepHook{func(_ context.Context, _ string, state loom.State) error {
+		// The last saved checkpoint sequence names the slice, so a re-attempt of
+		// the same slice finds the same journal segment.
+		run.journal.beginSegment(fmt.Sprint(state["__seq"]))
+		return nil
+	}}})
+	graph.AddStep("chat", stdlib.NewToolLoopStep(llm, tools, stdlib.ToolLoopOpts{
+		Model: "m", MaxIterations: 2,
+		Control: &stdlib.ToolLoopControl{ID: "chat", InitialTotalRounds: 2},
+	}), loom.End())
+	ctx := context.WithValue(context.Background(), recoveryCtxKey{}, true)
+	for slices := 0; slices < 4; slices++ {
+		var result *loom.RunResult
+		var err error
+		if run.lastPause == nil {
+			result, err = graph.Run(ctx, loom.State{"__run_id": "run-1", "messages": []contract.Message{{Role: "user", Content: "do the work"}}}, run.store)
+		} else {
+			outcome, _, readErr := stdlib.ReadToolLoopOutcome(run.lastPause.State)
+			if readErr != nil {
+				return "", readErr
+			}
+			seq, _ := run.lastPause.State["__checkpoint_seq"].(int64)
+			grant := stdlib.ToolLoopResumeGrant{ID: fmt.Sprintf("grant-%d", slices), ExpectedRunID: run.lastPause.RunID,
+				ExpectedCheckpointSeq: seq, ExpectedYieldToken: run.lastPause.State["__yield_token"].(string),
+				ExpectedSlice: outcome.Slice, AuthorizedTotalRounds: outcome.AuthorizedTotalRounds + 1}
+			input, prepareErr := stdlib.PrepareToolLoopResume(run.lastPause.State, grant)
+			if prepareErr != nil {
+				return "", prepareErr
+			}
+			result, err = graph.Resume(ctx, run.lastPause.RunID, input, run.store)
+		}
+		if err != nil {
+			return "", err
+		}
+		if result.Yielded {
+			run.lastPause = result
+			continue
+		}
+		output, _ := result.State["output"].(string)
+		return output, nil
+	}
+	return "", errors.New("controlled loop did not finish within four slices")
+}
+
+func newControlledRecoveryRun() *recoveryRun {
+	run := newRecoveryRun()
+	run.controlled, run.store = true, loom.NewMemStore()
+	return run
+}
+
+func TestRecoveryControlledLoopEveryOperationBoundary(t *testing.T) {
+	reference := newControlledRecoveryRun()
+	want, err := reference.attempt(t)
+	if err != nil || !strings.HasPrefix(want, "done:") {
+		t.Fatalf("uninterrupted controlled run: output %q err %v", want, err)
+	}
+	if segments := map[string]bool{}; true {
+		for _, entry := range reference.journal.entries {
+			segments[entry.segment] = true
+		}
+		if len(segments) != 2 {
+			t.Fatalf("the controlled run used %d journal segments, want 2 (one per slice): %v", len(segments), segments)
+		}
+	}
+	operations := len(reference.journal.entries)
+	for index := 0; index < operations; index++ {
+		for _, mode := range allCrashModes {
+			t.Run(fmt.Sprintf("op%d/%s", index, mode), func(t *testing.T) {
+				run := newControlledRecoveryRun()
+				run.journal.crashAt, run.journal.crashMode = index, mode
+				if _, err := run.attempt(t); !errors.Is(err, errRecoveryCrash) {
+					t.Fatalf("first attempt did not stop at the crash: %v", err)
+				}
+				got := completeAfterCrash(t, run)
+				if got != want {
+					t.Fatalf("recovered output %q differs from uninterrupted %q", got, want)
+				}
+				requireExactlyOnceEffects(t, run.ledger)
+				if len(run.model.invalid) > 0 {
+					t.Fatalf("a request had an invalid history: %v", run.model.invalid)
+				}
+				if run.journal.diverged != nil {
+					t.Fatal(run.journal.diverged)
+				}
+			})
+		}
 	}
 }
