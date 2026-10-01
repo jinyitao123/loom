@@ -101,16 +101,6 @@ func TestToolHook_PostAudits(t *testing.T) {
 // --- Read/Write dispatch tests ---
 
 func TestReadWriteDispatch_ReadOnlyParallel(t *testing.T) {
-	var mu sync.Mutex
-	var dispatchOrder []string
-	tools := &mockTools{handler: func(c contract.ToolCall) *contract.ToolResult {
-		mu.Lock()
-		dispatchOrder = append(dispatchOrder, c.Name)
-		mu.Unlock()
-		time.Sleep(10 * time.Millisecond)
-		return &contract.ToolResult{CallID: c.ID, Content: "ok", ToolName: c.Name}
-	}}
-
 	calls := []contract.ToolCall{
 		{ID: "1", Name: "read1"}, {ID: "2", Name: "read2"}, {ID: "3", Name: "read3"},
 	}
@@ -120,14 +110,53 @@ func TestReadWriteDispatch_ReadOnlyParallel(t *testing.T) {
 		{Name: "read3", ReadOnly: true},
 	}
 
-	start := time.Now()
-	if _, err := stdlib.DispatchWithHooks(context.Background(), tools, calls, defs, nil); err != nil {
-		t.Fatalf("DispatchWithHooks() error = %v", err)
-	}
-	elapsed := time.Since(start)
+	// Hold every tool until all calls have entered. Serial dispatch cannot reach
+	// this barrier, regardless of the runner's scheduling or timer resolution.
+	entered := make(chan string, len(calls))
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	releaseTools := func() { releaseOnce.Do(func() { close(release) }) }
+	tools := &mockTools{handler: func(c contract.ToolCall) *contract.ToolResult {
+		entered <- c.Name
+		<-release
+		return &contract.ToolResult{CallID: c.ID, Content: "ok", ToolName: c.Name}
+	}}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	done := make(chan struct{})
+	var dispatchErr error
+	go func() {
+		_, dispatchErr = stdlib.DispatchWithHooks(ctx, tools, calls, defs, nil)
+		close(done)
+	}()
+	t.Cleanup(func() {
+		releaseTools()
+		<-done
+	})
 
-	if elapsed > 25*time.Millisecond {
-		t.Errorf("read-only dispatch took %v, expected parallel (~10ms)", elapsed)
+	seen := make(map[string]bool, len(calls))
+	for range calls {
+		select {
+		case name := <-entered:
+			if seen[name] {
+				t.Fatalf("tool %q entered more than once", name)
+			}
+			seen[name] = true
+		case <-done:
+			t.Fatalf("dispatch finished before all tools entered: %d/%d, error = %v", len(seen), len(calls), dispatchErr)
+		case <-ctx.Done():
+			t.Fatalf("read-only tools did not enter concurrently: %d/%d", len(seen), len(calls))
+		}
+	}
+
+	releaseTools()
+	select {
+	case <-done:
+		if dispatchErr != nil {
+			t.Fatalf("DispatchWithHooks() error = %v", dispatchErr)
+		}
+	case <-ctx.Done():
+		t.Fatal("dispatch did not finish after releasing the tools")
 	}
 }
 
