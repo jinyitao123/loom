@@ -1,0 +1,35 @@
+name: recovery
+
+# The journal replay contract that Weave's member runs depend on. It is pure Go
+# and must hold on every platform Loom ships for.
+on:
+  push:
+    paths:
+      - "stdlib/**"
+      - "contract/**"
+      - "go.mod"
+      - ".github/workflows/recovery.yml"
+  pull_request:
+    paths:
+      - "stdlib/**"
+      - "contract/**"
+      - "go.mod"
+
+jobs:
+  recovery:
+    name: recovery matrix (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+      - name: stdlib
+        run: go test -count=1 ./stdlib/...
+      - name: recovery matrix under the race detector
+        if: runner.os == 'Linux'
+        run: go test -race -count=1 ./stdlib -run 'TestRecovery|TestJournal'

@@ -38,6 +38,13 @@ type JournalPerform func() (any, error)
 // must return an error wrapping ErrJournalOutcomeUnknown when an effect may have
 // happened without a durable response, and must not call perform again for that
 // unresolved operation.
+//
+// A journal that addresses operations by position (the usual design, since a
+// model request and a tool call have no identity of their own) needs the loop
+// to issue them in the same order on every replay. Wrap tools with
+// JournaledToolOpts{SerializeWhenActive: true} so read-only tools are not run
+// in parallel while a journal is active; stdlib/recovery_matrix_test.go holds
+// the crash-at-every-boundary regression for this contract.
 type ExecutionJournal interface {
 	Active(context.Context) bool
 	Execute(context.Context, JournalOperation, JournalPerform) (json.RawMessage, error)
