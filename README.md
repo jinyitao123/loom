@@ -99,6 +99,8 @@ The kernel executes steps in graph order, checkpoints along the way, and pauses 
 
 Tool loops can opt into [controlled model-round pauses](docs/toolloop-control.md), reusing the existing yield and checkpoint protocol while leaving continuation authorization and journal fencing to the host.
 
+The [provider-recorded recovery fixtures](docs/provider-recorded-recovery.md) replay a real synthetic DeepSeek tool conversation across journal crashes and controlled budget pauses without live model calls.
+
 ## When not to use Loom
 
 - **You want batteries included.** Built-in RAG, vector memory, a visual flow designer, a hosted platform — Loom has none of these, on purpose. LangGraph or the OpenAI Agents SDK will get you there faster.
