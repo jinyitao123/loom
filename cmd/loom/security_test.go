@@ -31,9 +31,12 @@ func TestSecretsNotLeakedToStdout(t *testing.T) {
 	srv := httptest.NewServer((&mockLLM{turns: []llmTurn{{httpError: 500}}}).handler())
 	defer srv.Close()
 
+	cwd := t.TempDir()
+	// Restore the process directory before TempDir cleanup, including on Windows.
+	t.Chdir(cwd)
 	var out bytes.Buffer
 	runCmdIO(
-		[]string{"--model", "test", "--cwd", t.TempDir()},
+		[]string{"--model", "test", "--cwd", cwd},
 		strings.NewReader(`{"type":"chat","instruction":"hi"}`),
 		&out,
 		envGetter(map[string]string{"LOOM_BASE_URL": srv.URL, "LOOM_API_KEY": sentinel}),

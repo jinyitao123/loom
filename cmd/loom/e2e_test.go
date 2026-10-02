@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -29,6 +30,9 @@ func TestMain(m *testing.M) {
 		panic(err)
 	}
 	loomBin = filepath.Join(dir, "loom")
+	if runtime.GOOS == "windows" {
+		loomBin += ".exe"
+	}
 	build := exec.Command("go", "build", "-o", loomBin, ".")
 	build.Stderr = os.Stderr
 	if err := build.Run(); err != nil {

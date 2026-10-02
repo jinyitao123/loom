@@ -1,8 +1,13 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/jinyitao123/loom"
@@ -112,6 +117,90 @@ func TestOrchestration_NoDelegateAnswersDirectly(t *testing.T) {
 	}
 	if got := stdlib.GetString(res.State, "output", ""); got != "DIRECT_ANSWER" {
 		t.Fatalf("output = %q, want DIRECT_ANSWER", got)
+	}
+}
+
+// Exercise the actual CLI assembly, including child specs on disk and final
+// events; the lower-level router fixtures above use synthetic child graphs.
+func TestRunAgentOrchestrationLoadsChildAndReportsOutcome(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		child      string
+		responses  []contract.ChatResponse
+		modelError error
+		wantOutput string
+		wantError  string
+		delegated  bool
+	}{
+		{
+			name: "direct answer retains parent context", child: `{"system_prompt":"CHILD_IDENTITY"}`,
+			responses: []contract.ChatResponse{{Content: "parent answer"}}, wantOutput: "parent answer",
+		},
+		{
+			name: "delegated answer comes from child", child: `{"system_prompt":"CHILD_IDENTITY"}`,
+			responses: []contract.ChatResponse{
+				{ToolCalls: []contract.ToolCall{{ID: "delegate-1", Name: delegateToolName, Args: `{"agent":"worker","task":"inspect the sample"}`}}},
+				{Content: "parent handoff"}, {Content: "child answer"},
+			}, wantOutput: "child answer", delegated: true,
+		},
+		{name: "missing child fails before model", wantError: "spec not found"},
+		{name: "invalid child fails before model", child: `{bad json`, wantError: "parse agent-config"},
+		{
+			name: "model failure reports failed outcome", child: `{"system_prompt":"CHILD_IDENTITY"}`,
+			modelError: fmt.Errorf("synthetic model failure"), wantError: "synthetic model failure",
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			cwd := t.TempDir()
+			if test.child != "" {
+				childDir := filepath.Join(cwd, ".loom-agents")
+				if err := os.Mkdir(childDir, 0o700); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(filepath.Join(childDir, "worker.json"), []byte(test.child), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			model := &fakeLLM{responses: test.responses}
+			if test.modelError != nil {
+				model.errs = []error{test.modelError}
+			}
+			var out bytes.Buffer
+			spec := &stdlib.AgentSpec{SystemPrompt: "PARENT_IDENTITY", SubAgents: []stdlib.SubAgentRef{{Name: "worker"}}}
+			prompt := promptInput{Instruction: "inspect", Notice: "NOTICE_MARKER", RecalledMemory: []string{"MEMORY_MARKER"}}
+			err := runAgent(context.Background(), runDeps{llm: model, tools: noTools{}, spec: spec, out: NewEmitter(&out)}, prompt, runConfig{cwd: cwd, model: "test"})
+			lines := parseLines(t, &out)
+			if len(lines) < 2 || lines[0]["type"] != "session_init" {
+				t.Fatalf("missing session event: %v", lines)
+			}
+			last := lines[len(lines)-1]
+			if test.wantError != "" {
+				if err == nil || !strings.Contains(err.Error(), test.wantError) || last["type"] != "result" || last["status"] != "failed" || !hasType(lines, "error") {
+					t.Fatalf("failure was not reported: err=%v events=%v", err, lines)
+				}
+				if test.modelError == nil && model.calls != 0 {
+					t.Fatalf("invalid child reached model: calls=%d", model.calls)
+				}
+				return
+			}
+			if err != nil || last["type"] != "result" || last["status"] != "completed" || last["output"] != test.wantOutput {
+				t.Fatalf("incorrect completion: err=%v events=%v", err, lines)
+			}
+			if model.calls != len(test.responses) || len(model.lastMessages) == 0 || model.lastMessages[0].Role != "system" {
+				t.Fatalf("unexpected model execution: calls=%d messages=%v", model.calls, model.lastMessages)
+			}
+			if test.delegated {
+				if !strings.Contains(model.lastMessages[0].Content, "CHILD_IDENTITY") || !hasEvent(lines, "tool_use", "name", delegateToolName) || !hasType(lines, "tool_result") {
+					t.Fatalf("child identity or delegation evidence missing: messages=%v events=%v", model.lastMessages, lines)
+				}
+			} else {
+				for _, marker := range []string{"PARENT_IDENTITY", "NOTICE_MARKER", "MEMORY_MARKER"} {
+					if !strings.Contains(model.lastMessages[0].Content, marker) {
+						t.Fatalf("parent context lost %s", marker)
+					}
+				}
+			}
+		})
 	}
 }
 

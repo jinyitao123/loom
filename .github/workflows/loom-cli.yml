@@ -28,7 +28,7 @@ jobs:
       - name: build
         run: go build ./cmd/loom/
       - name: test -race + coverage
-        run: go test -race -covermode=atomic -coverprofile=cover.out ./cmd/loom/
+        run: go test -race -covermode=atomic "-coverprofile=cover.out" ./cmd/loom/
       - name: coverage gate (>=85%)
         if: runner.os == 'Linux'
         shell: bash
