@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -222,12 +223,14 @@ func TestRunAgentLLMErrorEmitsFailed(t *testing.T) {
 }
 
 func TestResolveMCPPath(t *testing.T) {
+	cwd := t.TempDir()
+	explicit := filepath.Join(cwd, "custom", "mcp.json")
 	// explicit flag wins
-	if got := resolveMCPPath("/custom/mcp.json", "/work"); got != "/custom/mcp.json" {
+	if got := resolveMCPPath(explicit, cwd); got != explicit {
 		t.Fatalf("explicit flag: %q", got)
 	}
 	// default = .loom-mcp.json under cwd
-	if got := resolveMCPPath("", "/work"); got != "/work/.loom-mcp.json" {
+	if got := resolveMCPPath("", cwd); got != filepath.Join(cwd, ".loom-mcp.json") {
 		t.Fatalf("default under cwd: %q", got)
 	}
 	// no cwd → bare default
