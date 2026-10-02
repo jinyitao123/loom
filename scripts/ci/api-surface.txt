@@ -16,6 +16,7 @@ type ToolHook struct{ ... }
 type ToolResult struct{ ... }
 type Usage struct{ ... }
 # stdlib
+const BareToolProtocolCompletionPolicyID = "loom.reject-bare-tool-protocol.v2"
 var ErrCompletionUnverified = errors.New("agent completion was not verified")
 var ErrJournalExecution = errors.New("journaled operation failed")
 var ErrJournalOutcomeUnknown = errors.New("journaled operation outcome is unknown")
@@ -52,6 +53,7 @@ type CompactionPolicy struct{ ... }
 type CompletionCandidate struct{ ... }
 type CompletionDecision struct{ ... }
 type CompletionVerifier interface{ ... }
+    func RejectBareToolProtocolCompletion(next CompletionVerifier) CompletionVerifier
 type CompletionVerifierFunc func(context.Context, CompletionCandidate) (CompletionDecision, error)
 type ContextCompressor interface{ ... }
 type ExecutionJournal interface{ ... }

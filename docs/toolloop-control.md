@@ -49,6 +49,14 @@ When reached through `NewSubGraphStep` or `NewHandoffStep`, a controlled ToolLoo
 
 The host must reject unsupported compositions before execution using its known configuration and capability checks. Graph's opaque Step functions do not provide a proof of the full topology's capabilities. The stdlib entry guard is a local defense, not whole-graph admission.
 
+## Optional final-text protocol check
+
+`RejectBareToolProtocolCompletion(next)` wraps a host `CompletionVerifier` (or `nil`) to reject final text ending with a bare, balanced DSML `calls`/`invoke` block. The block must begin a separate paragraph, either at the start or after a blank line; arbitrary introductory prose is allowed before it. It never decodes that text into executable calls or treats it as a tool result. The normal completion feedback asks the model to use structured tool calls if needed, or answer from evidence already available. No minimum tool-call count is imposed.
+
+This check is opt-in and does not infer intent from the wording of the introduction. Prose mentioning tags, inline or block quotations, fenced examples and indented code remain ordinary text. An explanation followed by a standalone bare trailing protocol block is rejected too: hosts requesting that exact format should leave the policy disabled or request a quoted/fenced example. It is a narrow output-format rule, not a semantic task-quality verifier or a guarantee against every malformed protocol. Incomplete or unbalanced packets and other protocol dialects are outside this policy. JSON schema or other task acceptance rules belong in `next`.
+
+Set `CompletionVerifierID` to `BareToolProtocolCompletionPolicyID` when this is the only verifier. When composing policies, include that ID and a stable identity for the other rules, including their schema, in the host's combined ID. Rejections consume the existing model-round budget and persist with feedback across controlled pauses; only an accepted candidate becomes a `final_response`. Without controlled rounds, exhaustion returns `ErrCompletionUnverified` instead of a successful wrap-up.
+
 ## Hooks and crash recovery
 
 After hooks run before Graph checks yield. Hosts must keep safety checks while skipping completion-only effects for valid controlled pauses. Do not use ordinary `delta + error` to express a controlled pause: the existing Graph error path does not merge that delta.
