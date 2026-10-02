@@ -303,12 +303,31 @@ type recoveryRun struct {
 	journal *sequenceJournal
 	ledger  *effectLedger
 	model   *scriptedModel
+	// Recorded-provider runs use the same crash journal and checkpoint harness.
+	recordedLLM     contract.LLM
+	recordedTools   contract.ToolDispatcher
+	recordedInitial []contract.Message
+	recordedOpts    *stdlib.ToolLoopOpts
 
 	// controlled runs the loop in durable model-round slices: the host's
 	// checkpoint store and the last pause survive a crash, like its database.
 	controlled bool
 	store      loom.Store
 	lastPause  *loom.RunResult
+}
+
+func (run *recoveryRun) adapters() (contract.LLM, contract.ToolDispatcher) {
+	if run.recordedLLM != nil {
+		return run.recordedLLM, run.recordedTools
+	}
+	return run.model, &ledgerTools{ledger: run.ledger}
+}
+
+func (run *recoveryRun) initialMessages() []contract.Message {
+	if run.recordedInitial != nil {
+		return append([]contract.Message(nil), run.recordedInitial...)
+	}
+	return []contract.Message{{Role: "user", Content: "do the work"}}
 }
 
 func newRecoveryRun() *recoveryRun {
@@ -326,11 +345,16 @@ func (run *recoveryRun) attempt(t *testing.T) (string, error) {
 		return run.attemptControlled(t)
 	}
 	run.journal.cursor = 0
-	llm := stdlib.NewJournaledLLM(run.model, run.journal)
-	tools := stdlib.NewJournaledToolDispatcher(&ledgerTools{ledger: run.ledger}, run.journal, stdlib.JournaledToolOpts{SerializeWhenActive: true})
-	step := stdlib.NewToolLoopStep(llm, tools, stdlib.ToolLoopOpts{Model: "m", MaxIterations: 6})
+	innerLLM, innerTools := run.adapters()
+	llm := stdlib.NewJournaledLLM(innerLLM, run.journal)
+	tools := stdlib.NewJournaledToolDispatcher(innerTools, run.journal, stdlib.JournaledToolOpts{SerializeWhenActive: true})
+	opts := stdlib.ToolLoopOpts{Model: "m", MaxIterations: 6}
+	if run.recordedOpts != nil {
+		opts = *run.recordedOpts
+	}
+	step := stdlib.NewToolLoopStep(llm, tools, opts)
 	ctx := context.WithValue(context.Background(), recoveryCtxKey{}, true)
-	delta, err := step(ctx, loom.State{"messages": []contract.Message{{Role: "user", Content: "do the work"}}})
+	delta, err := step(ctx, loom.State{"messages": run.initialMessages()})
 	if err != nil {
 		return "", err
 	}
@@ -498,25 +522,34 @@ func TestRecoveryHistoryValidatorRejectsBrokenTranscripts(t *testing.T) {
 func (run *recoveryRun) attemptControlled(t *testing.T) (string, error) {
 	t.Helper()
 	run.journal.beginSegment("")
-	llm := stdlib.NewJournaledLLM(run.model, run.journal)
-	tools := stdlib.NewJournaledToolDispatcher(&ledgerTools{ledger: run.ledger}, run.journal, stdlib.JournaledToolOpts{SerializeWhenActive: true})
+	innerLLM, innerTools := run.adapters()
+	llm := stdlib.NewJournaledLLM(innerLLM, run.journal)
+	tools := stdlib.NewJournaledToolDispatcher(innerTools, run.journal, stdlib.JournaledToolOpts{SerializeWhenActive: true})
 	graph := loom.NewGraph("recovery-controlled", "chat", loom.WithCheckpointPolicy(loom.CheckpointRequired))
 	graph.SetHooks(loom.HookPoints{Before: []loom.StepHook{func(_ context.Context, _ string, state loom.State) error {
-		// The last saved checkpoint sequence names the slice, so a re-attempt of
-		// the same slice finds the same journal segment.
-		run.journal.beginSegment(fmt.Sprint(state["__seq"]))
+		// Failed attempts may append an error checkpoint. Journal identity
+		// belongs to the frozen slice entry, not that newer error sequence.
+		segment := "entry-0"
+		if run.lastPause != nil {
+			segment = fmt.Sprint(run.lastPause.State["__checkpoint_seq"])
+		}
+		run.journal.beginSegment(segment)
 		return nil
 	}}})
-	graph.AddStep("chat", stdlib.NewToolLoopStep(llm, tools, stdlib.ToolLoopOpts{
+	opts := stdlib.ToolLoopOpts{
 		Model: "m", MaxIterations: 2,
 		Control: &stdlib.ToolLoopControl{ID: "chat", InitialTotalRounds: 2},
-	}), loom.End())
+	}
+	if run.recordedOpts != nil {
+		opts = *run.recordedOpts
+	}
+	graph.AddStep("chat", stdlib.NewToolLoopStep(llm, tools, opts), loom.End())
 	ctx := context.WithValue(context.Background(), recoveryCtxKey{}, true)
 	for slices := 0; slices < 4; slices++ {
 		var result *loom.RunResult
 		var err error
 		if run.lastPause == nil {
-			result, err = graph.Run(ctx, loom.State{"__run_id": "run-1", "messages": []contract.Message{{Role: "user", Content: "do the work"}}}, run.store)
+			result, err = graph.Run(ctx, loom.State{"__run_id": "run-1", "messages": run.initialMessages()}, run.store)
 		} else {
 			outcome, _, readErr := stdlib.ReadToolLoopOutcome(run.lastPause.State)
 			if readErr != nil {

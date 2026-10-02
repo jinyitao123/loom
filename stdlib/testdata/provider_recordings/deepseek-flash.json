@@ -1,0 +1,911 @@
+{
+  "version": 1,
+  "provider": "deepseek",
+  "requested_model": "deepseek-flash",
+  "captured_at": "2026-10-02T00:13:57.133301+00:00",
+  "endpoint": "https://api.deepseek.com/v1/chat/completions",
+  "synthetic_only": true,
+  "profile": "existing_nonthinking_tools",
+  "redacted_fields": [
+    "reasoning_content"
+  ],
+  "initial_messages": [
+    {
+      "role": "system",
+      "content": "This is a synthetic protocol test. First call lookup_value for alpha and beta together in one assistant tool_calls batch. After both tool results, call sum_values once with values [2,3]. After that result answer exactly DONE:5. Do not invent results or call any other tool."
+    },
+    {
+      "role": "user",
+      "content": "Look up the two synthetic values, then add them using the tools."
+    }
+  ],
+  "tools": [
+    {
+      "type": "function",
+      "function": {
+        "name": "lookup_value",
+        "description": "Read a synthetic alpha or beta value.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "label": {
+              "type": "string",
+              "enum": [
+                "alpha",
+                "beta"
+              ]
+            }
+          },
+          "required": [
+            "label"
+          ],
+          "additionalProperties": false
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "sum_values",
+        "description": "Add the two previously read synthetic values.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "values": {
+              "type": "array",
+              "items": {
+                "type": "integer"
+              }
+            }
+          },
+          "required": [
+            "values"
+          ],
+          "additionalProperties": false
+        }
+      }
+    }
+  ],
+  "turns": [
+    {
+      "status": 200,
+      "request": {
+        "model": "deepseek-flash",
+        "messages": [
+          {
+            "role": "system",
+            "content": "This is a synthetic protocol test. First call lookup_value for alpha and beta together in one assistant tool_calls batch. After both tool results, call sum_values once with values [2,3]. After that result answer exactly DONE:5. Do not invent results or call any other tool."
+          },
+          {
+            "role": "user",
+            "content": "Look up the two synthetic values, then add them using the tools."
+          }
+        ],
+        "tools": [
+          {
+            "type": "function",
+            "function": {
+              "name": "lookup_value",
+              "description": "Read a synthetic alpha or beta value.",
+              "parameters": {
+                "type": "object",
+                "properties": {
+                  "label": {
+                    "type": "string",
+                    "enum": [
+                      "alpha",
+                      "beta"
+                    ]
+                  }
+                },
+                "required": [
+                  "label"
+                ],
+                "additionalProperties": false
+              }
+            }
+          },
+          {
+            "type": "function",
+            "function": {
+              "name": "sum_values",
+              "description": "Add the two previously read synthetic values.",
+              "parameters": {
+                "type": "object",
+                "properties": {
+                  "values": {
+                    "type": "array",
+                    "items": {
+                      "type": "integer"
+                    }
+                  }
+                },
+                "required": [
+                  "values"
+                ],
+                "additionalProperties": false
+              }
+            }
+          }
+        ],
+        "max_tokens": 512,
+        "thinking": {
+          "type": "disabled"
+        },
+        "reasoning_effort": "none"
+      },
+      "response": {
+        "id": "bba5b44d-98f8-4491-b1c1-12016d340136",
+        "object": "chat.completion",
+        "created": 1790900033,
+        "model": "deepseek-flash",
+        "choices": [
+          {
+            "index": 0,
+            "message": {
+              "role": "assistant",
+              "content": "I'll look up both values in a single batch.",
+              "tool_calls": [
+                {
+                  "index": 0,
+                  "id": "call_00_3x7Vj0zIxnGfwHsk3Qze1562",
+                  "type": "function",
+                  "function": {
+                    "name": "lookup_value",
+                    "arguments": "{\"label\": \"alpha\"}"
+                  }
+                },
+                {
+                  "index": 1,
+                  "id": "call_01_e1MdMPA4MvVloQXs2UQt5730",
+                  "type": "function",
+                  "function": {
+                    "name": "lookup_value",
+                    "arguments": "{\"label\": \"beta\"}"
+                  }
+                }
+              ]
+            },
+            "logprobs": null,
+            "finish_reason": "tool_calls"
+          }
+        ],
+        "usage": {
+          "prompt_tokens": 417,
+          "completion_tokens": 77,
+          "total_tokens": 494,
+          "prompt_tokens_details": {
+            "cached_tokens": 256
+          },
+          "prompt_cache_hit_tokens": 256,
+          "prompt_cache_miss_tokens": 161
+        },
+        "system_fingerprint": "aeb56401ca74e127821c4f9126dcb669"
+      },
+      "raw_request_sha256": "17a2e135f6f99ad209f85c6e01c77c48b42482d6a35ecda9e7be3479322ab67d",
+      "raw_response_sha256": "66c3e37fc521d6460d90858ee4314e2762f52185f40f5027c61be82953821df9"
+    },
+    {
+      "status": 200,
+      "request": {
+        "model": "deepseek-flash",
+        "messages": [
+          {
+            "role": "system",
+            "content": "This is a synthetic protocol test. First call lookup_value for alpha and beta together in one assistant tool_calls batch. After both tool results, call sum_values once with values [2,3]. After that result answer exactly DONE:5. Do not invent results or call any other tool."
+          },
+          {
+            "role": "user",
+            "content": "Look up the two synthetic values, then add them using the tools."
+          },
+          {
+            "role": "assistant",
+            "content": "I'll look up both values in a single batch.",
+            "tool_calls": [
+              {
+                "index": 0,
+                "id": "call_00_3x7Vj0zIxnGfwHsk3Qze1562",
+                "type": "function",
+                "function": {
+                  "name": "lookup_value",
+                  "arguments": "{\"label\": \"alpha\"}"
+                }
+              },
+              {
+                "index": 1,
+                "id": "call_01_e1MdMPA4MvVloQXs2UQt5730",
+                "type": "function",
+                "function": {
+                  "name": "lookup_value",
+                  "arguments": "{\"label\": \"beta\"}"
+                }
+              }
+            ]
+          },
+          {
+            "role": "tool",
+            "tool_call_id": "call_00_3x7Vj0zIxnGfwHsk3Qze1562",
+            "content": "{\"label\":\"alpha\",\"value\":2}"
+          },
+          {
+            "role": "tool",
+            "tool_call_id": "call_01_e1MdMPA4MvVloQXs2UQt5730",
+            "content": "{\"label\":\"beta\",\"value\":3}"
+          }
+        ],
+        "tools": [
+          {
+            "type": "function",
+            "function": {
+              "name": "lookup_value",
+              "description": "Read a synthetic alpha or beta value.",
+              "parameters": {
+                "type": "object",
+                "properties": {
+                  "label": {
+                    "type": "string",
+                    "enum": [
+                      "alpha",
+                      "beta"
+                    ]
+                  }
+                },
+                "required": [
+                  "label"
+                ],
+                "additionalProperties": false
+              }
+            }
+          },
+          {
+            "type": "function",
+            "function": {
+              "name": "sum_values",
+              "description": "Add the two previously read synthetic values.",
+              "parameters": {
+                "type": "object",
+                "properties": {
+                  "values": {
+                    "type": "array",
+                    "items": {
+                      "type": "integer"
+                    }
+                  }
+                },
+                "required": [
+                  "values"
+                ],
+                "additionalProperties": false
+              }
+            }
+          }
+        ],
+        "max_tokens": 512,
+        "thinking": {
+          "type": "disabled"
+        },
+        "reasoning_effort": "none"
+      },
+      "response": {
+        "id": "5198e4f5-2e67-4f64-bd56-67af4f81cfa5",
+        "object": "chat.completion",
+        "created": 1790900033,
+        "model": "deepseek-flash",
+        "choices": [
+          {
+            "index": 0,
+            "message": {
+              "role": "assistant",
+              "content": "Both values retrieved. Now summing them.",
+              "tool_calls": [
+                {
+                  "index": 0,
+                  "id": "call_00_775VymTO43KYSKdi9kxh6057",
+                  "type": "function",
+                  "function": {
+                    "name": "sum_values",
+                    "arguments": "{\"values\": [2, 3]}"
+                  }
+                }
+              ]
+            },
+            "logprobs": null,
+            "finish_reason": "tool_calls"
+          }
+        ],
+        "usage": {
+          "prompt_tokens": 530,
+          "completion_tokens": 49,
+          "total_tokens": 579,
+          "prompt_tokens_details": {
+            "cached_tokens": 384
+          },
+          "prompt_cache_hit_tokens": 384,
+          "prompt_cache_miss_tokens": 146
+        },
+        "system_fingerprint": "aeb56401ca74e127821c4f9126dcb669"
+      },
+      "raw_request_sha256": "584fc00e3d45f27a9c5d9762b8defe5cebbd237a458443029576024bc5d7cc5d",
+      "raw_response_sha256": "8fdbee7a25652fdedec73ebf6d9dae99eb73faa8e77bda691bcf0cb661f6ba12"
+    },
+    {
+      "status": 200,
+      "request": {
+        "model": "deepseek-flash",
+        "messages": [
+          {
+            "role": "system",
+            "content": "This is a synthetic protocol test. First call lookup_value for alpha and beta together in one assistant tool_calls batch. After both tool results, call sum_values once with values [2,3]. After that result answer exactly DONE:5. Do not invent results or call any other tool."
+          },
+          {
+            "role": "user",
+            "content": "Look up the two synthetic values, then add them using the tools."
+          },
+          {
+            "role": "assistant",
+            "content": "I'll look up both values in a single batch.",
+            "tool_calls": [
+              {
+                "index": 0,
+                "id": "call_00_3x7Vj0zIxnGfwHsk3Qze1562",
+                "type": "function",
+                "function": {
+                  "name": "lookup_value",
+                  "arguments": "{\"label\": \"alpha\"}"
+                }
+              },
+              {
+                "index": 1,
+                "id": "call_01_e1MdMPA4MvVloQXs2UQt5730",
+                "type": "function",
+                "function": {
+                  "name": "lookup_value",
+                  "arguments": "{\"label\": \"beta\"}"
+                }
+              }
+            ]
+          },
+          {
+            "role": "tool",
+            "tool_call_id": "call_00_3x7Vj0zIxnGfwHsk3Qze1562",
+            "content": "{\"label\":\"alpha\",\"value\":2}"
+          },
+          {
+            "role": "tool",
+            "tool_call_id": "call_01_e1MdMPA4MvVloQXs2UQt5730",
+            "content": "{\"label\":\"beta\",\"value\":3}"
+          },
+          {
+            "role": "assistant",
+            "content": "Both values retrieved. Now summing them.",
+            "tool_calls": [
+              {
+                "index": 0,
+                "id": "call_00_775VymTO43KYSKdi9kxh6057",
+                "type": "function",
+                "function": {
+                  "name": "sum_values",
+                  "arguments": "{\"values\": [2, 3]}"
+                }
+              }
+            ]
+          },
+          {
+            "role": "tool",
+            "tool_call_id": "call_00_775VymTO43KYSKdi9kxh6057",
+            "content": "{\"sum\":5}"
+          }
+        ],
+        "tools": [
+          {
+            "type": "function",
+            "function": {
+              "name": "lookup_value",
+              "description": "Read a synthetic alpha or beta value.",
+              "parameters": {
+                "type": "object",
+                "properties": {
+                  "label": {
+                    "type": "string",
+                    "enum": [
+                      "alpha",
+                      "beta"
+                    ]
+                  }
+                },
+                "required": [
+                  "label"
+                ],
+                "additionalProperties": false
+              }
+            }
+          },
+          {
+            "type": "function",
+            "function": {
+              "name": "sum_values",
+              "description": "Add the two previously read synthetic values.",
+              "parameters": {
+                "type": "object",
+                "properties": {
+                  "values": {
+                    "type": "array",
+                    "items": {
+                      "type": "integer"
+                    }
+                  }
+                },
+                "required": [
+                  "values"
+                ],
+                "additionalProperties": false
+              }
+            }
+          }
+        ],
+        "max_tokens": 512,
+        "thinking": {
+          "type": "disabled"
+        },
+        "reasoning_effort": "none"
+      },
+      "response": {
+        "id": "16920e29-2cb3-4fae-b9f4-f5fffb0ce919",
+        "object": "chat.completion",
+        "created": 1790900034,
+        "model": "deepseek-flash",
+        "choices": [
+          {
+            "index": 0,
+            "message": {
+              "role": "assistant",
+              "content": "DONE:5"
+            },
+            "logprobs": null,
+            "finish_reason": "stop"
+          }
+        ],
+        "usage": {
+          "prompt_tokens": 595,
+          "completion_tokens": 4,
+          "total_tokens": 599,
+          "prompt_tokens_details": {
+            "cached_tokens": 384
+          },
+          "prompt_cache_hit_tokens": 384,
+          "prompt_cache_miss_tokens": 211
+        },
+        "system_fingerprint": "aeb56401ca74e127821c4f9126dcb669"
+      },
+      "raw_request_sha256": "fe4b1c9f7ffef41c9a558b4069916b43a0136efe931c5da4a60340f255ba6878",
+      "raw_response_sha256": "72e427a9ea1a419aeb6e636874b31bf70deacc8ae5afd77c652ab5b9cc4cd51e"
+    }
+  ],
+  "thinking_probe": {
+    "first": {
+      "status": 200,
+      "request": {
+        "model": "deepseek-flash",
+        "messages": [
+          {
+            "role": "system",
+            "content": "This is a synthetic protocol test. First call lookup_value for alpha and beta together in one assistant tool_calls batch. After both tool results, call sum_values once with values [2,3]. After that result answer exactly DONE:5. Do not invent results or call any other tool."
+          },
+          {
+            "role": "user",
+            "content": "Look up the two synthetic values, then add them using the tools."
+          }
+        ],
+        "tools": [
+          {
+            "type": "function",
+            "function": {
+              "name": "lookup_value",
+              "description": "Read a synthetic alpha or beta value.",
+              "parameters": {
+                "type": "object",
+                "properties": {
+                  "label": {
+                    "type": "string",
+                    "enum": [
+                      "alpha",
+                      "beta"
+                    ]
+                  }
+                },
+                "required": [
+                  "label"
+                ],
+                "additionalProperties": false
+              }
+            }
+          },
+          {
+            "type": "function",
+            "function": {
+              "name": "sum_values",
+              "description": "Add the two previously read synthetic values.",
+              "parameters": {
+                "type": "object",
+                "properties": {
+                  "values": {
+                    "type": "array",
+                    "items": {
+                      "type": "integer"
+                    }
+                  }
+                },
+                "required": [
+                  "values"
+                ],
+                "additionalProperties": false
+              }
+            }
+          }
+        ],
+        "max_tokens": 1024,
+        "thinking": {
+          "type": "enabled"
+        },
+        "reasoning_effort": "high"
+      },
+      "response": {
+        "id": "b6d4604c-e588-46e0-80bf-185528df0c17",
+        "object": "chat.completion",
+        "created": 1790900034,
+        "model": "deepseek-flash",
+        "choices": [
+          {
+            "index": 0,
+            "message": {
+              "role": "assistant",
+              "content": "",
+              "reasoning_content": "[provider continuation redacted]",
+              "recording_reasoning_sha256": "aad525c40c973fc0fc87330f494c5961b5649a47024d7a6e768b94c25b44e246",
+              "recording_reasoning_bytes": 393,
+              "tool_calls": [
+                {
+                  "index": 0,
+                  "id": "call_00_Glds711JX8AuhuPw6isL8768",
+                  "type": "function",
+                  "function": {
+                    "name": "lookup_value",
+                    "arguments": "{\"label\": \"alpha\"}"
+                  }
+                },
+                {
+                  "index": 1,
+                  "id": "call_01_YPJAyhD5RGsYa8mvtb0G9868",
+                  "type": "function",
+                  "function": {
+                    "name": "lookup_value",
+                    "arguments": "{\"label\": \"beta\"}"
+                  }
+                }
+              ]
+            },
+            "logprobs": null,
+            "finish_reason": "tool_calls"
+          }
+        ],
+        "usage": {
+          "prompt_tokens": 442,
+          "completion_tokens": 155,
+          "total_tokens": 597,
+          "prompt_tokens_details": {
+            "cached_tokens": 256
+          },
+          "completion_tokens_details": {
+            "reasoning_tokens": 87
+          },
+          "prompt_cache_hit_tokens": 256,
+          "prompt_cache_miss_tokens": 186
+        },
+        "system_fingerprint": "aeb56401ca74e127821c4f9126dcb669"
+      },
+      "raw_request_sha256": "b08cda2b8927dfaee39a2ef22432e6655b84a67e2ea40194fd89519ee1df45ca",
+      "raw_response_sha256": "6f51c1cce00257e786f022b5db870ee556cbb68f2c0e1b97d3a79cf20f42ac43"
+    },
+    "preserved": {
+      "status": 200,
+      "request": {
+        "model": "deepseek-flash",
+        "messages": [
+          {
+            "role": "system",
+            "content": "This is a synthetic protocol test. First call lookup_value for alpha and beta together in one assistant tool_calls batch. After both tool results, call sum_values once with values [2,3]. After that result answer exactly DONE:5. Do not invent results or call any other tool."
+          },
+          {
+            "role": "user",
+            "content": "Look up the two synthetic values, then add them using the tools."
+          },
+          {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+              {
+                "index": 0,
+                "id": "call_00_Glds711JX8AuhuPw6isL8768",
+                "type": "function",
+                "function": {
+                  "name": "lookup_value",
+                  "arguments": "{\"label\": \"alpha\"}"
+                }
+              },
+              {
+                "index": 1,
+                "id": "call_01_YPJAyhD5RGsYa8mvtb0G9868",
+                "type": "function",
+                "function": {
+                  "name": "lookup_value",
+                  "arguments": "{\"label\": \"beta\"}"
+                }
+              }
+            ],
+            "reasoning_content": "[provider continuation redacted]",
+            "recording_reasoning_sha256": "aad525c40c973fc0fc87330f494c5961b5649a47024d7a6e768b94c25b44e246",
+            "recording_reasoning_bytes": 393
+          },
+          {
+            "role": "tool",
+            "tool_call_id": "call_00_Glds711JX8AuhuPw6isL8768",
+            "content": "{\"label\":\"alpha\",\"value\":2}"
+          },
+          {
+            "role": "tool",
+            "tool_call_id": "call_01_YPJAyhD5RGsYa8mvtb0G9868",
+            "content": "{\"label\":\"beta\",\"value\":3}"
+          }
+        ],
+        "tools": [
+          {
+            "type": "function",
+            "function": {
+              "name": "lookup_value",
+              "description": "Read a synthetic alpha or beta value.",
+              "parameters": {
+                "type": "object",
+                "properties": {
+                  "label": {
+                    "type": "string",
+                    "enum": [
+                      "alpha",
+                      "beta"
+                    ]
+                  }
+                },
+                "required": [
+                  "label"
+                ],
+                "additionalProperties": false
+              }
+            }
+          },
+          {
+            "type": "function",
+            "function": {
+              "name": "sum_values",
+              "description": "Add the two previously read synthetic values.",
+              "parameters": {
+                "type": "object",
+                "properties": {
+                  "values": {
+                    "type": "array",
+                    "items": {
+                      "type": "integer"
+                    }
+                  }
+                },
+                "required": [
+                  "values"
+                ],
+                "additionalProperties": false
+              }
+            }
+          }
+        ],
+        "max_tokens": 1024,
+        "thinking": {
+          "type": "enabled"
+        },
+        "reasoning_effort": "high"
+      },
+      "response": {
+        "id": "979759c0-c29d-48d6-a2f6-28ecc60b24ab",
+        "object": "chat.completion",
+        "created": 1790900035,
+        "model": "deepseek-flash",
+        "choices": [
+          {
+            "index": 0,
+            "message": {
+              "role": "assistant",
+              "content": "",
+              "reasoning_content": "[provider continuation redacted]",
+              "recording_reasoning_sha256": "52a431c28b703409c84bcf7ee7f13d7cf025c8115efcd289fecc085039d0762d",
+              "recording_reasoning_bytes": 71,
+              "tool_calls": [
+                {
+                  "index": 0,
+                  "id": "call_00_jsRJt3IMRcbTAReUbF4y8369",
+                  "type": "function",
+                  "function": {
+                    "name": "sum_values",
+                    "arguments": "{\"values\": [2, 3]}"
+                  }
+                }
+              ]
+            },
+            "logprobs": null,
+            "finish_reason": "tool_calls"
+          }
+        ],
+        "usage": {
+          "prompt_tokens": 633,
+          "completion_tokens": 63,
+          "total_tokens": 696,
+          "prompt_tokens_details": {
+            "cached_tokens": 384
+          },
+          "completion_tokens_details": {
+            "reasoning_tokens": 20
+          },
+          "prompt_cache_hit_tokens": 384,
+          "prompt_cache_miss_tokens": 249
+        },
+        "system_fingerprint": "aeb56401ca74e127821c4f9126dcb669"
+      },
+      "raw_request_sha256": "4a360a73e2e6975bd9610bdbda1b4c4a7be8cd1c429474d48b0589d34b7ef483",
+      "raw_response_sha256": "2e9bd4ec8e17e5ab21eaaf2238e85e291e6563e9d826803eebb97a0f17547db7"
+    },
+    "omitted": {
+      "status": 200,
+      "request": {
+        "model": "deepseek-flash",
+        "messages": [
+          {
+            "role": "system",
+            "content": "This is a synthetic protocol test. First call lookup_value for alpha and beta together in one assistant tool_calls batch. After both tool results, call sum_values once with values [2,3]. After that result answer exactly DONE:5. Do not invent results or call any other tool."
+          },
+          {
+            "role": "user",
+            "content": "Look up the two synthetic values, then add them using the tools."
+          },
+          {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+              {
+                "index": 0,
+                "id": "call_00_Glds711JX8AuhuPw6isL8768",
+                "type": "function",
+                "function": {
+                  "name": "lookup_value",
+                  "arguments": "{\"label\": \"alpha\"}"
+                }
+              },
+              {
+                "index": 1,
+                "id": "call_01_YPJAyhD5RGsYa8mvtb0G9868",
+                "type": "function",
+                "function": {
+                  "name": "lookup_value",
+                  "arguments": "{\"label\": \"beta\"}"
+                }
+              }
+            ]
+          },
+          {
+            "role": "tool",
+            "tool_call_id": "call_00_Glds711JX8AuhuPw6isL8768",
+            "content": "{\"label\":\"alpha\",\"value\":2}"
+          },
+          {
+            "role": "tool",
+            "tool_call_id": "call_01_YPJAyhD5RGsYa8mvtb0G9868",
+            "content": "{\"label\":\"beta\",\"value\":3}"
+          }
+        ],
+        "tools": [
+          {
+            "type": "function",
+            "function": {
+              "name": "lookup_value",
+              "description": "Read a synthetic alpha or beta value.",
+              "parameters": {
+                "type": "object",
+                "properties": {
+                  "label": {
+                    "type": "string",
+                    "enum": [
+                      "alpha",
+                      "beta"
+                    ]
+                  }
+                },
+                "required": [
+                  "label"
+                ],
+                "additionalProperties": false
+              }
+            }
+          },
+          {
+            "type": "function",
+            "function": {
+              "name": "sum_values",
+              "description": "Add the two previously read synthetic values.",
+              "parameters": {
+                "type": "object",
+                "properties": {
+                  "values": {
+                    "type": "array",
+                    "items": {
+                      "type": "integer"
+                    }
+                  }
+                },
+                "required": [
+                  "values"
+                ],
+                "additionalProperties": false
+              }
+            }
+          }
+        ],
+        "max_tokens": 1024,
+        "thinking": {
+          "type": "enabled"
+        },
+        "reasoning_effort": "high"
+      },
+      "response": {
+        "id": "ec09d492-c3d9-45d1-8adf-f49eb059e9cd",
+        "object": "chat.completion",
+        "created": 1790900036,
+        "model": "deepseek-flash",
+        "choices": [
+          {
+            "index": 0,
+            "message": {
+              "role": "assistant",
+              "content": "",
+              "reasoning_content": "[provider continuation redacted]",
+              "recording_reasoning_sha256": "e6f34b1009e88c3cdf968cb311794473029b6f27b7849fdea43570f8c64fa40f",
+              "recording_reasoning_bytes": 100,
+              "tool_calls": [
+                {
+                  "index": 0,
+                  "id": "call_00_KAqLk8Y8Z42SW3nV9VqJ4115",
+                  "type": "function",
+                  "function": {
+                    "name": "sum_values",
+                    "arguments": "{\"values\": [2, 3]}"
+                  }
+                }
+              ]
+            },
+            "logprobs": null,
+            "finish_reason": "tool_calls"
+          }
+        ],
+        "usage": {
+          "prompt_tokens": 633,
+          "completion_tokens": 69,
+          "total_tokens": 702,
+          "prompt_tokens_details": {
+            "cached_tokens": 384
+          },
+          "completion_tokens_details": {
+            "reasoning_tokens": 26
+          },
+          "prompt_cache_hit_tokens": 384,
+          "prompt_cache_miss_tokens": 249
+        },
+        "system_fingerprint": "aeb56401ca74e127821c4f9126dcb669"
+      },
+      "raw_request_sha256": "3e1c80c337596dc0dc273c50155d6e8139dc6683cbb4ad04d0fce8cf423b5985",
+      "raw_response_sha256": "923b42780e1a3ac20499f1dc97095a85623e0a0d873bdce825fd3dba5d2b152e"
+    }
+  }
+}
