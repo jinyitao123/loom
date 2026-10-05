@@ -2,6 +2,7 @@ package stdlib
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -48,13 +49,57 @@ type toolLoopCompletionRejection struct {
 	Reason string `json:"reason"`
 }
 
-const maxCompletionRejectionReasonBytes = 256
+const (
+	maxCompletionRejectionReasonBytes = 256
+	// maxCompletionRejections bounds the rejection history kept for verifiers;
+	// beyond it the oldest reasons are dropped.
+	maxCompletionRejections = 64
+)
+
+func boundedRejectionReason(reason string) string {
+	if len(reason) > maxCompletionRejectionReasonBytes {
+		reason = strings.ToValidUTF8(reason[:maxCompletionRejectionReasonBytes], "")
+	}
+	return reason
+}
 
 func newCompletionRejection(reason string) *toolLoopCompletionRejection {
-	if len(reason) > maxCompletionRejectionReasonBytes {
-		reason = reason[:maxCompletionRejectionReasonBytes]
+	return &toolLoopCompletionRejection{Reason: boundedRejectionReason(reason)}
+}
+
+// appendCompletionRejection records one rejected candidate's Reason (possibly
+// empty) for later verifiers, keeping the most recent bounded history.
+func appendCompletionRejection(history []string, reason string) []string {
+	history = append(append([]string(nil), history...), boundedRejectionReason(reason))
+	if len(history) > maxCompletionRejections {
+		history = history[len(history)-maxCompletionRejections:]
 	}
-	return &toolLoopCompletionRejection{Reason: reason}
+	return history
+}
+
+// decodeCompletionRejections restores the legacy loop's private history after
+// checkpoint JSON round-tripping. Absent means no rejection was recorded.
+func decodeCompletionRejections(raw any) ([]string, error) {
+	if raw == nil {
+		return nil, nil
+	}
+	if history, ok := raw.([]string); ok {
+		return history, nil
+	}
+	data, err := json.Marshal(raw)
+	if err != nil {
+		return nil, fmt.Errorf("loom/toolloop: encode __toolloop_rejections: %w", err)
+	}
+	var history []string
+	if err := json.Unmarshal(data, &history); err != nil || len(history) > maxCompletionRejections {
+		return nil, fmt.Errorf("loom/toolloop: invalid __toolloop_rejections")
+	}
+	for _, reason := range history {
+		if len(reason) > maxCompletionRejectionReasonBytes {
+			return nil, fmt.Errorf("loom/toolloop: invalid __toolloop_rejections")
+		}
+	}
+	return history, nil
 }
 
 // chooseRoundTool asks the optional policy for this round and validates the

@@ -63,6 +63,8 @@ Set `CompletionVerifierID` to `BareToolProtocolCompletionPolicyID` when this is 
 
 `ToolLoopOpts.ToolChoicePolicy` lets a host choose that constraint before each model round. The policy receives the offered tools and whether the previous round's completion candidate was rejected, with the verifier's optional machine-readable `CompletionDecision.Reason`. The reason never enters the transcript; the rejection marker lasts for exactly one round and persists across controlled pauses. A response that contradicts the chosen constraint (text after `required` or `tool`, another tool after `tool`, a call after `none`) stops the loop with `ErrToolChoiceNotHonored` before any of its calls are dispatched or verified. Controlled loops require a stable `ToolChoicePolicyID`, which joins the continuation policy hash only when a policy is configured, so existing paused snapshots keep their identity.
 
+Each `CompletionCandidate` also carries `PriorRejections`: the `Reason` of every earlier rejected candidate in the same loop, oldest first (empty reasons included, the most recent 64 kept). It lives outside the transcript, persists in the controlled snapshot and in a legacy park snapshot (only once a rejection exists, so other snapshots are unchanged), is unaffected by compaction, and is rebuilt identically when a journal replays the same responses. Hosts can therefore apply once-per-loop rules without matching feedback text.
+
 Loom does not decide which actions are mandatory or when a constraint is safe; a host should force a tool only when its own facts show the action is still missing, and should never force calls merely to obtain missing inputs. The budget-exhaustion wrap-up request offers no tools and never carries a choice.
 
 ## Hooks and crash recovery

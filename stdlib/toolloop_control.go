@@ -82,6 +82,9 @@ type toolLoopControlState struct {
 	// the next model round, so a pause at that boundary keeps the tool choice.
 	// It is omitted otherwise, leaving snapshots of loops without it unchanged.
 	LastCompletionRejection *toolLoopCompletionRejection `json:"last_completion_rejection,omitempty"`
+	// CompletionRejections is the bounded rejection history given to verifiers
+	// as CompletionCandidate.PriorRejections; omitted while empty.
+	CompletionRejections []string `json:"completion_rejections,omitempty"`
 }
 
 var controlSnapshotKeys = []string{
@@ -214,6 +217,14 @@ func readToolLoopControl(state loom.State) (toolLoopControlState, bool, error) {
 	if rejection := control.LastCompletionRejection; rejection != nil &&
 		(control.Phase == "complete" || len(rejection.Reason) > maxCompletionRejectionReasonBytes) {
 		return invalid()
+	}
+	if len(control.CompletionRejections) > maxCompletionRejections {
+		return invalid()
+	}
+	for _, reason := range control.CompletionRejections {
+		if len(reason) > maxCompletionRejectionReasonBytes {
+			return invalid()
+		}
 	}
 	var pending []toolLoopPendingCall
 	var msgs []contract.Message

@@ -46,6 +46,11 @@ type CompletionCandidate struct {
 	Content    string
 	Transcript []contract.Message
 	TotalUsage contract.Usage
+	// PriorRejections lists the Reason of each earlier rejected candidate in this
+	// loop, oldest first and including empty reasons, bounded to the most recent
+	// entries. It is kept outside the transcript, survives pauses and compaction,
+	// and is rebuilt identically when a journal replays the same responses.
+	PriorRejections []string
 }
 
 // CompletionDecision accepts a candidate or returns actionable feedback for
@@ -149,6 +154,21 @@ func NewToolLoopStep(llm contract.LLM, tools contract.ToolDispatcher, opts ToolL
 			return nil, err
 		}
 		resumedFromPark := len(pending) > 0
+		// Rejection history is private loop state, written only after a rejection,
+		// so loops without one keep their exact state deltas.
+		var priorRejections []string
+		if resumedFromPark {
+			if priorRejections, err = decodeCompletionRejections(state["__toolloop_rejections"]); err != nil {
+				return nil, err
+			}
+		}
+		finish := func(content string, usage contract.Usage, patch loom.State) loom.State {
+			result := finishToolLoop(content, usage, resumedFromPark, patch)
+			if state["__toolloop_rejections"] != nil {
+				result["__toolloop_rejections"] = nil
+			}
+			return result
+		}
 		stagedPatch := make(loom.State)
 		stagedState := make(loom.State, len(state))
 		for key, value := range state {
@@ -197,7 +217,7 @@ func NewToolLoopStep(llm contract.LLM, tools contract.ToolDispatcher, opts ToolL
 			}
 
 			if len(remaining) > 0 {
-				return loom.State{
+				return withCompletionRejections(loom.State{
 					"__yield":                 true,
 					"__yield_phase":           "mid_step",
 					"yield_type":              "await_approval",
@@ -206,10 +226,10 @@ func NewToolLoopStep(llm contract.LLM, tools contract.ToolDispatcher, opts ToolL
 					"__resumed_tool_results":  nil,
 					"__toolloop_staged_patch": stagedPatchResults,
 					"__toolloop_usage":        accumulatedUsage,
-				}, nil
+				}, priorRejections), nil
 			}
 			if hasStopLoopResult(stagedPatchResults) {
-				return finishToolLoop(lastAssistantContent(msgs), accumulatedUsage, true, stagedPatch), nil
+				return finish(lastAssistantContent(msgs), accumulatedUsage, stagedPatch), nil
 			}
 
 			// Resume invariant: after the assistant tool_calls message, every call_id has exactly one real
@@ -321,12 +341,13 @@ func NewToolLoopStep(llm contract.LLM, tools contract.ToolDispatcher, opts ToolL
 
 			// 模型没有再请求工具 ⇒ 任务在本轮完成，把文本答案与用量写入输出状态，正常收官。
 			if len(resp.ToolCalls) == 0 {
-				accepted, continued, reason, err := verifyToolLoopCompletion(ctx, opts, msgs, resp, accumulatedUsage)
+				accepted, continued, reason, err := verifyToolLoopCompletion(ctx, opts, msgs, resp, accumulatedUsage, priorRejections)
 				if err != nil {
 					return loom.State{"__error": err.Error()}, err
 				}
 				if !accepted {
 					completionRejection = newCompletionRejection(reason)
+					priorRejections = appendCompletionRejection(priorRejections, reason)
 					msgs = continued
 					continue
 				}
@@ -334,7 +355,7 @@ func NewToolLoopStep(llm contract.LLM, tools contract.ToolDispatcher, opts ToolL
 				if opts.CompletionVerifier != nil {
 					usage = accumulatedUsage
 				}
-				return finishToolLoop(resp.Content, usage, resumedFromPark, stagedPatch), nil
+				return finish(resp.Content, usage, stagedPatch), nil
 			}
 
 			// Cycle detection: hash current tool call batch and compare to previous.
@@ -351,7 +372,7 @@ func NewToolLoopStep(llm contract.LLM, tools contract.ToolDispatcher, opts ToolL
 						err := fmt.Errorf("%w: repeated actions reached the hard stop", ErrCompletionUnverified)
 						return loom.State{"__error": err.Error()}, err
 					}
-					return finishToolLoop(resp.Content, resp.Usage, resumedFromPark, nil), nil
+					return finish(resp.Content, resp.Usage, nil), nil
 				}
 			} else {
 				// 出现新的调用组合：更新基准签名，计数从 1 重新累计。
@@ -393,7 +414,7 @@ func NewToolLoopStep(llm contract.LLM, tools contract.ToolDispatcher, opts ToolL
 						CallID: result.CallID, Tool: call.Name, Args: call.Args, ParkRef: result.ParkRef,
 					})
 				}
-				return loom.State{
+				return withCompletionRejections(loom.State{
 					"__yield":                 true,
 					"__yield_phase":           "mid_step",
 					"yield_type":              "await_approval",
@@ -401,10 +422,10 @@ func NewToolLoopStep(llm contract.LLM, tools contract.ToolDispatcher, opts ToolL
 					"__toolloop_pending":      parked,
 					"__toolloop_staged_patch": stagedPatchResults,
 					"__toolloop_usage":        accumulatedUsage,
-				}, nil
+				}, priorRejections), nil
 			}
 			if hasStopLoopResult(results) {
-				return finishToolLoop(resp.Content, accumulatedUsage, resumedFromPark, stagedPatch), nil
+				return finish(resp.Content, accumulatedUsage, stagedPatch), nil
 			}
 			// 结果回填协议：先追加 assistant 的工具调用消息，再逐条追加对应的工具结果消息，
 			// 保持"调用在前、结果在后"的顺序供下一轮 LLM 阅读。
@@ -451,8 +472,17 @@ func NewToolLoopStep(llm contract.LLM, tools contract.ToolDispatcher, opts ToolL
 			return loom.State{"__error": err.Error()}, err
 		}
 		// 把收尾总结作为本轮的最终输出返回。
-		return finishToolLoop(resp.Content, resp.Usage, resumedFromPark, nil), nil
+		return finish(resp.Content, resp.Usage, nil), nil
 	}
+}
+
+// withCompletionRejections adds the private rejection history to a park
+// snapshot only when one exists, leaving other snapshots exactly as before.
+func withCompletionRejections(state loom.State, history []string) loom.State {
+	if len(history) > 0 {
+		state["__toolloop_rejections"] = append([]string(nil), history...)
+	}
+	return state
 }
 
 // ErrCompletionUnverified means a verifier was configured but no candidate was
@@ -461,7 +491,7 @@ var ErrCompletionUnverified = errors.New("agent completion was not verified")
 
 // verifyToolLoopCompletion also returns the rejection Reason, so the next
 // round's optional ToolChoicePolicy can respond; the feedback text is unchanged.
-func verifyToolLoopCompletion(ctx context.Context, opts ToolLoopOpts, messages []contract.Message, response *contract.ChatResponse, totalUsage contract.Usage) (bool, []contract.Message, string, error) {
+func verifyToolLoopCompletion(ctx context.Context, opts ToolLoopOpts, messages []contract.Message, response *contract.ChatResponse, totalUsage contract.Usage, priorRejections []string) (bool, []contract.Message, string, error) {
 	if opts.CompletionVerifier == nil {
 		return true, nil, "", nil
 	}
@@ -469,6 +499,7 @@ func verifyToolLoopCompletion(ctx context.Context, opts ToolLoopOpts, messages [
 	transcript = append(transcript, response.AsMessage())
 	decision, err := opts.CompletionVerifier.VerifyCompletion(ctx, CompletionCandidate{
 		Content: response.Content, Transcript: append([]contract.Message(nil), transcript...), TotalUsage: totalUsage,
+		PriorRejections: append([]string(nil), priorRejections...),
 	})
 	if err != nil {
 		return false, nil, "", fmt.Errorf("loom/toolloop: verify completion: %w", err)

@@ -215,12 +215,13 @@ func newControlledToolLoopStep(llm contract.LLM, tools contract.ToolDispatcher, 
 			}
 			loop.control.LastCompletionRejection = nil
 			if len(resp.ToolCalls) == 0 {
-				accepted, continued, reason, err := verifyToolLoopCompletion(ctx, opts, loop.messages, resp, loop.usage)
+				accepted, continued, reason, err := verifyToolLoopCompletion(ctx, opts, loop.messages, resp, loop.usage, loop.control.CompletionRejections)
 				if err != nil {
 					return nil, err
 				}
 				if !accepted {
 					loop.control.LastCompletionRejection = newCompletionRejection(reason)
+					loop.control.CompletionRejections = appendCompletionRejection(loop.control.CompletionRejections, reason)
 					loop.messages = continued
 					continue
 				}

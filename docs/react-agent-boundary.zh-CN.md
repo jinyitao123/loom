@@ -44,7 +44,7 @@ Loom 内核继续只包含 `State`、`Step`、`Router`、`Graph` 和 `Store`。�
 
 `ToolLoopOpts.CompletionVerifier` 现在提供可选的完成门。模型不再请求工具时，Loom 先提交候选给验证器。通过才生成最终输出；拒绝必须带反馈，反馈作为观察写入历史并继续执行。旧的未配置路径保持原行为。
 
-验证器可在拒绝时给出机器可读的 `CompletionDecision.Reason`；它不写入对话，只提供给可选的 `ToolChoicePolicy`。宿主据此只在紧随拒绝的那一轮约束工具调用（如指定某个工具），响应违背约束时以 `ErrToolChoiceNotHonored` 停止，不派发其中任何调用。哪些动作必须执行、何时可以强制，仍由宿主依据自身事实决定，Loom 不做业务判断。
+验证器可在拒绝时给出机器可读的 `CompletionDecision.Reason`；它不写入对话，只提供给可选的 `ToolChoicePolicy`。宿主据此只在紧随拒绝的那一轮约束工具调用（如指定某个工具），响应违背约束时以 `ErrToolChoiceNotHonored` 停止，不派发其中任何调用。每个候选还带有 `PriorRejections`：本次循环此前被拒绝候选的原因序列，不写入对话、不受上下文压缩影响，随检查点或暂停快照保存，按日志重放会得到相同结果；宿主可据此执行“只纠正一次”一类规则，而不必匹配反馈文字。哪些动作必须执行、何时可以强制，仍由宿主依据自身事实决定，Loom 不做业务判断。
 
 受控循环还要求稳定的 `CompletionVerifierID` 并把它纳入恢复策略哈希。验证拒绝后的历史会随检查点保存；预算用尽时受控循环暂停，普通循环返回 `ErrCompletionUnverified`，不会把被拒绝候选包装成成功。
 
