@@ -143,6 +143,15 @@ tool-call finish without any assembled call is also incomplete.
 Normal text with an observed finish and DONE can prove a complete zero-call
 protocol response, which is not proof that a requested task succeeded.
 
+The supported SSE delta and non-streaming message fields are `content`, `tool_calls`, `role`,
+`reasoning_content` and `refusal`. The last three do not carry tool calls and
+are never copied into observations. A non-null `function_call` or other unknown
+delta/message field makes the observation incomplete: the adapter does not execute that
+unsupported protocol, and cannot call its ignored value a complete zero-call
+response. Null compatibility fields do not contain a call. This validation only
+affects observation completeness; legacy execution and default wire behavior
+remain unchanged.
+
 `MaxDataFrames`, `MaxToolDeltas` and `MaxToolIndexes` bound metadata only. Defaults
 are 16,384 / 4,096 / 128; hard ceilings are 65,536 / 65,536 / 256. Exceeding a
 limit sets `Truncated` and never truncates model output or tool execution.

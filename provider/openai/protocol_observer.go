@@ -142,8 +142,42 @@ func (p *protocolCapture) streamShape(raw []byte, chunk oaiStreamChunk) {
 		var delta map[string]json.RawMessage
 		if json.Unmarshal(frame.Choices[0].Delta, &delta) != nil || delta == nil {
 			p.parseFailure()
+			return
+		}
+		if unsupportedMessageFields(delta) {
+			p.parseFailure()
 		}
 	}
+}
+
+func (p *protocolCapture) chatShape(raw []byte) {
+	if p == nil {
+		return
+	}
+	var response struct {
+		Choices []struct {
+			Message map[string]json.RawMessage `json:"message"`
+		} `json:"choices"`
+	}
+	if json.Unmarshal(raw, &response) != nil || len(response.Choices) != 1 || response.Choices[0].Message == nil || unsupportedMessageFields(response.Choices[0].Message) {
+		p.parseFailure()
+	}
+}
+
+// Only tool_calls is an executable call carrier. Unknown non-null fields could
+// contain ignored calls; recognized non-call fields are never copied out.
+func unsupportedMessageFields(fields map[string]json.RawMessage) bool {
+	for key, value := range fields {
+		switch key {
+		case "content", "tool_calls", "role", "reasoning_content", "refusal":
+			continue
+		default:
+			if string(value) != "null" {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func (p *protocolCapture) delta(index int) {

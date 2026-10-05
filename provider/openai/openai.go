@@ -542,6 +542,7 @@ func (c *Client) Chat(ctx context.Context, req contract.ChatRequest) (*contract.
 		probe.end("empty_response", "", false, 0)
 		return nil, fmt.Errorf("openai: empty response")
 	}
+	probe.chatShape(respBody)
 
 	// 只取第一个 choice（框架不使用 n>1 的多候选），回填为 contract.ChatResponse。
 	choice := oaiResp.Choices[0]

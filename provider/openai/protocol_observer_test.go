@@ -81,6 +81,10 @@ func TestProtocolObserverStreamBoundaries(t *testing.T) {
 		{name: "call finish without calls", wire: protocolFrame(map[string]any{"content": "ok"}, "tool_calls") + "data: [DONE]\n\n", end: "done", frames: 1, indexes: []int{}},
 		{name: "malformed frame", wire: "data: {malformed\n\n" + protocolFrame(map[string]any{"content": "ok"}, "stop") + "data: [DONE]\n\n", end: "done", frames: 2, failures: 1, indexes: []int{}},
 		{name: "unsupported stream shape", wire: protocolFrame(map[string]any{"content": "ok"}, "stop") + "data: {\"choices\":[{\"message\":{\"tool_calls\":[]}}]}\n\ndata: [DONE]\n\n", end: "done", frames: 2, failures: 1, indexes: []int{}},
+		{name: "legacy function call unsupported", wire: protocolFrame(map[string]any{"content": "ok", "function_call": map[string]any{"name": "lookup", "arguments": `{}`}}, "stop") + "data: [DONE]\n\n", end: "done", frames: 1, failures: 1, indexes: []int{}},
+		{name: "future call carrier unsupported", wire: protocolFrame(map[string]any{"content": "ok", "future_call": map[string]any{"name": "lookup", "arguments": `{}`}}, "stop") + "data: [DONE]\n\n", end: "done", frames: 1, failures: 1, indexes: []int{}},
+		{name: "null legacy call", wire: protocolFrame(map[string]any{"content": "ok", "function_call": nil}, "stop") + "data: [DONE]\n\n", end: "done", complete: true, frames: 1, indexes: []int{}},
+		{name: "known non-call fields", wire: protocolFrame(map[string]any{"content": "ok", "role": "assistant", "reasoning_content": "private reasoning", "refusal": nil}, "stop") + "data: [DONE]\n\n", end: "done", complete: true, frames: 1, indexes: []int{}},
 		{name: "EOF without done", wire: call(0), end: "eof", frames: 1, deltas: 1, assembled: 1, indexes: []int{0}, streamError: true},
 		{name: "unknown reason", wire: protocolFrame(map[string]any{"content": "ok"}, "private-finish-value") + "data: [DONE]\n\n", end: "done", frames: 1, indexes: []int{}},
 	} {
@@ -267,6 +271,36 @@ func TestProtocolObserverStreamPreSendAndHTTPFailure(t *testing.T) {
 			stream, err := openai.New("test-key", openai.WithBaseURL(server.URL)).Stream(ctx, chatReq(true, 0.7))
 			if err == nil || stream != nil || len(observations) != 1 || observations[0].Complete || observations[0].End != test.end || observations[0].RequestSent == test.cancel {
 				t.Fatalf("failed stream observation = %+v, err=%v", observations, err)
+			}
+		})
+	}
+}
+
+func TestProtocolObserverChatUnsupportedCallsAreIncomplete(t *testing.T) {
+	for _, test := range []struct {
+		name, fields string
+		complete     bool
+	}{
+		{name: "legacy call", fields: `,"function_call":{"name":"lookup","arguments":"{}"}`},
+		{name: "future carrier", fields: `,"future_call":{"name":"lookup","arguments":"{}"}`},
+		{name: "null compatibility", fields: `,"function_call":null`, complete: true},
+		{name: "known non-call fields", fields: `,"role":"assistant","reasoning_content":"private","refusal":null`, complete: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"ok"`+test.fields+`},"finish_reason":"stop"}]}`)
+			}))
+			defer server.Close()
+			client := openai.New("test-key", openai.WithBaseURL(server.URL))
+			plain, err := client.Chat(context.Background(), chatReq(true, 0.7))
+			if err != nil {
+				t.Fatal(err)
+			}
+			var observations []contract.ProtocolObservation
+			ctx := openai.WithProtocolObserver(context.Background(), openai.ProtocolObserverOptions{}, func(value contract.ProtocolObservation) { observations = append(observations, value) })
+			probed, err := client.Chat(ctx, chatReq(true, 0.7))
+			if err != nil || !reflect.DeepEqual(plain, probed) || len(observations) != 1 || observations[0].Complete != test.complete || observations[0].AssembledCalls != 0 || observations[0].EmittedCalls != 0 || (observations[0].ParseFailures == 0) != test.complete {
+				t.Fatalf("unsupported chat observation = %+v, err=%v", observations, err)
 			}
 		})
 	}
