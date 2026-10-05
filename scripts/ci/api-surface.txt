@@ -6,10 +6,17 @@ type EffortLevel string
 type Embedder interface{ ... }
 type LLM interface{ ... }
 type Message struct{ ... }
+type ProtocolContentObservation struct{ ... }
+type ProtocolObservation struct{ ... }
+type ProtocolRequestOptions struct{ ... }
 type StateOp struct{ ... }
 type StreamChunk struct{ ... }
 type StreamSink interface{ ... }
+type ToolArgumentObservation struct{ ... }
 type ToolCall struct{ ... }
+type ToolChoice struct{ ... }
+type ToolChoiceMode string
+    const ToolChoiceAuto ToolChoiceMode = "auto" ...
 type ToolDef struct{ ... }
 type ToolDispatcher interface{ ... }
 type ToolHook struct{ ... }
@@ -17,10 +24,12 @@ type ToolResult struct{ ... }
 type Usage struct{ ... }
 # stdlib
 const BareToolProtocolCompletionPolicyID = "loom.reject-bare-tool-protocol.v2"
+const BareToolProtocolRejectionReason = "bare_tool_protocol"
 var ErrCompletionUnverified = errors.New("agent completion was not verified")
 var ErrJournalExecution = errors.New("journaled operation failed")
 var ErrJournalOutcomeUnknown = errors.New("journaled operation outcome is unknown")
 var ErrJournalStreamingUnsupported = errors.New("journaled execution does not support streaming")
+var ErrToolChoiceNotHonored = errors.New("model response did not honor the requested tool choice")
 func CostBudgetHook(maxUSD float64) loom.StepHook
 func DispatchWithHooks(ctx context.Context, tools contract.ToolDispatcher, calls []contract.ToolCall, ...) ([]contract.ToolResult, error)
 func GetBool(s loom.State, key string, fallback bool) bool
@@ -80,6 +89,9 @@ type SubAgentRef struct{ ... }
 type SubGraphOpts struct{ ... }
     func WithParentMergeConfig(cfg *loom.MergeConfig) SubGraphOpts
 type SummaryCompactionOpts struct{ ... }
+type ToolChoiceInput struct{ ... }
+type ToolChoicePolicy interface{ ... }
+type ToolChoicePolicyFunc func(context.Context, ToolChoiceInput) (*contract.ToolChoice, error)
 type ToolLoopControl struct{ ... }
 type ToolLoopOpts struct{ ... }
 type ToolLoopOutcome struct{ ... }
