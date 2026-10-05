@@ -57,6 +57,14 @@ This check is opt-in and does not infer intent from the wording of the introduct
 
 Set `CompletionVerifierID` to `BareToolProtocolCompletionPolicyID` when this is the only verifier. When composing policies, include that ID and a stable identity for the other rules, including their schema, in the host's combined ID. Rejections consume the existing model-round budget and persist with feedback across controlled pauses; only an accepted candidate becomes a `final_response`. Without controlled rounds, exhaustion returns `ErrCompletionUnverified` instead of a successful wrap-up.
 
+## Optional per-round tool choice
+
+`ChatRequest.ToolChoice` constrains tool calling for one request (`auto`, `none`, `required`, or `tool` with a `Name` from that request's tools). `nil` keeps the provider default and the serialized request unchanged. The OpenAI-compatible adapter maps it to `tool_choice` and refuses an inconsistent choice before sending (`ErrToolChoiceInvalid`); `WithToolChoiceModes` declares the modes an endpoint accepts, and an undeclared mode fails with `ErrToolChoiceUnsupported` instead of being dropped.
+
+`ToolLoopOpts.ToolChoicePolicy` lets a host choose that constraint before each model round. The policy receives the offered tools and whether the previous round's completion candidate was rejected, with the verifier's optional machine-readable `CompletionDecision.Reason`. The reason never enters the transcript; the rejection marker lasts for exactly one round and persists across controlled pauses. A response that contradicts the chosen constraint (text after `required` or `tool`, another tool after `tool`, a call after `none`) stops the loop with `ErrToolChoiceNotHonored` before any of its calls are dispatched or verified. Controlled loops require a stable `ToolChoicePolicyID`, which joins the continuation policy hash only when a policy is configured, so existing paused snapshots keep their identity.
+
+Loom does not decide which actions are mandatory or when a constraint is safe; a host should force a tool only when its own facts show the action is still missing, and should never force calls merely to obtain missing inputs. The budget-exhaustion wrap-up request offers no tools and never carries a choice.
+
 ## Hooks and crash recovery
 
 After hooks run before Graph checks yield. Hosts must keep safety checks while skipping completion-only effects for valid controlled pauses. Do not use ordinary `delta + error` to express a controlled pause: the existing Graph error path does not merge that delta.

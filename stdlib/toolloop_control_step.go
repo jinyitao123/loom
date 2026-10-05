@@ -34,6 +34,9 @@ func newControlledToolLoopStep(llm contract.LLM, tools contract.ToolDispatcher, 
 		if (opts.CompletionVerifier == nil) != (strings.TrimSpace(opts.CompletionVerifierID) == "") {
 			return nil, fmt.Errorf("loom/toolloop: controlled completion verifier requires a stable policy id")
 		}
+		if (opts.ToolChoicePolicy == nil) != (strings.TrimSpace(opts.ToolChoicePolicyID) == "") {
+			return nil, fmt.Errorf("loom/toolloop: controlled tool choice policy requires a stable policy id")
+		}
 		runID, _ := state["__run_id"].(string)
 		if runID == "" {
 			return nil, fmt.Errorf("loom/toolloop: control requires a graph run identity")
@@ -168,9 +171,14 @@ func newControlledToolLoopStep(llm contract.LLM, tools contract.ToolDispatcher, 
 					}
 				}
 			}
+			choice, err := chooseRoundTool(ctx, opts, availableTools, loop.control.LastCompletionRejection)
+			if err != nil {
+				return nil, err
+			}
 			resp, err := llm.Chat(ctx, contract.ChatRequest{
 				Model: opts.Model, Messages: loop.messages, Tools: availableTools,
 				MaxTokens: opts.MaxTokens, Schema: opts.OutputSchema, Effort: opts.Effort,
+				ToolChoice: choice,
 			})
 			if err != nil {
 				return nil, err
@@ -202,12 +210,17 @@ func newControlledToolLoopStep(llm contract.LLM, tools contract.ToolDispatcher, 
 			default:
 				return loop.pause(ToolLoopProviderStop, resp), nil
 			}
+			if !toolChoiceHonored(choice, resp.ToolCalls) {
+				return nil, toolChoiceNotHonored(choice)
+			}
+			loop.control.LastCompletionRejection = nil
 			if len(resp.ToolCalls) == 0 {
-				accepted, continued, err := verifyToolLoopCompletion(ctx, opts, loop.messages, resp, loop.usage)
+				accepted, continued, reason, err := verifyToolLoopCompletion(ctx, opts, loop.messages, resp, loop.usage)
 				if err != nil {
 					return nil, err
 				}
 				if !accepted {
+					loop.control.LastCompletionRejection = newCompletionRejection(reason)
 					loop.messages = continued
 					continue
 				}
@@ -311,6 +324,7 @@ func (loop *controlledToolLoop) pause(reason ToolLoopStopReason, response *contr
 
 func (loop *controlledToolLoop) finish(reason ToolLoopStopReason, content string) loom.State {
 	loop.control.Phase, loop.control.Reason = "complete", reason
+	loop.control.LastCompletionRejection = nil
 	loop.control.PartialText, loop.control.ProviderStopReason, loop.control.HaltedResponse = "", "", nil
 	update := loop.snapshot()
 	for key, value := range finishToolLoop(content, loop.usage, false, loop.patch) {

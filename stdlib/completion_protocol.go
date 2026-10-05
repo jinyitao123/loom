@@ -10,6 +10,11 @@ import (
 // the identity of their other acceptance rules in CompletionVerifierID.
 const BareToolProtocolCompletionPolicyID = "loom.reject-bare-tool-protocol.v2"
 
+// BareToolProtocolRejectionReason is the CompletionDecision.Reason used when
+// RejectBareToolProtocolCompletion rejects a bare text tool-call block. It does
+// not change which candidates are accepted, so the policy ID above is unchanged.
+const BareToolProtocolRejectionReason = "bare_tool_protocol"
+
 // RejectBareToolProtocolCompletion wraps an optional completion verifier with
 // an opt-in check for a bare, balanced DSML calls/invoke block ending the final
 // text. The block must begin a separate paragraph, with or without a preamble. Such
@@ -25,7 +30,7 @@ const BareToolProtocolCompletionPolicyID = "loom.reject-bare-tool-protocol.v2"
 func RejectBareToolProtocolCompletion(next CompletionVerifier) CompletionVerifier {
 	return CompletionVerifierFunc(func(ctx context.Context, candidate CompletionCandidate) (CompletionDecision, error) {
 		if isBareToolProtocol(candidate.Content) {
-			return CompletionDecision{Feedback: "The proposed final response ends with a bare tool-call protocol block in text. It did not execute a tool and is not a tool result. If a tool is needed, use the provided structured tool-call interface and wait for its actual result. Otherwise provide the requested answer using the available evidence, without a bare protocol block. If explaining protocol syntax is the requested task, quote or fence the example."}, nil
+			return CompletionDecision{Feedback: "The proposed final response ends with a bare tool-call protocol block in text. It did not execute a tool and is not a tool result. If a tool is needed, use the provided structured tool-call interface and wait for its actual result. Otherwise provide the requested answer using the available evidence, without a bare protocol block. If explaining protocol syntax is the requested task, quote or fence the example.", Reason: BareToolProtocolRejectionReason}, nil
 		}
 		if next != nil {
 			return next.VerifyCompletion(ctx, candidate)

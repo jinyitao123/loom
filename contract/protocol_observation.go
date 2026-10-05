@@ -22,6 +22,31 @@ type ProtocolObservation struct {
 	DoneSeen           bool                      `json:"done_seen"`
 	Arguments          []ToolArgumentObservation `json:"arguments"`
 	Truncated          bool                      `json:"truncated"`
+	// RequestOptions are the option values actually written to the wire. Nil
+	// means the request was rejected before its wire form was built.
+	RequestOptions *ProtocolRequestOptions `json:"request_options,omitempty"`
+	// Content counts response text carriers. Nil means not collected; zero
+	// counts in a present value mean the carrier was observed and empty.
+	Content *ProtocolContentObservation `json:"content,omitempty"`
+}
+
+// ProtocolRequestOptions records enum values only. Empty means the option was
+// omitted from the wire request; "other" means an unrecognized value was sent.
+type ProtocolRequestOptions struct {
+	Thinking        string `json:"thinking,omitempty"`
+	ReasoningEffort string `json:"reasoning_effort,omitempty"`
+	ResponseFormat  string `json:"response_format,omitempty"`
+	ToolChoice      string `json:"tool_choice,omitempty"`
+}
+
+// ProtocolContentObservation counts bytes and markers without retaining text.
+// TextToolProtocolMarkers counts provider tool-call markup found in ordinary
+// content; such text is not an executable call. Reasoning is counted, never kept.
+type ProtocolContentObservation struct {
+	ContentBytes            int `json:"content_bytes"`
+	TextToolProtocolMarkers int `json:"text_tool_protocol_markers"`
+	ReasoningFrames         int `json:"reasoning_frames"`
+	ReasoningBytes          int `json:"reasoning_bytes"`
 }
 
 // ToolArgumentObservation describes assembled bytes at a wire index (or array

@@ -46,6 +46,12 @@ var (
 	// ErrJSONModeInstructionMissing 中文：json_object 模式 + Schema 请求在发送前
 	// 校验消息中缺少明确的 JSON 输出指令。属调用方配置错误，重试无益（非可重试）。
 	ErrJSONModeInstructionMissing = errors.New("openai: json mode requires an explicit JSON instruction in messages")
+	// ErrToolChoiceInvalid 中文：ChatRequest.ToolChoice 与本次请求不一致（未提供工具、
+	// 指名的工具不在本次工具列表中、模式未知等）。属调用方错误，请求不发出、不可重试。
+	ErrToolChoiceInvalid = errors.New("openai: invalid tool choice")
+	// ErrToolChoiceUnsupported 中文：客户端经 WithToolChoiceModes 声明不支持该模式。
+	// 请求不发出；绝不静默丢弃约束，否则调用方会误以为约束已生效。
+	ErrToolChoiceUnsupported = errors.New("openai: tool choice mode is not supported by this provider")
 )
 
 // EmptyResponseError carries protocol context for an empty model response.
@@ -130,6 +136,8 @@ type Client struct {
 	// thinking+tools 必须回传 reasoning_content；M1 阶段不做 reasoning 连续性，
 	// 因此带 tools 的请求直接 fail-safe 关闭 thinking。
 	thinkingDisableWithTools bool
+	// 中文：经 WithToolChoiceModes 声明的可用工具选择模式；nil 表示 OpenAI 协议的全部模式均可用。
+	toolChoiceModes map[contract.ToolChoiceMode]bool
 }
 
 // Option configures a Client.
@@ -174,6 +182,21 @@ func WithThinkingControl(defaultMode string, disableWithTools bool) Option {
 	return func(c *Client) {
 		c.thinkingDefaultMode = defaultMode
 		c.thinkingDisableWithTools = disableWithTools
+	}
+}
+
+// WithToolChoiceModes restricts the ChatRequest.ToolChoice modes this endpoint
+// accepts. Without it every OpenAI tool_choice mode is mapped to the wire. A
+// request using an undeclared mode fails with ErrToolChoiceUnsupported before
+// sending; the constraint is never silently dropped.
+// 中文：声明该端点支持的工具选择模式。未声明时按 OpenAI 协议映射全部模式；
+// 请求使用未声明的模式时在发送前返回 ErrToolChoiceUnsupported，绝不静默忽略约束。
+func WithToolChoiceModes(modes ...contract.ToolChoiceMode) Option {
+	return func(c *Client) {
+		c.toolChoiceModes = make(map[contract.ToolChoiceMode]bool, len(modes))
+		for _, mode := range modes {
+			c.toolChoiceModes[mode] = true
+		}
 	}
 }
 
@@ -229,6 +252,7 @@ type oaiRequest struct {
 	Model          string             `json:"model"`                     // 模型名（已经过 resolveModel 兜底）
 	Messages       []oaiMessage       `json:"messages"`                  // 对话历史，由 contract.Message 映射而来
 	Tools          []oaiTool          `json:"tools,omitempty"`           // 工具定义列表；为 nil 时整个字段缺省
+	ToolChoice     any                `json:"tool_choice,omitempty"`     // "auto"/"none"/"required" 或指名 function；nil 时整个字段缺省
 	MaxTokens      int                `json:"max_tokens,omitempty"`      // 输出 token 上限；0 时省略，交给服务端默认
 	Temperature    *float64           `json:"temperature,omitempty"`     // 采样温度；用指针区分"未设置"与显式 0
 	Stream         bool               `json:"stream,omitempty"`          // true 时服务端切换为 SSE 流式返回
@@ -265,6 +289,17 @@ type oaiJSONSchema struct {
 	Name   string          `json:"name"`   // schema 名称，协议必填（本包固定用 "output"）
 	Strict bool            `json:"strict"` // true 时服务端严格校验输出必须完全匹配 schema
 	Schema json.RawMessage `json:"schema"` // 调用方 JSON Schema 原文，RawMessage 原样透传不解析
+}
+
+// oaiNamedToolChoice 中文：指名工具的 tool_choice wire 形态
+// {"type":"function","function":{"name":...}}。
+type oaiNamedToolChoice struct {
+	Type     string                     `json:"type"`
+	Function oaiNamedToolChoiceFunction `json:"function"`
+}
+
+type oaiNamedToolChoiceFunction struct {
+	Name string `json:"name"`
 }
 
 // oaiStreamOptions 中文：流式请求的附加选项。
@@ -319,6 +354,8 @@ type oaiResponse struct {
 			Role      string        `json:"role"`                 // 恒为 assistant
 			Content   string        `json:"content"`              // 回复文本
 			ToolCalls []oaiToolCall `json:"tool_calls,omitempty"` // 模型请求执行的工具调用
+			// ReasoningContent 中文：仅供协议观测计数，绝不进入 ChatResponse 或任何输出。
+			ReasoningContent string `json:"reasoning_content,omitempty"`
 		} `json:"message"`
 		FinishReason string `json:"finish_reason"` // 结束原因：stop / tool_calls / length 等
 	} `json:"choices"`
@@ -390,6 +427,43 @@ func (c *Client) buildTools(tools []contract.ToolDef) []oaiTool {
 	return out
 }
 
+// toolChoiceWire validates ChatRequest.ToolChoice against the offered tools and
+// the declared provider modes, returning the tool_choice wire value. A nil
+// choice returns nil, so the key stays absent and the request is unchanged.
+// 中文：校验并映射 tool_choice。nil 返回 nil（字段缺省、请求体零变化）；任何不一致都在发送前失败。
+func (c *Client) toolChoiceWire(req contract.ChatRequest) (any, error) {
+	choice := req.ToolChoice
+	if choice == nil {
+		return nil, nil
+	}
+	if len(req.Tools) == 0 {
+		return nil, fmt.Errorf("%w: a tool choice requires offered tools", ErrToolChoiceInvalid)
+	}
+	switch choice.Mode {
+	case contract.ToolChoiceAuto, contract.ToolChoiceNone, contract.ToolChoiceRequired:
+		if choice.Name != "" {
+			return nil, fmt.Errorf("%w: only a named tool choice carries a tool name", ErrToolChoiceInvalid)
+		}
+	case contract.ToolChoiceTool:
+		offered := false
+		for _, tool := range req.Tools {
+			offered = offered || tool.Name == choice.Name
+		}
+		if choice.Name == "" || !offered {
+			return nil, fmt.Errorf("%w: the named tool is not offered in this request", ErrToolChoiceInvalid)
+		}
+	default:
+		return nil, fmt.Errorf("%w: unknown mode", ErrToolChoiceInvalid)
+	}
+	if c.toolChoiceModes != nil && !c.toolChoiceModes[choice.Mode] {
+		return nil, fmt.Errorf("%w: %s", ErrToolChoiceUnsupported, choice.Mode)
+	}
+	if choice.Mode == contract.ToolChoiceTool {
+		return oaiNamedToolChoice{Type: "function", Function: oaiNamedToolChoiceFunction{Name: choice.Name}}, nil
+	}
+	return string(choice.Mode), nil
+}
+
 // applyThinkingControl 中文：按 provider 显式声明的 capability 填充 thinking 键，
 // 并裁剪 thinking 模式不支持的参数（temperature）。未 opt-in（defaultMode 为空）
 // 时零改动——thinking 键绝不出现、temperature 照常透传。
@@ -454,12 +528,18 @@ func (c *Client) Chat(ctx context.Context, req contract.ChatRequest) (*contract.
 	if err := c.requireJSONOutputInstruction(req); err != nil {
 		return nil, err
 	}
+	// tool_choice 发送前校验：不一致或提供方未声明支持时，请求不出门。
+	toolChoice, err := c.toolChoiceWire(req)
+	if err != nil {
+		return nil, err
+	}
 	// 组装 wire 请求：模型名兜底、消息/工具逐一映射；
 	// Effort 直接透传为 reasoning_effort（空值因 omitempty 不会出现在 JSON 中）。
 	oaiReq := oaiRequest{
 		Model:           c.resolveModel(req.Model),     // 未指定模型时回退到 defaultModel
 		Messages:        c.buildMessages(req.Messages), // contract.Message -> oaiMessage（含 tool_calls 回放）
 		Tools:           c.buildTools(req.Tools),       // contract.ToolDef -> OpenAI function 工具定义
+		ToolChoice:      toolChoice,                    // nil 时字段缺省
 		MaxTokens:       req.MaxTokens,                 // 输出 token 上限；0 表示交给服务端默认
 		Temperature:     req.Temperature,               // 指针：nil 表示"用服务端默认"，可与显式 0 区分
 		ReasoningEffort: string(req.Effort),            // ChatRequest.Effort 透传为 reasoning_effort（推理模型专用）
@@ -491,7 +571,7 @@ func (c *Client) Chat(ctx context.Context, req contract.ChatRequest) (*contract.
 	if err != nil {
 		return nil, fmt.Errorf("openai: marshal request: %w", err)
 	}
-	probe.request(oaiReq.Tools)
+	probe.request(&oaiReq)
 
 	// 构造 HTTP 请求并绑定 ctx：取消/超时由调用方 context 驱动，本包不额外设限。
 	httpReq, err := http.NewRequestWithContext(probe.trace(ctx), "POST", c.baseURL+c.chatPath, bytes.NewReader(body))
@@ -546,6 +626,8 @@ func (c *Client) Chat(ctx context.Context, req contract.ChatRequest) (*contract.
 
 	// 只取第一个 choice（框架不使用 n>1 的多候选），回填为 contract.ChatResponse。
 	choice := oaiResp.Choices[0]
+	probe.content(choice.Message.Content)
+	probe.reasoning(choice.Message.ReasoningContent)
 	chatResp := &contract.ChatResponse{
 		Content:    choice.Message.Content, // 助手文本内容
 		StopReason: choice.FinishReason,    // 结束原因（stop / tool_calls / length ...）原样透传
@@ -592,6 +674,8 @@ type oaiStreamChunk struct {
 		Delta struct {
 			Content   string        `json:"content,omitempty"`    // 本块新增的文本片段
 			ToolCalls []oaiToolCall `json:"tool_calls,omitempty"` // 本块新增的工具调用增量（按 Index 归并）
+			// ReasoningContent 中文：仅供协议观测计数，绝不下发给消费方。
+			ReasoningContent string `json:"reasoning_content,omitempty"`
 		} `json:"delta"`
 		FinishReason *string `json:"finish_reason"` // 指针区分"尚未结束"（null）与具体结束原因
 	} `json:"choices"`
@@ -618,12 +702,18 @@ func (c *Client) Stream(ctx context.Context, req contract.ChatRequest) (stream <
 	if err := c.requireJSONOutputInstruction(req); err != nil {
 		return nil, err
 	}
+	// tool_choice 发送前校验：与 Chat 同一语义。
+	toolChoice, err := c.toolChoiceWire(req)
+	if err != nil {
+		return nil, err
+	}
 	// 组装 wire 请求：映射逻辑与 Chat 相同（含 Effort -> reasoning_effort 透传），
 	// 差异仅两处——Stream=true 切换 SSE；StreamOptions 让服务端在流尾补发 usage。
 	oaiReq := oaiRequest{
 		Model:           c.resolveModel(req.Model),             // 模型名兜底
 		Messages:        c.buildMessages(req.Messages),         // 消息映射（含 tool_calls 回放）
 		Tools:           c.buildTools(req.Tools),               // 工具定义映射
+		ToolChoice:      toolChoice,                            // nil 时字段缺省
 		MaxTokens:       req.MaxTokens,                         // 输出上限
 		Temperature:     req.Temperature,                       // nil 表示服务端默认
 		ReasoningEffort: string(req.Effort),                    // Effort 透传（omitempty，未设置不发送）
@@ -655,7 +745,7 @@ func (c *Client) Stream(ctx context.Context, req contract.ChatRequest) (stream <
 	if err != nil {
 		return nil, fmt.Errorf("openai: marshal request: %w", err)
 	}
-	probe.request(oaiReq.Tools)
+	probe.request(&oaiReq)
 
 	// 构造请求并绑定 ctx：取消 ctx 会中断后续的流读取，使读循环自然退出。
 	httpReq, err := http.NewRequestWithContext(probe.trace(ctx), "POST", c.baseURL+c.chatPath, bytes.NewReader(body))
@@ -791,6 +881,8 @@ func (c *Client) Stream(ctx context.Context, req contract.ChatRequest) (stream <
 
 			// 只消费第一个 choice 的增量（框架不使用多候选）。
 			delta := chunk.Choices[0].Delta
+			probe.content(delta.Content)
+			probe.reasoning(delta.ReasoningContent)
 
 			// 文本增量：即时透传给消费方，实现逐字输出。
 			if delta.Content != "" {

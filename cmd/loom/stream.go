@@ -55,6 +55,11 @@ func (s *streamingLLM) Chat(ctx context.Context, req contract.ChatRequest) (*con
 	var usage contract.Usage          // 记录最终 token 用量
 	// 逐块消费流；channel 关闭即代表流结束。
 	for chunk := range ch {
+		// 错误块表示流异常收尾（如未见 [DONE]），其前的增量可能缺失工具调用：
+		// 必须作为错误上抛，绝不当作干净完成。
+		if chunk.Err != nil {
+			return nil, chunk.Err
+		}
 		if chunk.Content != "" {
 			content.WriteString(chunk.Content) // 先入缓冲，保证最终响应内容完整
 			_ = s.out.Text(chunk.Content)      // 再即时外发增量；发送失败不打断消费

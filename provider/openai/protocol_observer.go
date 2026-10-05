@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"net/http/httptrace"
 	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 
@@ -52,7 +53,15 @@ type protocolCapture struct {
 	partial  bool
 	sent     atomic.Bool
 	once     sync.Once
+	// markerTail keeps only the last len(marker)-1 content bytes so a marker
+	// split across deltas is counted once; no other content is retained.
+	markerTail string
 }
+
+// textToolProtocolMarker delimits DeepSeek-style tool-call markup written as
+// ordinary text. Such text is not a structured call; counting it separates a
+// prose answer from a provider-side text call carrier in zero-call responses.
+const textToolProtocolMarker = "｜DSML｜"
 
 func observationLimit(value, fallback, ceiling int) int {
 	if value <= 0 {
@@ -75,20 +84,82 @@ func newProtocolCapture(ctx context.Context, protocol string) *protocolCapture {
 	return &protocolCapture{observer: observer, indexes: map[int]bool{}, value: contract.ProtocolObservation{
 		Version: 1, Protocol: protocol, End: "before_send", FinishReason: "unknown",
 		ToolIndexes: []int{}, Arguments: []contract.ToolArgumentObservation{},
+		Content: &contract.ProtocolContentObservation{},
 	}}
 }
 
-func (p *protocolCapture) request(tools []oaiTool) {
-	if p == nil {
+// request records the tool digest and the enum values of the wire options
+// exactly as serialized; it never copies messages or tool definitions.
+func (p *protocolCapture) request(request *oaiRequest) {
+	if p == nil || request == nil {
 		return
 	}
-	raw, err := json.Marshal(tools)
+	options := &contract.ProtocolRequestOptions{
+		ReasoningEffort: protocolEnum(request.ReasoningEffort, "none", "minimal", "low", "medium", "high", "xhigh", "max"),
+		ToolChoice:      wireToolChoiceMode(request.ToolChoice),
+	}
+	if request.Thinking != nil {
+		options.Thinking = protocolEnum(request.Thinking.Type, "enabled", "disabled")
+	}
+	if request.ResponseFormat != nil {
+		options.ResponseFormat = protocolEnum(request.ResponseFormat.Type, "json_object", "json_schema", "text")
+	}
+	p.value.RequestOptions = options
+	raw, err := json.Marshal(request.Tools)
 	if err != nil {
 		p.partial = true
 		return
 	}
-	p.value.RequestToolCount = len(tools)
+	p.value.RequestToolCount = len(request.Tools)
 	p.value.RequestToolsSHA256 = observationSHA256(raw)
+}
+
+func protocolEnum(value string, known ...string) string {
+	if value == "" {
+		return ""
+	}
+	for _, candidate := range known {
+		if value == candidate {
+			return value
+		}
+	}
+	return "other"
+}
+
+func wireToolChoiceMode(value any) string {
+	switch choice := value.(type) {
+	case nil:
+		return ""
+	case string:
+		return protocolEnum(choice, "auto", "none", "required")
+	case oaiNamedToolChoice:
+		return "tool"
+	default:
+		return "other"
+	}
+}
+
+// content counts ordinary response text and text tool-call markers.
+func (p *protocolCapture) content(text string) {
+	if p == nil || text == "" {
+		return
+	}
+	p.value.Content.ContentBytes += len(text)
+	window := p.markerTail + text
+	p.value.Content.TextToolProtocolMarkers += strings.Count(window, textToolProtocolMarker)
+	if keep := len(textToolProtocolMarker) - 1; len(window) > keep {
+		window = window[len(window)-keep:]
+	}
+	p.markerTail = window
+}
+
+// reasoning counts reasoning carriers; their text is never retained.
+func (p *protocolCapture) reasoning(text string) {
+	if p == nil || text == "" {
+		return
+	}
+	p.value.Content.ReasoningFrames++
+	p.value.Content.ReasoningBytes += len(text)
 }
 
 func (p *protocolCapture) trace(ctx context.Context) context.Context {

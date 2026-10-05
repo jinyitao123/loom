@@ -114,6 +114,29 @@ type ChatRequest struct {
 	Schema      *json.RawMessage `json:"schema,omitempty"`      // 结构化输出的 JSON Schema，原样透传给支持该能力的 provider
 	Effort      EffortLevel      `json:"effort,omitempty"`      // v1.4
 	// Effort 推理档位随请求透传，由 provider 映射为自家推理强度参数（见 EffortLevel）。
+	// ToolChoice constrains tool calling for this request only. nil keeps the
+	// provider default and leaves the serialized request unchanged.
+	// ToolChoice 只约束本次请求的工具调用方式；nil 表示沿用提供方默认，序列化结果与旧版完全一致。
+	ToolChoice *ToolChoice `json:"tool_choice,omitempty"`
+}
+
+// ToolChoiceMode selects how a model may use the tools offered in one request.
+// ToolChoiceMode 是提供商无关的工具选择方式；各 provider 负责映射到自家字段。
+type ToolChoiceMode string
+
+const (
+	ToolChoiceAuto     ToolChoiceMode = "auto"     // the model decides whether to call a tool
+	ToolChoiceNone     ToolChoiceMode = "none"     // the model must not call a tool
+	ToolChoiceRequired ToolChoiceMode = "required" // the model must call at least one offered tool
+	ToolChoiceTool     ToolChoiceMode = "tool"     // the model must call the named offered tool
+)
+
+// ToolChoice is a per-request tool calling constraint. Name is used only with
+// ToolChoiceTool and must match one of the request's Tools.
+// ToolChoice 是单次请求的工具调用约束；Name 仅在 ToolChoiceTool 时使用，且必须是本次请求提供的工具名。
+type ToolChoice struct {
+	Mode ToolChoiceMode `json:"mode"`
+	Name string         `json:"name,omitempty"`
 }
 
 // ChatResponse is the output of an LLM call.

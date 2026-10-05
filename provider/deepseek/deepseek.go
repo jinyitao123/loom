@@ -16,12 +16,22 @@ import (
 	"bytes"         // 把序列化后的 JSON 请求体包装成 io.Reader
 	"context"       // 透传调用方 context，承载取消与超时
 	"encoding/json" // contract 类型与 DeepSeek（OpenAI 兼容）wire 格式的 JSON 编解码
+	"errors"        // 流异常收尾的哨兵错误
 	"fmt"           // 构造带 "deepseek:" 前缀的错误信息
 	"io"            // 一次性读取非流式响应体 / 流式建连失败时的错误体
 	"net/http"      // 底层 HTTP 客户端与请求构造
+	"sort"          // 工具调用按实际 Index 排序还原
 	"strings"       // SSE "data: " 行前缀解析
 
 	"github.com/jinyitao123/loom/contract" // 内核契约层：LLM 接口与请求/响应类型
+)
+
+// Stream termination errors arrive as StreamChunk.Err, never as a clean close.
+// 中文：流异常收尾的哨兵错误，以错误块下发；调用方用 errors.Is 分类。
+var (
+	ErrStreamClosedWithoutDone = errors.New("deepseek: stream closed without [DONE]")
+	ErrStreamScanner           = errors.New("deepseek: stream scanner error")
+	ErrStreamCancelled         = errors.New("deepseek: stream context cancelled")
 )
 
 // Client implements contract.LLM for DeepSeek.
@@ -397,6 +407,8 @@ func (c *Client) Stream(ctx context.Context, req contract.ChatRequest) (<-chan c
 
 		// 按行扫描 SSE 流：每个事件是一行 "data: {...}"，空行为事件分隔符。
 		scanner := bufio.NewScanner(resp.Body)
+		// 单行上限 1MiB：超长行以 scanner.Err() 报告，而不是被当作干净结束。
+		scanner.Buffer(make([]byte, 64*1024), 1024*1024)
 		for scanner.Scan() {
 			line := scanner.Text() // 当前行文本（不含换行符）
 
@@ -412,11 +424,14 @@ func (c *Client) Stream(ctx context.Context, req contract.ChatRequest) (<-chan c
 				// 与 Done 标志、usage 统计一起放进最后一个增量块交付。
 				if len(toolCallMap) > 0 {
 					var tcs []contract.ToolCall
-					// 服务端按 0 起连续编号 Index，计数循环保证输出顺序稳定。
-					for i := 0; i < len(toolCallMap); i++ {
-						if tc, ok := toolCallMap[i]; ok {
-							tcs = append(tcs, *tc)
-						}
+					// 按实际 Index 排序还原：稀疏或非 0 起始的编号也不能静默丢调用。
+					indexes := make([]int, 0, len(toolCallMap))
+					for index := range toolCallMap {
+						indexes = append(indexes, index)
+					}
+					sort.Ints(indexes)
+					for _, index := range indexes {
+						tcs = append(tcs, *toolCallMap[index])
 					}
 					ch <- contract.StreamChunk{ToolCalls: tcs, Done: true, Usage: lastUsage}
 				} else {
@@ -474,6 +489,17 @@ func (c *Client) Stream(ctx context.Context, req contract.ChatRequest) (<-chan c
 					toolCallMap[idx].Args += tc.Function.Arguments
 				}
 			}
+		}
+
+		// 未见 [DONE] 即退出：按 contract.StreamChunk 约定以错误块收尾，
+		// 绝不让消费方把截断的流（可能缺失工具调用）当作干净完成。
+		switch {
+		case ctx.Err() != nil:
+			ch <- contract.StreamChunk{Err: fmt.Errorf("%w: %w", ErrStreamCancelled, ctx.Err())}
+		case scanner.Err() != nil:
+			ch <- contract.StreamChunk{Err: fmt.Errorf("%w: %w", ErrStreamScanner, scanner.Err())}
+		default:
+			ch <- contract.StreamChunk{Err: ErrStreamClosedWithoutDone}
 		}
 	}()
 

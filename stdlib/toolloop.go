@@ -53,6 +53,9 @@ type CompletionCandidate struct {
 type CompletionDecision struct {
 	Accepted bool
 	Feedback string
+	// Reason is an optional machine-readable rejection code. It is never sent
+	// to the model; a ToolChoicePolicy receives it before the next round.
+	Reason string
 }
 
 // CompletionVerifier applies host-supplied, read-only acceptance rules.
@@ -100,6 +103,12 @@ type ToolLoopOpts struct {
 	// appended to the transcript as an observation so the model can correct it.
 	CompletionVerifier   CompletionVerifier
 	CompletionVerifierID string // stable policy identity, required for controlled loops
+	// ToolChoicePolicy optionally constrains tool calling for one model round,
+	// for example right after a rejected completion. nil leaves every request
+	// unchanged. A response contradicting the chosen constraint stops the loop
+	// with ErrToolChoiceNotHonored before any of its tool calls are dispatched.
+	ToolChoicePolicy   ToolChoicePolicy
+	ToolChoicePolicyID string // stable policy identity, required for controlled loops
 }
 
 // toolLoopPendingCall is the checkpoint-safe description of one parked tool call.
@@ -256,6 +265,8 @@ func NewToolLoopStep(llm contract.LLM, tools contract.ToolDispatcher, opts ToolL
 		}
 		var lastBatchHash string // 上一批工具调用的签名哈希
 		repeatCount := 0         // 当前签名连续重复的次数
+		// 上一轮被完成校验驳回的记录，只影响紧随其后的一轮工具选择。
+		var completionRejection *toolLoopCompletionRejection
 
 		// 主循环：最多 MaxIterations 次"LLM→工具"往返。
 		for i := 0; i < opts.MaxIterations; i++ {
@@ -280,28 +291,42 @@ func NewToolLoopStep(llm contract.LLM, tools contract.ToolDispatcher, opts ToolL
 				return nil, err
 			}
 
+			// 可选的工具选择策略：未配置时 choice 恒为 nil，请求与旧版完全一致。
+			choice, err := chooseRoundTool(ctx, opts, availableTools, completionRejection)
+			if err != nil {
+				return loom.State{"__error": err.Error()}, err
+			}
+
 			// 本轮询问 LLM：携带完整历史、工具清单与输出约束。
 			resp, err := llm.Chat(ctx, contract.ChatRequest{
-				Model:     opts.Model,
-				Messages:  msgs,
-				Tools:     availableTools,
-				MaxTokens: opts.MaxTokens,
-				Schema:    opts.OutputSchema,
-				Effort:    effort,
+				Model:      opts.Model,
+				Messages:   msgs,
+				Tools:      availableTools,
+				MaxTokens:  opts.MaxTokens,
+				Schema:     opts.OutputSchema,
+				Effort:     effort,
+				ToolChoice: choice,
 			})
 			// 调用失败：把错误文本写入状态键 __error（供下游路由器/观测使用）并同时向引擎上抛。
 			if err != nil {
 				return loom.State{"__error": err.Error()}, err
 			}
 			accumulatedUsage = addUsage(accumulatedUsage, resp.Usage)
+			// 响应违背本轮工具选择：不派发其中任何调用，直接失败，交由宿主明确处理。
+			if !toolChoiceHonored(choice, resp.ToolCalls) {
+				err := toolChoiceNotHonored(choice)
+				return loom.State{"__error": err.Error()}, err
+			}
+			completionRejection = nil
 
 			// 模型没有再请求工具 ⇒ 任务在本轮完成，把文本答案与用量写入输出状态，正常收官。
 			if len(resp.ToolCalls) == 0 {
-				accepted, continued, err := verifyToolLoopCompletion(ctx, opts, msgs, resp, accumulatedUsage)
+				accepted, continued, reason, err := verifyToolLoopCompletion(ctx, opts, msgs, resp, accumulatedUsage)
 				if err != nil {
 					return loom.State{"__error": err.Error()}, err
 				}
 				if !accepted {
+					completionRejection = newCompletionRejection(reason)
 					msgs = continued
 					continue
 				}
@@ -434,9 +459,11 @@ func NewToolLoopStep(llm contract.LLM, tools contract.ToolDispatcher, opts ToolL
 // accepted before a hard stop.
 var ErrCompletionUnverified = errors.New("agent completion was not verified")
 
-func verifyToolLoopCompletion(ctx context.Context, opts ToolLoopOpts, messages []contract.Message, response *contract.ChatResponse, totalUsage contract.Usage) (bool, []contract.Message, error) {
+// verifyToolLoopCompletion also returns the rejection Reason, so the next
+// round's optional ToolChoicePolicy can respond; the feedback text is unchanged.
+func verifyToolLoopCompletion(ctx context.Context, opts ToolLoopOpts, messages []contract.Message, response *contract.ChatResponse, totalUsage contract.Usage) (bool, []contract.Message, string, error) {
 	if opts.CompletionVerifier == nil {
-		return true, nil, nil
+		return true, nil, "", nil
 	}
 	transcript := append([]contract.Message(nil), messages...)
 	transcript = append(transcript, response.AsMessage())
@@ -444,19 +471,19 @@ func verifyToolLoopCompletion(ctx context.Context, opts ToolLoopOpts, messages [
 		Content: response.Content, Transcript: append([]contract.Message(nil), transcript...), TotalUsage: totalUsage,
 	})
 	if err != nil {
-		return false, nil, fmt.Errorf("loom/toolloop: verify completion: %w", err)
+		return false, nil, "", fmt.Errorf("loom/toolloop: verify completion: %w", err)
 	}
 	if decision.Accepted {
-		return true, nil, nil
+		return true, nil, "", nil
 	}
 	feedback := strings.TrimSpace(decision.Feedback)
 	if feedback == "" {
-		return false, nil, errors.New("loom/toolloop: completion verifier rejected without feedback")
+		return false, nil, "", errors.New("loom/toolloop: completion verifier rejected without feedback")
 	}
 	transcript = append(transcript, contract.Message{
 		Role: "user", Content: "[loom completion verification]\nThe proposed result was rejected. Correct the result using this evidence:\n" + feedback,
 	})
-	return false, transcript, nil
+	return false, transcript, strings.TrimSpace(decision.Reason), nil
 }
 
 // decodeToolLoopMessages restores a private message snapshot after checkpoint JSON round-tripping.

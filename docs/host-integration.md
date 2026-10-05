@@ -134,6 +134,15 @@ the actual serialized OpenAI `tools` value (`null` represents an omitted list).
 `RequestSent` requires the HTTP trace's successful `WroteRequest` boundary;
 pre-send/transport failures cannot prove the provider received the request.
 
+`RequestOptions` records the enum values actually serialized for `thinking`,
+`reasoning_effort`, `response_format` and `tool_choice` (empty when omitted,
+`other` for an unrecognized value); it is absent when the request was refused
+before its wire form existed. `Content` counts response text bytes, DeepSeek-style
+text tool-call markers (`｜DSML｜`) found in ordinary content, and reasoning
+frames/bytes. Marker text is not an executable call, so a zero-call response
+with markers indicates a provider-side text call carrier rather than a prose
+answer. Only counts are kept; no content or reasoning text is retained.
+
 Absence means not collected or unsupported. `Complete=false` means the counts
 cannot establish zero calls. Malformed/unsupported frames, sparse/negative indexes, missing
 tool identities, unknown/missing finish reasons, EOF, cancellation, scan errors

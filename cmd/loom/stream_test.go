@@ -103,3 +103,13 @@ func TestStreamingLLMFallbackPropagatesChatError(t *testing.T) {
 		t.Fatal("want chat error propagated")
 	}
 }
+
+func TestStreamingLLMReturnsStreamErrorChunk(t *testing.T) {
+	var buf bytes.Buffer
+	cut := errors.New("stream closed without [DONE]")
+	inner := &streamLLM{chunks: []contract.StreamChunk{{Content: "partial"}, {Err: cut}}}
+	s := &streamingLLM{inner: inner, out: NewEmitter(&buf)}
+	if resp, err := s.Chat(context.Background(), contract.ChatRequest{}); !errors.Is(err, cut) || resp != nil {
+		t.Fatalf("truncated stream became a response: %#v, %v", resp, err)
+	}
+}

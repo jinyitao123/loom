@@ -44,6 +44,8 @@ Loom 内核继续只包含 `State`、`Step`、`Router`、`Graph` 和 `Store`。�
 
 `ToolLoopOpts.CompletionVerifier` 现在提供可选的完成门。模型不再请求工具时，Loom 先提交候选给验证器。通过才生成最终输出；拒绝必须带反馈，反馈作为观察写入历史并继续执行。旧的未配置路径保持原行为。
 
+验证器可在拒绝时给出机器可读的 `CompletionDecision.Reason`；它不写入对话，只提供给可选的 `ToolChoicePolicy`。宿主据此只在紧随拒绝的那一轮约束工具调用（如指定某个工具），响应违背约束时以 `ErrToolChoiceNotHonored` 停止，不派发其中任何调用。哪些动作必须执行、何时可以强制，仍由宿主依据自身事实决定，Loom 不做业务判断。
+
 受控循环还要求稳定的 `CompletionVerifierID` 并把它纳入恢复策略哈希。验证拒绝后的历史会随检查点保存；预算用尽时受控循环暂停，普通循环返回 `ErrCompletionUnverified`，不会把被拒绝候选包装成成功。
 
 这一阶段补上了完成验证与有限纠正机制。通用操作日志仍需宿主提供持久化实现；Loom 规定统一装饰、回放和结果未知协议，Weave 目前负责 PostgreSQL 落盘、事务 fencing 和业务错误映射。

@@ -78,6 +78,10 @@ type toolLoopControlState struct {
 	ProviderStopReason    string                 `json:"provider_stop_reason"`
 	PartialText           string                 `json:"partial_text"`
 	HaltedResponse        *contract.ChatResponse `json:"halted_response"`
+	// LastCompletionRejection is present only between a rejected completion and
+	// the next model round, so a pause at that boundary keeps the tool choice.
+	// It is omitted otherwise, leaving snapshots of loops without it unchanged.
+	LastCompletionRejection *toolLoopCompletionRejection `json:"last_completion_rejection,omitempty"`
 }
 
 var controlSnapshotKeys = []string{
@@ -207,6 +211,10 @@ func readToolLoopControl(state loom.State) (toolLoopControlState, bool, error) {
 		(control.Slice > 1 && strings.TrimSpace(control.LastGrantID) == "") {
 		return invalid()
 	}
+	if rejection := control.LastCompletionRejection; rejection != nil &&
+		(control.Phase == "complete" || len(rejection.Reason) > maxCompletionRejectionReasonBytes) {
+		return invalid()
+	}
 	var pending []toolLoopPendingCall
 	var msgs []contract.Message
 	var staged []contract.ToolResult
@@ -327,6 +335,25 @@ func toolLoopPolicyHash(opts ToolLoopOpts, state loom.State) (string, error) {
 	system := opts.SystemPrompt
 	if value, ok := state["__system_prompt"].(string); ok && value != "" {
 		system = value
+	}
+	if opts.ToolChoicePolicy != nil || opts.ToolChoicePolicyID != "" {
+		// Only loops that opt into a tool choice policy use this identity shape;
+		// existing continuation hashes below stay byte-for-byte unchanged.
+		data, err := json.Marshal(struct {
+			Version                     uint32
+			Control                     ToolLoopControl
+			Model, System               string
+			Iterations, Repeats, Tokens int
+			Effort                      contract.EffortLevel
+			Schema                      *json.RawMessage
+			CompletionVerifierID        string
+			ToolChoicePolicyID          string
+		}{3, *opts.Control, opts.Model, system, opts.MaxIterations, opts.MaxToolRepeats, opts.MaxTokens, opts.Effort, opts.OutputSchema, opts.CompletionVerifierID, opts.ToolChoicePolicyID})
+		if err != nil {
+			return "", fmt.Errorf("loom/toolloop: invalid control policy: %w", err)
+		}
+		digest := sha256.Sum256(data)
+		return hex.EncodeToString(digest[:]), nil
 	}
 	if opts.CompletionVerifier == nil && opts.CompletionVerifierID == "" {
 		data, err := json.Marshal(struct {
