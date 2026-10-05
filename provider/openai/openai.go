@@ -448,6 +448,8 @@ func (c *Client) requireJSONOutputInstruction(req contract.ChatRequest) error {
 // 本方法不做重试；单个物理 attempt 受构造期超时约束（默认 120s，WithAttemptTimeout
 // 可覆盖），与调用方传入的 ctx 取消/超时叠加生效。
 func (c *Client) Chat(ctx context.Context, req contract.ChatRequest) (*contract.ChatResponse, error) {
+	probe := newProtocolCapture(ctx, "openai_chat")
+	defer probe.emit()
 	// json_object + Schema 的发送前校验：缺 JSON 指令立即失败，请求不出门。
 	if err := c.requireJSONOutputInstruction(req); err != nil {
 		return nil, err
@@ -489,9 +491,10 @@ func (c *Client) Chat(ctx context.Context, req contract.ChatRequest) (*contract.
 	if err != nil {
 		return nil, fmt.Errorf("openai: marshal request: %w", err)
 	}
+	probe.request(oaiReq.Tools)
 
 	// 构造 HTTP 请求并绑定 ctx：取消/超时由调用方 context 驱动，本包不额外设限。
-	httpReq, err := http.NewRequestWithContext(ctx, "POST", c.baseURL+c.chatPath, bytes.NewReader(body))
+	httpReq, err := http.NewRequestWithContext(probe.trace(ctx), "POST", c.baseURL+c.chatPath, bytes.NewReader(body))
 	if err != nil {
 		return nil, err // URL 非法等构造错误，原样返回
 	}
@@ -501,6 +504,7 @@ func (c *Client) Chat(ctx context.Context, req contract.ChatRequest) (*contract.
 	// 发起同步请求；网络层错误（连接失败、ctx 取消等）在此返回。
 	resp, err := c.client.Do(httpReq)
 	if err != nil {
+		probe.end(protocolTransportEnd(ctx), "", false, 0)
 		return nil, fmt.Errorf("openai: http: %w", err)
 	}
 	defer resp.Body.Close() // 无论成败都释放连接
@@ -508,29 +512,37 @@ func (c *Client) Chat(ctx context.Context, req contract.ChatRequest) (*contract.
 	// 先整体读出响应体：非 200 时它就是错误详情，200 时再做 JSON 解析。
 	respBody, err := io.ReadAll(resp.Body)
 	if err != nil {
+		probe.end("read_error", "", false, 0)
 		return nil, fmt.Errorf("openai: read response: %w", err)
 	}
 
 	// 非 200 一律视为失败，把原始响应体附进错误便于排查（通常含厂商错误 JSON）。
 	if resp.StatusCode != http.StatusOK {
+		probe.end("http_error", "", false, 0)
 		return nil, fmt.Errorf("openai: HTTP %d: %s", resp.StatusCode, string(respBody))
 	}
 
 	// 解析 wire 响应。
 	var oaiResp oaiResponse
+	probe.frame()
 	if err := json.Unmarshal(respBody, &oaiResp); err != nil {
+		probe.parseFailure()
+		probe.end("decode_error", "", false, 0)
 		return nil, fmt.Errorf("openai: unmarshal response: %w", err)
 	}
 
 	// 部分兼容端点会在 200 响应体内携带 error 字段，需要单独识别。
 	if oaiResp.Error != nil {
+		probe.end("api_error", "", false, 0)
 		return nil, fmt.Errorf("openai: API error: %s", oaiResp.Error.Message)
 	}
 
 	// 协议约定至少返回一个 choice；空响应视为异常。
 	if len(oaiResp.Choices) == 0 {
+		probe.end("empty_response", "", false, 0)
 		return nil, fmt.Errorf("openai: empty response")
 	}
+	probe.chatShape(respBody)
 
 	// 只取第一个 choice（框架不使用 n>1 的多候选），回填为 contract.ChatResponse。
 	choice := oaiResp.Choices[0]
@@ -552,12 +564,22 @@ func (c *Client) Chat(ctx context.Context, req contract.ChatRequest) (*contract.
 			Args: tc.Function.Arguments, // 参数 JSON 字符串（原样保留）
 		})
 	}
+	if probe != nil {
+		calls := make(map[int]*contract.ToolCall, len(chatResp.ToolCalls))
+		for index := range chatResp.ToolCalls {
+			probe.delta(index)
+			calls[index] = &chatResp.ToolCalls[index]
+		}
+		probe.calls(calls)
+	}
 
 	// 空响应 fail-closed：HTTP 200 但 content 与 tool_calls 均为空不是成功。
 	// 合法例外：tool_calls 非空时 content 可以为空字符串。
 	if chatResp.Content == "" && len(chatResp.ToolCalls) == 0 {
+		probe.end("empty_response", choice.FinishReason, false, 0)
 		return nil, &EmptyResponseError{FinishReason: choice.FinishReason}
 	}
+	probe.end("response", choice.FinishReason, false, len(chatResp.ToolCalls))
 
 	return chatResp, nil // 映射完成，返回 contract 层响应
 }
@@ -585,7 +607,13 @@ type oaiStreamChunk struct {
 // 中文：流式对话。请求组装与 Chat 完全一致，只额外打开 stream 开关并请求 usage 统计；
 // 立即返回一个由后台 goroutine 持续写入的只读通道：文本增量即时下发，
 // tool_calls 参数按 Index 跨块拼接，直到 [DONE] 哨兵到达时随终止块一次性交付。
-func (c *Client) Stream(ctx context.Context, req contract.ChatRequest) (<-chan contract.StreamChunk, error) {
+func (c *Client) Stream(ctx context.Context, req contract.ChatRequest) (stream <-chan contract.StreamChunk, streamErr error) {
+	probe := newProtocolCapture(ctx, "openai_sse")
+	defer func() {
+		if stream == nil {
+			probe.emit()
+		}
+	}()
 	// json_object + Schema 的发送前校验：与 Chat 同一语义，请求不得发出。
 	if err := c.requireJSONOutputInstruction(req); err != nil {
 		return nil, err
@@ -627,9 +655,10 @@ func (c *Client) Stream(ctx context.Context, req contract.ChatRequest) (<-chan c
 	if err != nil {
 		return nil, fmt.Errorf("openai: marshal request: %w", err)
 	}
+	probe.request(oaiReq.Tools)
 
 	// 构造请求并绑定 ctx：取消 ctx 会中断后续的流读取，使读循环自然退出。
-	httpReq, err := http.NewRequestWithContext(ctx, "POST", c.baseURL+c.chatPath, bytes.NewReader(body))
+	httpReq, err := http.NewRequestWithContext(probe.trace(ctx), "POST", c.baseURL+c.chatPath, bytes.NewReader(body))
 	if err != nil {
 		return nil, err // URL 构造失败
 	}
@@ -640,11 +669,13 @@ func (c *Client) Stream(ctx context.Context, req contract.ChatRequest) (<-chan c
 	// 发起请求；成功后响应体是一条保持打开的 SSE 长连接。
 	resp, err := c.client.Do(httpReq)
 	if err != nil {
+		probe.end(protocolTransportEnd(ctx), "", false, 0)
 		return nil, fmt.Errorf("openai: http: %w", err)
 	}
 
 	// 非 200 说明流根本没有建立：读出错误体、关闭连接，同步返回错误。
 	if resp.StatusCode != http.StatusOK {
+		probe.end("http_error", "", false, 0)
 		defer resp.Body.Close()
 		errBody, _ := io.ReadAll(resp.Body) // 错误详情尽力而为，读失败也不影响主错误
 		return nil, fmt.Errorf("openai: HTTP %d: %s", resp.StatusCode, string(errBody))
@@ -657,10 +688,12 @@ func (c *Client) Stream(ctx context.Context, req contract.ChatRequest) (<-chan c
 	go func() {
 		defer resp.Body.Close() // 退出时释放连接
 		defer close(ch)         // 关闭通道即向消费方宣告流结束（含异常提前结束）
+		defer probe.emit()
 
 		// tool_calls 的参数 JSON 被拆散在多个增量块里，
 		// 以 choice 内的 Index 为键在此累积拼接，直到流结束才完整。
 		toolCallMap := make(map[int]*contract.ToolCall)
+		defer probe.calls(toolCallMap)
 		var lastUsage *contract.Usage // 暂存流尾 usage 块，随最终 Done 块一并交付
 		var lastFinishReason string   // 暂存流中首个非空 finish_reason，随终止块交付
 		sawContent := false           // 是否交付过任何文本增量（空响应判定用）
@@ -687,6 +720,7 @@ func (c *Client) Stream(ctx context.Context, req contract.ChatRequest) (<-chan c
 			if data == "[DONE]" {
 				// 空响应 fail-closed：全程无文本且无工具调用，[DONE] 不是成功。
 				if !sawContent && len(toolCallMap) == 0 {
+					probe.end("empty_response", lastFinishReason, true, 0)
 					ch <- contract.StreamChunk{
 						Err: &EmptyResponseError{
 							FinishReason: lastFinishReason,
@@ -696,15 +730,13 @@ func (c *Client) Stream(ctx context.Context, req contract.ChatRequest) (<-chan c
 					}
 					return
 				}
-				// 有累积的工具调用时，按 Index 0..n-1 依序还原为切片，
+				// 有累积的工具调用时，按实际 Index 排序还原为切片，
 				// 与 Done 标志、usage 统计一起放进最后一个增量块交付。
 				if len(toolCallMap) > 0 {
 					var tcs []contract.ToolCall
-					// 服务端按 0 起连续编号 Index，计数循环保证输出顺序稳定。
-					for i := 0; i < len(toolCallMap); i++ {
-						if tc, ok := toolCallMap[i]; ok {
-							tcs = append(tcs, *tc)
-						}
+					// 稀疏索引不能静默丢调用；诊断仍将该形态标为不完整。
+					for _, index := range sortedToolIndexes(toolCallMap) {
+						tcs = append(tcs, *toolCallMap[index])
 					}
 					ch <- contract.StreamChunk{
 						ToolCalls:    tcs,
@@ -712,6 +744,7 @@ func (c *Client) Stream(ctx context.Context, req contract.ChatRequest) (<-chan c
 						Usage:        lastUsage,
 						FinishReason: lastFinishReason,
 					}
+					probe.end("done", lastFinishReason, true, len(tcs))
 				} else {
 					// 纯文本流：只发终止块（Done + usage）。
 					ch <- contract.StreamChunk{
@@ -719,15 +752,19 @@ func (c *Client) Stream(ctx context.Context, req contract.ChatRequest) (<-chan c
 						Usage:        lastUsage,
 						FinishReason: lastFinishReason,
 					}
+					probe.end("done", lastFinishReason, true, 0)
 				}
 				return // 正常收尾：defer 负责关闭通道与连接
 			}
 
 			// 反序列化单个增量块；个别畸形块直接跳过，保证整条流的健壮性。
 			var chunk oaiStreamChunk
+			probe.frame()
 			if err := json.Unmarshal([]byte(data), &chunk); err != nil {
+				probe.parseFailure()
 				continue
 			}
+			probe.streamShape([]byte(data), chunk)
 
 			// Capture usage from any chunk (sent in a dedicated chunk
 			// with empty choices when stream_options.include_usage=true).
@@ -764,6 +801,7 @@ func (c *Client) Stream(ctx context.Context, req contract.ChatRequest) (<-chan c
 			// 工具调用增量：首个分片携带 ID/Name 与参数开头，后续分片只带参数续片。
 			for _, tc := range delta.ToolCalls {
 				idx := tc.Index // 同一次调用的所有分片共享同一个 Index
+				probe.delta(idx)
 				if _, ok := toolCallMap[idx]; !ok {
 					// 首次见到该 Index：登记调用 ID、工具名与参数首片。
 					toolCallMap[idx] = &contract.ToolCall{
@@ -782,13 +820,16 @@ func (c *Client) Stream(ctx context.Context, req contract.ChatRequest) (<-chan c
 		// 而不是"干净关闭"。取消优先于 scanner 错误：ctx 取消时 body 读取失败
 		// 的底层错误往往就是 context.Canceled/DeadlineExceeded。
 		if ctx.Err() != nil {
+			probe.end("cancel", lastFinishReason, false, 0)
 			ch <- contract.StreamChunk{Err: &StreamCloseError{CloseKind: "cancel", Err: ctx.Err()}}
 			return
 		}
 		if err := scanner.Err(); err != nil {
+			probe.end("scanner", lastFinishReason, false, 0)
 			ch <- contract.StreamChunk{Err: &StreamCloseError{CloseKind: "scanner", Err: err}}
 			return
 		}
+		probe.end("eof", lastFinishReason, false, 0)
 		ch <- contract.StreamChunk{Err: &StreamCloseError{CloseKind: "eof"}}
 	}()
 

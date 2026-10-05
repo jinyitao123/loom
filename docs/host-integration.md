@@ -108,6 +108,60 @@ completion (`result` carries final status + session id).
 process invocations. This is how a per-turn CLI sustains a multi-turn,
 in-presence agent.
 
+## Optional provider protocol observations
+
+Embedded Go hosts may opt a single provider invocation into
+`openai.WithProtocolObserver(ctx, options, callback)`. No observer is installed
+by default. This context option does not change `ChatRequest`, model request
+JSON, `ChatResponse`, `StreamChunk`, CLI events or journal response formats.
+Place an observing wrapper inside `stdlib.NewJournaledLLM` when replay must not
+collect another observation. The host owns authorization, expiry, attempt
+identity, quotas and persistence; the provider adds no storage or execution loop.
+
+The callback receives one `contract.ProtocolObservation` per `Client.Chat` or
+`Client.Stream` invocation, including pre-send refusals and failed HTTP attempts.
+For streaming it runs before the returned channel closes; for Chat it runs
+before the method returns. Callbacks must be short and synchronize shared state.
+A nil callback disables collection, and a callback panic is isolated from model
+execution. A caller that cancels must still drain the stream to closure.
+
+The value contains only tool-definition count/SHA-256, bounded data-frame and
+parse-failure counts, tool-delta indexes, assembled/emitted call counts, argument
+byte lengths/SHA-256, a finite finish reason, terminal shape and completeness.
+It never contains messages, response text, raw frames, headers, API keys, tool
+names, call IDs, argument text or reasoning. The definition digest is SHA-256 of
+the actual serialized OpenAI `tools` value (`null` represents an omitted list).
+`RequestSent` requires the HTTP trace's successful `WroteRequest` boundary;
+pre-send/transport failures cannot prove the provider received the request.
+
+Absence means not collected or unsupported. `Complete=false` means the counts
+cannot establish zero calls. Malformed/unsupported frames, sparse/negative indexes, missing
+tool identities, unknown/missing finish reasons, EOF, cancellation, scan errors
+and capture limits remain incomplete even when some counts are available. A
+tool-call finish without any assembled call is also incomplete.
+`DoneSeen` records the actual SSE sentinel, independently of completeness.
+Normal text with an observed finish and DONE can prove a complete zero-call
+protocol response, which is not proof that a requested task succeeded.
+
+The supported SSE delta and non-streaming message fields are `content`, `tool_calls`, `role`,
+`reasoning_content` and `refusal`. The last three do not carry tool calls and
+are never copied into observations. A non-null `function_call` or other unknown
+delta/message field makes the observation incomplete: the adapter does not execute that
+unsupported protocol, and cannot call its ignored value a complete zero-call
+response. Null compatibility fields do not contain a call. This validation only
+affects observation completeness; legacy execution and default wire behavior
+remain unchanged.
+
+`MaxDataFrames`, `MaxToolDeltas` and `MaxToolIndexes` bound metadata only. Defaults
+are 16,384 / 4,096 / 128; hard ceilings are 65,536 / 65,536 / 256. Exceeding a
+limit sets `Truncated` and never truncates model output or tool execution.
+Argument indexes are wire indexes for SSE and array positions for Chat.
+Sparse SSE indexes are assembled in sorted index order so they cannot silently
+lose a call; the observation still reports that protocol shape as incomplete.
+Malformed-frame skipping retains its existing behavior, but can no longer look
+complete to an enabled observer. These are synthetic protocol tests and future
+observations, not reconstructed evidence for an earlier unobserved request.
+
 ## Embedded lifecycle hooks
 
 An embedded Go host that needs durable run admission or terminalization can
