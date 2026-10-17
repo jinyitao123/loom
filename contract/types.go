@@ -13,6 +13,23 @@ type Message struct {
 	Content    string     `json:"content,omitempty"`      // 文本内容；纯工具调用消息可为空
 	ToolCalls  []ToolCall `json:"tool_calls,omitempty"`   // assistant 消息携带的工具调用请求（可多个）
 	ToolCallID string     `json:"tool_call_id,omitempty"` // tool 消息回填的调用 ID，与发起方 ToolCall.ID 配对
+	// Parts optionally carries the message as ordered text and image parts.
+	// Content always holds the text rendering, so providers without
+	// multi-part input keep working; providers that accept images send Parts.
+	// Parts 可选地以有序的文本/图片片段表达消息；Content 始终保留纯文本形态，
+	// 不支持多片段输入的 provider 照常工作，支持图片的 provider 改发 Parts。
+	Parts []ContentPart `json:"parts,omitempty"`
+}
+
+// ContentPart is one part of a multi-part message. Type "text" uses Text;
+// type "image" uses MediaType (for example image/png) and Data, the base64
+// encoded bytes without a data: prefix.
+// ContentPart 是多片段消息中的一段：text 用 Text；image 用 MediaType 与 Data（不带 data: 前缀的 base64）。
+type ContentPart struct {
+	Type      string `json:"type"`
+	Text      string `json:"text,omitempty"`
+	MediaType string `json:"media_type,omitempty"`
+	Data      string `json:"data,omitempty"`
 }
 
 // ToolCall represents a tool invocation requested by the LLM.
@@ -44,6 +61,9 @@ type ToolResult struct {
 	// ToolName 冗余记录工具名：ToolHook 的 Post 阶段只拿到结果时仍能按工具名匹配。
 	Park    bool   `json:"park,omitempty"`     // true=本次调用未执行，已被平台扣下等外部批准；Content 仅为占位说明，循环不得将其当作执行结果
 	ParkRef string `json:"park_ref,omitempty"` // 平台侧不透明关联引用（如审批动作 ID），原样带进暂停现场供宿主定位
+	// Parts optionally carries the result as text and image parts; Content
+	// stays the text rendering. 可选的文本/图片片段，Content 仍为纯文本形态。
+	Parts []ContentPart `json:"parts,omitempty"`
 	// Park marks an unexecuted call held for external approval; ParkRef carries the platform's opaque correlation reference.
 }
 
@@ -54,6 +74,7 @@ func (r *ToolResult) AsMessage() Message {
 		Role:       "tool",    // 固定为 tool 角色，模型据此识别这是工具回执
 		Content:    r.Content, // 结果正文原样进入上下文
 		ToolCallID: r.CallID,  // 回填调用 ID，与发起该调用的 assistant 消息配对
+		Parts:      r.Parts,   // 富内容片段随回执一并入史
 	}
 }
 
