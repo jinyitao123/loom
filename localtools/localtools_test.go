@@ -2,6 +2,7 @@ package localtools
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -213,5 +214,23 @@ func TestTruncateTailKeepsTheEnd(t *testing.T) {
 	text, truncated := truncateTail(b.String())
 	if !truncated || !strings.HasSuffix(text, fmt.Sprintf("%d\n", MaxLines+9)) || strings.HasPrefix(text, "0\n") {
 		t.Fatalf("truncated=%v head=%q", truncated, text[:20])
+	}
+}
+
+func TestReadReturnsImagesAsParts(t *testing.T) {
+	tools, dir := newTools(t, "read")
+	png := []byte("\x89PNG\r\n\x1a\nfake")
+	if err := os.WriteFile(filepath.Join(dir, "dot.PNG"), png, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	r := call(t, tools, "read", map[string]any{"path": "dot.PNG"})
+	if r.IsError || len(r.Parts) != 2 || r.Parts[1].Type != "image" || r.Parts[1].MediaType != "image/png" {
+		t.Fatalf("image read = %+v", r)
+	}
+	if r.Parts[1].Data != base64.StdEncoding.EncodeToString(png) || !strings.Contains(r.Content, "image/png") {
+		t.Fatalf("image data or text: %+v", r)
+	}
+	if missing := call(t, tools, "read", map[string]any{"path": "nope.jpg"}); !missing.IsError {
+		t.Fatal("missing image read without error")
 	}
 }

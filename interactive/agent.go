@@ -19,14 +19,23 @@ type LLMFactory func(model Model, apiKey string) (contract.LLM, error)
 
 // Options configures an Agent.
 type Options struct {
-	Cwd           string                  // working directory of the agent and its tools
-	SessionDir    string                  // directory that receives new session files
-	Catalog       *Catalog                // configured models and keys
-	NewLLM        LLMFactory              // model client factory
-	Tools         contract.ToolDispatcher // tools offered to the model
-	SystemPrompt  string                  // system prompt for every model request
-	MaxIterations int                     // model rounds per prompt; <=0 means 500
-	Emit          func(event any)         // receives every protocol event; must be safe for concurrent use
+	Cwd              string                  // working directory of the agent and its tools
+	SessionDir       string                  // directory that receives new session files
+	Catalog          *Catalog                // configured models and keys
+	NewLLM           LLMFactory              // model client factory
+	Tools            contract.ToolDispatcher // tools offered to the model
+	SystemPrompt     string                  // system prompt for every model request
+	MaxIterations    int                     // model rounds per prompt; <=0 means 500
+	ReserveTokens    int                     // compaction runs when context exceeds window minus this; <=0 means 16384
+	KeepRecentTokens int                     // recent history kept verbatim by compaction; <=0 means 20000
+	Skills           []Skill                 // skills offered by "/skill:<name>" (also listed in SystemPrompt by the caller)
+	Emit             func(event any)         // receives every protocol event; must be safe for concurrent use
+}
+
+// queued is a prompt waiting to be delivered.
+type queued struct {
+	text   string
+	images []Block
 }
 
 // ThinkingLevels lists the accepted thinking levels.
@@ -51,10 +60,11 @@ type Agent struct {
 	model          *Model
 	thinking       string
 	running        bool
+	compacting     bool
 	cancel         context.CancelFunc
 	idle           chan struct{}
-	steering       []string
-	followUp       []string
+	steering       []queued
+	followUp       []queued
 	autoCompaction bool
 	autoRetry      bool
 	steeringMode   string
@@ -67,6 +77,12 @@ type Agent struct {
 func New(opts Options, sessionPath, provider, modelID, thinking string) (*Agent, error) {
 	if opts.MaxIterations <= 0 {
 		opts.MaxIterations = 500
+	}
+	if opts.ReserveTokens <= 0 {
+		opts.ReserveTokens = DefaultReserveTokens
+	}
+	if opts.KeepRecentTokens <= 0 {
+		opts.KeepRecentTokens = DefaultKeepRecentTokens
 	}
 	if opts.Catalog == nil {
 		opts.Catalog = &Catalog{keys: map[string]string{}}
@@ -141,7 +157,7 @@ func (a *Agent) State() map[string]any {
 		"model":                 a.model,
 		"thinkingLevel":         a.thinking,
 		"isStreaming":           a.running,
-		"isCompacting":          false,
+		"isCompacting":          a.compacting,
 		"steeringMode":          a.steeringMode,
 		"followUpMode":          a.followUpMode,
 		"sessionFile":           a.session.Path(),
@@ -156,18 +172,19 @@ func (a *Agent) State() map[string]any {
 	return state
 }
 
-// Prompt starts working on text. While the agent is working, behavior must be
-// "steer" or "followUp" and the text is queued instead.
-func (a *Agent) Prompt(text, behavior string) error {
+// Prompt starts working on text and images. While the agent is working,
+// behavior must be "steer" or "followUp" and the prompt is queued instead.
+func (a *Agent) Prompt(text string, images []Block, behavior string) error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	item := queued{text: text, images: images}
 	if a.running {
 		switch behavior {
 		case "steer":
-			a.enqueueLocked(&a.steering, text)
+			a.enqueueLocked(&a.steering, item)
 			return nil
 		case "followUp":
-			a.enqueueLocked(&a.followUp, text)
+			a.enqueueLocked(&a.followUp, item)
 			return nil
 		}
 		return ErrBusy
@@ -175,42 +192,70 @@ func (a *Agent) Prompt(text, behavior string) error {
 	if a.model == nil {
 		return ErrNoModel
 	}
-	a.startLocked(text)
+	a.startLocked(item)
 	return nil
 }
 
-// Steer queues text for the running prompt. Until the tool loop accepts input
-// between model rounds, steering is delivered when the current prompt ends.
-// Steer 为正在执行的提问排队一条插话；在工具循环支持轮次间接收输入之前，插话在本次提问结束后送达。
-func (a *Agent) Steer(text string) error { return a.queue(&a.steering, text) }
+// Steer queues a message for the running prompt; it is delivered after the
+// current model round's tool calls finish, before the next model request.
+// Steer 为正在执行的提问排队一条插话，在本轮工具调用结束后、下一次请求模型前送达。
+func (a *Agent) Steer(text string, images []Block) error {
+	return a.queue(&a.steering, queued{text: text, images: images})
+}
 
-// FollowUp queues text to run after the current prompt.
-func (a *Agent) FollowUp(text string) error { return a.queue(&a.followUp, text) }
+// FollowUp queues a message to run after the current prompt finishes.
+func (a *Agent) FollowUp(text string, images []Block) error {
+	return a.queue(&a.followUp, queued{text: text, images: images})
+}
 
-func (a *Agent) queue(target *[]string, text string) error {
+func (a *Agent) queue(target *[]queued, item queued) error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	if !a.running {
 		if a.model == nil {
 			return ErrNoModel
 		}
-		a.startLocked(text)
+		a.startLocked(item)
 		return nil
 	}
-	a.enqueueLocked(target, text)
+	a.enqueueLocked(target, item)
 	return nil
 }
 
-func (a *Agent) enqueueLocked(target *[]string, text string) {
-	*target = append(*target, text)
+func (a *Agent) enqueueLocked(target *[]queued, item queued) {
+	*target = append(*target, item)
 	a.emitQueueLocked()
 }
 
-func (a *Agent) emitQueueLocked() {
-	a.emit(map[string]any{"type": "queue_update", "steering": append([]string{}, a.steering...), "followUp": append([]string{}, a.followUp...)})
+func queueTexts(items []queued) []string {
+	texts := make([]string, len(items))
+	for i, item := range items {
+		texts[i] = item.text
+	}
+	return texts
 }
 
-func (a *Agent) startLocked(text string) {
+func (a *Agent) emitQueueLocked() {
+	a.emit(map[string]any{"type": "queue_update", "steering": queueTexts(a.steering), "followUp": queueTexts(a.followUp)})
+}
+
+// takeLocked removes the next queued messages: one, or all when mode is "all".
+func takeLocked(queue *[]queued, mode string) []queued {
+	if len(*queue) == 0 {
+		return nil
+	}
+	n := 1
+	if mode == "all" {
+		n = len(*queue)
+	}
+	taken := append([]queued(nil), (*queue)[:n]...)
+	*queue = (*queue)[n:]
+	return taken
+}
+
+// startJob marks the agent busy and runs job in the background until it
+// returns; Abort cancels its context.
+func (a *Agent) startJobLocked(job func(ctx context.Context)) {
 	ctx, cancel := context.WithCancel(context.Background())
 	a.running = true
 	a.cancel = cancel
@@ -219,7 +264,13 @@ func (a *Agent) startLocked(text string) {
 	go func() {
 		defer close(idle)
 		defer cancel()
-		next := text
+		job(ctx)
+	}()
+}
+
+func (a *Agent) startLocked(first queued) {
+	a.startJobLocked(func(ctx context.Context) {
+		next := []queued{first}
 		for {
 			a.runPrompt(ctx, next)
 			a.mu.Lock()
@@ -229,15 +280,39 @@ func (a *Agent) startLocked(text string) {
 				a.emit(map[string]any{"type": "agent_settled"})
 				return
 			}
-			if len(a.steering) > 0 {
-				next, a.steering = a.steering[0], a.steering[1:]
-			} else {
-				next, a.followUp = a.followUp[0], a.followUp[1:]
+			if next = takeLocked(&a.steering, a.steeringMode); next == nil {
+				next = takeLocked(&a.followUp, a.followUpMode)
 			}
 			a.emitQueueLocked()
 			a.mu.Unlock()
 		}
-	}()
+	})
+}
+
+// Compact summarizes older history now. It fails while a prompt is running.
+func (a *Agent) Compact(instructions string) (*CompactionResult, error) {
+	a.mu.Lock()
+	if a.running {
+		a.mu.Unlock()
+		return nil, ErrBusy
+	}
+	if a.model == nil {
+		a.mu.Unlock()
+		return nil, ErrNoModel
+	}
+	var result *CompactionResult
+	var err error
+	a.compacting = true
+	a.startJobLocked(func(ctx context.Context) {
+		result, err = a.compact(ctx, "manual", instructions, false)
+		a.mu.Lock()
+		a.running, a.compacting = false, false
+		a.mu.Unlock()
+	})
+	idle := a.idle
+	a.mu.Unlock()
+	<-idle
+	return result, err
 }
 
 // Abort stops the running prompt, drops queued input and waits until idle.
@@ -376,6 +451,15 @@ func (a *Agent) Stats() map[string]any {
 	var tokens Usage
 	var last *Usage
 	for _, entry := range a.session.Entries() {
+		if entry.Type == "compaction" {
+			if u := entry.Usage; u != nil {
+				tokens.Input += u.Input
+				tokens.Output += u.Output
+				tokens.Cost.Total += u.Cost.Total
+			}
+			last = nil // context size is unknown until the next answer
+			continue
+		}
 		if entry.Type != "message" || entry.Message == nil {
 			continue
 		}
@@ -460,30 +544,105 @@ func (r *promptRun) appendAndAnnounce(m Message) {
 	r.agent.emit(map[string]any{"type": "message_end", "message": m})
 }
 
-func (a *Agent) runPrompt(ctx context.Context, text string) {
+// userMessage builds the stored user message of a queued prompt, expanding a
+// "/skill:<name>" command.
+func (a *Agent) userMessage(item queued) Message {
+	text, err := expandSkillCommand(item.text, a.opts.Skills)
+	if err != nil {
+		text = item.text
+		a.emit(map[string]any{"type": "extension_error", "extensionPath": "skills", "event": "expand", "error": err.Error()})
+	}
+	content := textBlocks(text)
+	content = append(content, item.images...)
+	return Message{Role: "user", Content: content, Timestamp: nowMillis()}
+}
+
+// loopMessages rebuilds the transcript of the running loop from the session,
+// keeping the system message the loop prepended.
+func (a *Agent) loopMessages(current []contract.Message, vision bool) []contract.Message {
+	a.mu.Lock()
+	history := toContract(a.session.Context().Messages, vision)
+	a.mu.Unlock()
+	if len(current) > 0 && current[0].Role == "system" {
+		return append([]contract.Message{current[0]}, history...)
+	}
+	return history
+}
+
+// needsCompaction reports whether the active context exceeds the threshold.
+func (a *Agent) needsCompaction() bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if !a.autoCompaction || a.model == nil {
+		return false
+	}
+	threshold := compactionThreshold(a.model.ContextWindow, a.opts.ReserveTokens)
+	return threshold > 0 && contextTokens(a.session.Context().Messages) > threshold
+}
+
+func (a *Agent) runPrompt(ctx context.Context, items []queued) {
 	a.mu.Lock()
 	model, thinking := *a.model, a.thinking
-	history := a.session
 	a.mu.Unlock()
+	vision := supportsImages(model)
 
 	run := &promptRun{agent: a, model: model, thinking: thinking}
 	a.emit(map[string]any{"type": "agent_start"})
 	a.emit(map[string]any{"type": "turn_start"})
-	run.appendAndAnnounce(Message{Role: "user", Content: textBlocks(text), Timestamp: nowMillis()})
+	for _, item := range items {
+		run.appendAndAnnounce(a.userMessage(item))
+	}
 
-	a.mu.Lock()
-	messages := toContract(history.Context().Messages)
-	a.mu.Unlock()
+	// beforeRound delivers steering queued while the loop runs and compacts
+	// the session when the context grows past the threshold; either way the
+	// loop continues from the transcript rebuilt from the session.
+	beforeRound := func(ctx context.Context, round int, messages []contract.Message) ([]contract.Message, error) {
+		changed := false
+		if round > 0 {
+			a.mu.Lock()
+			steering := takeLocked(&a.steering, a.steeringMode)
+			if steering != nil {
+				a.emitQueueLocked()
+			}
+			a.mu.Unlock()
+			for _, item := range steering {
+				run.appendAndAnnounce(a.userMessage(item))
+				changed = true
+			}
+		}
+		if a.needsCompaction() {
+			if _, err := a.compact(ctx, "threshold", "", false); err == nil {
+				changed = true
+			}
+		}
+		if !changed {
+			return messages, nil
+		}
+		return a.loopMessages(messages, vision), nil
+	}
 
-	llm, err := a.opts.NewLLM(model, a.opts.Catalog.Key(model.Provider))
-	if err == nil {
+	runLoop := func() error {
+		llm, err := a.opts.NewLLM(model, a.opts.Catalog.Key(model.Provider))
+		if err != nil {
+			return err
+		}
 		step := stdlib.NewToolLoopStep(&observedLLM{inner: llm, run: run}, a.opts.Tools, stdlib.ToolLoopOpts{
 			Model:         model.ID,
 			SystemPrompt:  a.opts.SystemPrompt,
 			MaxIterations: a.opts.MaxIterations,
 			ToolHooks:     []contract.ToolHook{run.toolHook()},
+			BeforeRound:   beforeRound,
 		})
-		_, err = step(ctx, loom.State{"messages": messages})
+		_, err = step(ctx, loom.State{"messages": a.loopMessages(nil, vision)})
+		return err
+	}
+	err := runLoop()
+	// The request did not fit the context window: compact and try once more.
+	if err != nil && ctx.Err() == nil && IsContextOverflow(err) && a.autoCompactionEnabled() {
+		if _, cerr := a.compact(ctx, "overflow", "", true); cerr == nil {
+			run.lastErr = nil
+			err = runLoop()
+		}
 	}
 	if err != nil && ctx.Err() == nil && !errors.Is(err, run.lastErr) {
 		run.appendAndAnnounce(Message{Role: "assistant", Content: nil, API: model.API, Provider: model.Provider, Model: model.ID,
@@ -491,6 +650,12 @@ func (a *Agent) runPrompt(ctx context.Context, text string) {
 	}
 	a.emit(map[string]any{"type": "turn_end", "message": run.assistant, "toolResults": nonNil(run.toolResults)})
 	a.emit(map[string]any{"type": "agent_end", "messages": nonNil(run.added), "willRetry": false})
+}
+
+func (a *Agent) autoCompactionEnabled() bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.autoCompaction
 }
 
 func nonNil(messages []Message) []Message {
@@ -508,10 +673,7 @@ func (r *promptRun) toolHook() contract.ToolHook {
 			return call, nil
 		},
 		Post: func(_ context.Context, call contract.ToolCall, result *contract.ToolResult) error {
-			content := textBlocks(result.Content)
-			if content == nil {
-				content = []Block{}
-			}
+			content := resultBlocks(result)
 			r.agent.emit(map[string]any{"type": "tool_execution_end", "toolCallId": call.ID, "toolName": call.Name,
 				"result": map[string]any{"content": content, "details": map[string]any{}}, "isError": result.IsError})
 			m := Message{Role: "toolResult", ToolCallID: call.ID, ToolName: call.Name, Content: content, IsError: boolPtr(result.IsError), Timestamp: nowMillis()}
@@ -520,6 +682,26 @@ func (r *promptRun) toolHook() contract.ToolHook {
 			return nil
 		},
 	}
+}
+
+// resultBlocks converts a tool result to content blocks, keeping its images.
+func resultBlocks(result *contract.ToolResult) []Block {
+	if len(result.Parts) == 0 {
+		if blocks := textBlocks(result.Content); blocks != nil {
+			return blocks
+		}
+		return []Block{}
+	}
+	blocks := make([]Block, 0, len(result.Parts))
+	for _, p := range result.Parts {
+		switch p.Type {
+		case "text":
+			blocks = append(blocks, Block{Type: "text", Text: p.Text})
+		case "image":
+			blocks = append(blocks, Block{Type: "image", Data: p.Data, MimeType: p.MediaType})
+		}
+	}
+	return blocks
 }
 
 func rawArgs(args string) json.RawMessage {

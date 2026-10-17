@@ -3,6 +3,7 @@ package localtools
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -11,16 +12,21 @@ import (
 	"sort"
 	"strings"
 	"unicode/utf8"
+
+	"github.com/jinyitao123/loom/contract"
 )
 
 func userHome() (string, error) { return os.UserHomeDir() }
 
 func init() {
 	register("read",
-		fmt.Sprintf("Read the contents of a file. Output is truncated to %d lines or %dKB (whichever is hit first). Use offset/limit for large files. When you need the full file, continue with offset until complete.", MaxLines, MaxBytes/1024),
+		fmt.Sprintf("Read the contents of a file. Supports text files and images (png, jpg, gif, webp); images are returned as attachments. For text files, output is truncated to %d lines or %dKB (whichever is hit first). Use offset/limit for large files. When you need the full file, continue with offset until complete.", MaxLines, MaxBytes/1024),
 		true,
 		`{"type":"object","properties":{"path":{"type":"string","description":"Path to the file to read (relative or absolute)"},"offset":{"type":"number","description":"Line number to start reading from (1-indexed)"},"limit":{"type":"number","description":"Maximum number of lines to read"}},"required":["path"]}`,
 		runRead)
+	readTool := definitions["read"]
+	readTool.media = readImage
+	definitions["read"] = readTool
 	register("write",
 		"Write content to a file. Creates the file if it doesn't exist, overwrites if it does. Automatically creates parent directories.",
 		false,
@@ -36,6 +42,40 @@ func init() {
 		true,
 		`{"type":"object","properties":{"path":{"type":"string","description":"Directory to list (default: current directory)"},"limit":{"type":"number","description":"Maximum number of entries to return (default: 500)"}}}`,
 		runLs)
+}
+
+// MaxImageBytes bounds an image returned by read.
+const MaxImageBytes = 20 << 20
+
+var imageTypes = map[string]string{".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".gif": "image/gif", ".webp": "image/webp"}
+
+// readImage answers read for PNG, JPEG, GIF and WebP files with the image as
+// a part, so models that accept images can see it.
+func readImage(t *Tools, raw json.RawMessage) (string, []contract.ContentPart, bool, error) {
+	var args struct {
+		Path string `json:"path"`
+	}
+	if err := decode(raw, &args); err != nil || args.Path == "" {
+		return "", nil, false, nil
+	}
+	mediaType, ok := imageTypes[strings.ToLower(filepath.Ext(args.Path))]
+	if !ok {
+		return "", nil, false, nil
+	}
+	path := t.resolve(args.Path)
+	info, err := os.Stat(path)
+	if err != nil {
+		return "", nil, false, fmt.Errorf("Could not read %s: %v", args.Path, err)
+	}
+	if info.Size() > MaxImageBytes {
+		return "", nil, false, fmt.Errorf("%s is larger than %d MB", args.Path, MaxImageBytes>>20)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return "", nil, false, fmt.Errorf("Could not read %s: %v", args.Path, err)
+	}
+	text := fmt.Sprintf("Read image file %s [%s, %d bytes]", args.Path, mediaType, len(data))
+	return text, []contract.ContentPart{{Type: "text", Text: text}, {Type: "image", MediaType: mediaType, Data: base64.StdEncoding.EncodeToString(data)}}, true, nil
 }
 
 func runRead(_ context.Context, t *Tools, raw json.RawMessage) (string, error) {

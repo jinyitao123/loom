@@ -80,6 +80,15 @@ func (t *Tools) Dispatch(ctx context.Context, call contract.ToolCall) (*contract
 	if args == "" {
 		args = "{}"
 	}
+	if tool.media != nil {
+		text, parts, handled, err := tool.media(t, json.RawMessage(args))
+		if err != nil {
+			return &contract.ToolResult{CallID: call.ID, Content: err.Error(), IsError: true}, nil
+		}
+		if handled {
+			return &contract.ToolResult{CallID: call.ID, Content: text, Parts: parts}, nil
+		}
+	}
 	content, err := tool.run(ctx, t, json.RawMessage(args))
 	if err != nil {
 		return &contract.ToolResult{CallID: call.ID, Content: err.Error(), IsError: true}, nil
@@ -116,6 +125,8 @@ func (t *Tools) resolve(path string) string {
 type toolSpec struct {
 	def contract.ToolDef
 	run func(ctx context.Context, t *Tools, args json.RawMessage) (string, error)
+	// media, when set, may answer a call with text and image parts instead of run.
+	media func(t *Tools, args json.RawMessage) (text string, parts []contract.ContentPart, handled bool, err error)
 }
 
 var definitions = map[string]toolSpec{}

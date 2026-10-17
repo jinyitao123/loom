@@ -2,6 +2,7 @@ package interactive
 
 import (
 	"bufio"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -99,24 +100,31 @@ func (s *Server) handle(line []byte) {
 	case "get_state":
 		s.respond(cmd, a.State(), nil)
 	case "prompt", "steer", "follow_up":
-		if len(cmd.Images) > 0 {
-			s.respond(cmd, nil, errors.New("images are not supported by the Loom kernel yet"))
+		images, err := validImages(cmd.Images)
+		if err != nil {
+			s.respond(cmd, nil, err)
 			return
 		}
-		if strings.TrimSpace(cmd.Message) == "" {
+		if strings.TrimSpace(cmd.Message) == "" && len(images) == 0 {
 			s.respond(cmd, nil, errors.New("message is empty"))
 			return
 		}
-		var err error
 		switch cmd.Type {
 		case "prompt":
-			err = a.Prompt(cmd.Message, cmd.StreamingBehavior)
+			err = a.Prompt(cmd.Message, images, cmd.StreamingBehavior)
 		case "steer":
-			err = a.Steer(cmd.Message)
+			err = a.Steer(cmd.Message, images)
 		default:
-			err = a.FollowUp(cmd.Message)
+			err = a.FollowUp(cmd.Message, images)
 		}
 		s.respond(cmd, nil, err)
+	case "compact":
+		// Compaction calls the model; answer from a goroutine so other
+		// commands (get_state, abort) keep flowing meanwhile.
+		go func() {
+			result, err := a.Compact(cmd.CustomInstructions)
+			s.respond(cmd, result, err)
+		}()
 	case "abort", "abort_retry":
 		if cmd.Type == "abort" {
 			a.Abort()
@@ -180,14 +188,49 @@ func (s *Server) handle(line []byte) {
 		}
 		s.respond(cmd, map[string]any{"messages": messages}, nil)
 	case "get_commands":
-		s.respond(cmd, map[string]any{"commands": []any{}}, nil)
+		commands := []map[string]string{}
+		for _, skill := range a.opts.Skills {
+			commands = append(commands, map[string]string{"name": "skill:" + skill.Name, "description": skill.Description, "source": "skill", "location": skill.Location, "path": skill.Path})
+		}
+		s.respond(cmd, map[string]any{"commands": commands}, nil)
 	case "extension_ui_response":
 		s.respond(cmd, nil, nil)
-	case "compact", "fork", "clone", "bash", "abort_bash", "get_entries", "get_tree", "export_html":
+	case "fork", "clone", "bash", "abort_bash", "get_entries", "get_tree", "export_html":
 		s.respond(cmd, nil, fmt.Errorf("%s is not supported by the Loom kernel yet", cmd.Type))
 	default:
 		s.respond(cmd, nil, fmt.Errorf("Unknown command: %s", cmd.Type))
 	}
+}
+
+// MaxImageBytes bounds one decoded image.
+const MaxImageBytes = 20 << 20
+
+// validImages checks prompt images: PNG, JPEG, GIF or WebP, canonical base64,
+// at most 8 images of MaxImageBytes each.
+func validImages(images []Block) ([]Block, error) {
+	if len(images) > 8 {
+		return nil, errors.New("at most 8 images per message")
+	}
+	out := make([]Block, 0, len(images))
+	for i, img := range images {
+		if img.Type != "image" {
+			return nil, fmt.Errorf("images[%d].type must be image", i)
+		}
+		switch strings.ToLower(img.MimeType) {
+		case "image/png", "image/jpeg", "image/gif", "image/webp":
+		default:
+			return nil, fmt.Errorf("images[%d]: unsupported image type %q", i, img.MimeType)
+		}
+		data, err := base64.StdEncoding.DecodeString(img.Data)
+		if err != nil || len(data) == 0 {
+			return nil, fmt.Errorf("images[%d].data must be base64", i)
+		}
+		if len(data) > MaxImageBytes {
+			return nil, fmt.Errorf("images[%d] is larger than %d MB", i, MaxImageBytes>>20)
+		}
+		out = append(out, Block{Type: "image", Data: img.Data, MimeType: strings.ToLower(img.MimeType)})
+	}
+	return out, nil
 }
 
 func (s *Server) cycleModel() any {

@@ -135,13 +135,14 @@ func textBlocks(text string) []Block {
 func boolPtr(v bool) *bool { return &v }
 
 // toContract converts session messages into the provider-neutral history a
-// tool loop consumes. Thinking blocks stay out of the request; images are
-// replaced by a note until contract messages carry rich content. Every
-// assistant tool call is guaranteed a matching tool message, so an aborted
-// turn never leaves the provider with an unanswered call.
+// tool loop consumes. Thinking blocks stay out of the request. With vision,
+// user and tool messages that hold images carry them as Parts; without it an
+// image becomes a short note. Every assistant tool call is guaranteed a
+// matching tool message, so an aborted turn never leaves the provider with an
+// unanswered call.
 // toContract 把会话消息转换成工具循环使用的中性历史：思考块不进请求；
-// 在 contract 支持富内容之前图片以说明文字代替；保证每个工具调用都有回执。
-func toContract(messages []Message) []contract.Message {
+// 模型支持图片时图片以 Parts 送出，否则以说明文字代替；保证每个工具调用都有回执。
+func toContract(messages []Message, vision bool) []contract.Message {
 	out := make([]contract.Message, 0, len(messages))
 	answered := map[string]bool{}
 	for _, m := range messages {
@@ -152,8 +153,9 @@ func toContract(messages []Message) []contract.Message {
 	for _, m := range messages {
 		switch m.Role {
 		case "user", "custom":
-			if text := contentText(m.Content); text != "" {
-				out = append(out, contract.Message{Role: "user", Content: text})
+			msg := contract.Message{Role: "user", Content: contentText(m.Content, vision), Parts: contentParts(m.Content, vision)}
+			if msg.Content != "" || len(msg.Parts) > 0 {
+				out = append(out, msg)
 			}
 		case "assistant":
 			msg := contract.Message{Role: "assistant", Content: m.Text()}
@@ -179,7 +181,7 @@ func toContract(messages []Message) []contract.Message {
 				out = append(out, contract.Message{Role: "tool", ToolCallID: id, Content: "Tool call was not completed."})
 			}
 		case "toolResult":
-			out = append(out, contract.Message{Role: "tool", ToolCallID: m.ToolCallID, Content: contentText(m.Content)})
+			out = append(out, contract.Message{Role: "tool", ToolCallID: m.ToolCallID, Content: contentText(m.Content, vision), Parts: contentParts(m.Content, vision)})
 		case "bashExecution":
 			if !m.Excluded {
 				out = append(out, contract.Message{Role: "user", Content: fmt.Sprintf("Ran `%s`\n```\n%s\n```", m.Command, m.Output)})
@@ -193,7 +195,9 @@ func toContract(messages []Message) []contract.Message {
 	return out
 }
 
-func contentText(blocks []Block) string {
+// contentText is the text rendering of content blocks. Images are omitted
+// when they travel as parts and noted otherwise.
+func contentText(blocks []Block, vision bool) string {
 	var parts []string
 	for _, block := range blocks {
 		switch block.Type {
@@ -202,8 +206,49 @@ func contentText(blocks []Block) string {
 				parts = append(parts, block.Text)
 			}
 		case "image":
-			parts = append(parts, "[An image was attached here; this model connection does not receive images.]")
+			if !vision {
+				parts = append(parts, "[An image was attached here; the current model does not accept images.]")
+			}
 		}
 	}
 	return strings.Join(parts, "\n")
+}
+
+// contentParts returns text and image parts when blocks hold an image and the
+// model accepts images; otherwise nil, so text-only messages stay unchanged.
+func contentParts(blocks []Block, vision bool) []contract.ContentPart {
+	if !vision {
+		return nil
+	}
+	hasImage := false
+	for _, block := range blocks {
+		hasImage = hasImage || (block.Type == "image" && block.Data != "")
+	}
+	if !hasImage {
+		return nil
+	}
+	parts := make([]contract.ContentPart, 0, len(blocks))
+	for _, block := range blocks {
+		switch block.Type {
+		case "text":
+			if block.Text != "" {
+				parts = append(parts, contract.ContentPart{Type: "text", Text: block.Text})
+			}
+		case "image":
+			if block.Data != "" {
+				parts = append(parts, contract.ContentPart{Type: "image", MediaType: block.MimeType, Data: block.Data})
+			}
+		}
+	}
+	return parts
+}
+
+// supportsImages reports whether a model accepts image input.
+func supportsImages(m Model) bool {
+	for _, input := range m.Input {
+		if input == "image" {
+			return true
+		}
+	}
+	return false
 }

@@ -39,6 +39,8 @@ func agentCmdIO(args []string, stdin io.Reader, stdout, stderr io.Writer, getenv
 	model := fs.String("model", "", "model id from models.json")
 	thinking := fs.String("thinking", "", "thinking level: off, minimal, low, medium, high, xhigh, max")
 	tools := fs.String("tools", strings.Join(localtools.Default, ","), "comma-separated local tools ("+strings.Join(localtools.All, ",")+")")
+	var skillPaths multiFlag
+	fs.Var(&skillPaths, "skill", "skill file or directory (repeatable)")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
@@ -92,6 +94,10 @@ func agentCmdIO(args []string, stdin io.Reader, stdout, stderr io.Writer, getenv
 		return 2
 	}
 
+	skills := interactive.LoadSkills("path", skillPaths...)
+	skills = appendSkills(skills, interactive.LoadSkills("project", filepath.Join(workdir, ".loom", "skills")))
+	skills = appendSkills(skills, interactive.LoadSkills("user", filepath.Join(agentDir, "skills")))
+
 	server := interactive.NewServer(stdout)
 	agent, err := interactive.New(interactive.Options{
 		Cwd:          workdir,
@@ -99,7 +105,8 @@ func agentCmdIO(args []string, stdin io.Reader, stdout, stderr io.Writer, getenv
 		Catalog:      catalog,
 		NewLLM:       newModelClient,
 		Tools:        dispatcher,
-		SystemPrompt: systemPrompt(workdir, names),
+		SystemPrompt: systemPrompt(workdir, names) + interactive.SkillsPrompt(skills),
+		Skills:       skills,
 		Emit:         server.Emit,
 	}, *session, *provider, *model, *thinking)
 	if err != nil {
@@ -146,4 +153,25 @@ func systemPrompt(cwd string, tools []string) string {
 		b.WriteString("\n")
 	}
 	return b.String()
+}
+
+// multiFlag collects a repeatable string flag.
+type multiFlag []string
+
+func (m *multiFlag) String() string     { return strings.Join(*m, ",") }
+func (m *multiFlag) Set(v string) error { *m = append(*m, v); return nil }
+
+// appendSkills adds skills whose names are not taken yet; earlier sources win.
+func appendSkills(skills, more []interactive.Skill) []interactive.Skill {
+	taken := map[string]bool{}
+	for _, s := range skills {
+		taken[s.Name] = true
+	}
+	for _, s := range more {
+		if !taken[s.Name] {
+			taken[s.Name] = true
+			skills = append(skills, s)
+		}
+	}
+	return skills
 }

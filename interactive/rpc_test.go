@@ -21,10 +21,25 @@ type scriptedLLM struct {
 	block   chan struct{} // when set, each round waits until it is closed or the request is cancelled
 	seen    [][]contract.Message
 	efforts []contract.EffortLevel
+	fail    []error // errors for the next model rounds, consumed in order
+	summary []contract.ChatRequest
 }
 
-func (s *scriptedLLM) Chat(context.Context, contract.ChatRequest) (*contract.ChatResponse, error) {
-	return nil, fmt.Errorf("Chat should not be called directly")
+// Chat answers summarization requests (the streaming wrapper never calls it).
+func (s *scriptedLLM) Chat(_ context.Context, req contract.ChatRequest) (*contract.ChatResponse, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.summary = append(s.summary, req)
+	return &contract.ChatResponse{Content: "## Goal\nSUMMARY", Usage: contract.Usage{InputTokens: 50, OutputTokens: 5}}, nil
+}
+
+// requestTokens estimates input tokens the way a provider would report them.
+func requestTokens(req contract.ChatRequest) int {
+	chars := 0
+	for _, m := range req.Messages {
+		chars += len(m.Content)
+	}
+	return chars / 4
 }
 
 func (s *scriptedLLM) Stream(ctx context.Context, req contract.ChatRequest) (<-chan contract.StreamChunk, error) {
@@ -36,10 +51,19 @@ func (s *scriptedLLM) Stream(ctx context.Context, req contract.ChatRequest) (<-c
 		resp, s.rounds = s.rounds[0], s.rounds[1:]
 	}
 	block := s.block
+	var fail error
+	if len(s.fail) > 0 {
+		fail, s.fail = s.fail[0], s.fail[1:]
+	}
 	s.mu.Unlock()
+	input := requestTokens(req)
 	ch := make(chan contract.StreamChunk, 4)
 	go func() {
 		defer close(ch)
+		if fail != nil {
+			ch <- contract.StreamChunk{Err: fail}
+			return
+		}
 		if resp.Content != "" {
 			ch <- contract.StreamChunk{Content: resp.Content}
 		}
@@ -51,19 +75,34 @@ func (s *scriptedLLM) Stream(ctx context.Context, req contract.ChatRequest) (<-c
 				return
 			}
 		}
-		ch <- contract.StreamChunk{ToolCalls: resp.ToolCalls, Done: true, FinishReason: "stop", Usage: &contract.Usage{InputTokens: 10, OutputTokens: 2}}
+		ch <- contract.StreamChunk{ToolCalls: resp.ToolCalls, Done: true, FinishReason: "stop", Usage: &contract.Usage{InputTokens: input, OutputTokens: 2}}
 	}()
 	return ch, nil
 }
 
-type fakeTools struct{}
+// fakeTools answers "lookup"; when gate is set each call waits for it.
+type fakeTools struct {
+	gate    chan struct{}
+	entered chan struct{}
+	parts   []contract.ContentPart
+}
 
-func (fakeTools) ListTools(context.Context) ([]contract.ToolDef, error) {
+func (*fakeTools) ListTools(context.Context) ([]contract.ToolDef, error) {
 	return []contract.ToolDef{{Name: "lookup", InputSchema: json.RawMessage(`{"type":"object"}`), ReadOnly: true}}, nil
 }
 
-func (fakeTools) Dispatch(_ context.Context, call contract.ToolCall) (*contract.ToolResult, error) {
-	return &contract.ToolResult{CallID: call.ID, Content: "found " + call.Args}, nil
+func (f *fakeTools) Dispatch(ctx context.Context, call contract.ToolCall) (*contract.ToolResult, error) {
+	if f.entered != nil {
+		f.entered <- struct{}{}
+	}
+	if f.gate != nil {
+		select {
+		case <-f.gate:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+	return &contract.ToolResult{CallID: call.ID, Content: "found " + call.Args, Parts: f.parts}, nil
 }
 
 // harness drives a Server over pipes and collects its output lines.
@@ -79,18 +118,26 @@ type harness struct {
 
 func newHarness(t *testing.T, llm *scriptedLLM, reasoning bool) *harness {
 	t.Helper()
+	return newHarnessWith(t, llm, func(o *Options, m *Model) { m.Reasoning = reasoning })
+}
+
+// newHarnessWith lets a test adjust the options and the single model.
+func newHarnessWith(t *testing.T, llm *scriptedLLM, configure func(*Options, *Model)) *harness {
+	t.Helper()
 	inR, inW := io.Pipe()
 	outR, outW := io.Pipe()
 	server := NewServer(outW)
-	catalog := &Catalog{Models: []Model{{ID: "m", Name: "m", API: "openai-completions", Provider: "p", Reasoning: reasoning, ContextWindow: 1000}}, keys: map[string]string{}}
-	agent, err := New(Options{
+	model := Model{ID: "m", Name: "m", API: "openai-completions", Provider: "p", Input: []string{"text"}, ContextWindow: 1_000_000}
+	opts := Options{
 		Cwd:        "/work",
 		SessionDir: t.TempDir(),
-		Catalog:    catalog,
 		NewLLM:     func(Model, string) (contract.LLM, error) { return llm, nil },
-		Tools:      fakeTools{},
+		Tools:      &fakeTools{},
 		Emit:       server.Emit,
-	}, "", "", "", "")
+	}
+	configure(&opts, &model)
+	opts.Catalog = &Catalog{Models: []Model{model}, keys: map[string]string{}}
+	agent, err := New(opts, "", "", "", "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -235,7 +282,7 @@ func TestServerStreamsAPromptWithAToolRound(t *testing.T) {
 	stats := h.send(map[string]any{"type": "get_session_stats"})
 	statLines := h.until(isResponse(stats))
 	s := statLines[len(statLines)-1]["data"].(map[string]any)
-	if s["toolCalls"].(float64) != 1 || s["assistantMessages"].(float64) != 2 || s["tokens"].(map[string]any)["input"].(float64) != 20 {
+	if s["toolCalls"].(float64) != 1 || s["assistantMessages"].(float64) != 2 || s["tokens"].(map[string]any)["input"].(float64) <= 0 {
 		t.Fatalf("stats = %v", s)
 	}
 }
@@ -286,7 +333,7 @@ func TestServerRejectsPromptWhileBusyAndAbortKeepsPartialText(t *testing.T) {
 
 func TestServerReportsUnknownAndUnsupportedCommands(t *testing.T) {
 	h := newHarness(t, &scriptedLLM{}, false)
-	for kind, want := range map[string]string{"compact": "not supported", "nonsense": "Unknown command"} {
+	for kind, want := range map[string]string{"fork": "not supported", "nonsense": "Unknown command"} {
 		id := h.send(map[string]any{"type": kind})
 		lines := h.until(isResponse(id))
 		last := lines[len(lines)-1]

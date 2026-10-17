@@ -33,21 +33,23 @@ type Header struct {
 // are kept byte-for-byte in raw and only interpreted where context needs them.
 // Entry 是会话树中的一个节点；本包不创建的条目按原始字节保留，仅在构建上下文时解读。
 type Entry struct {
-	Type             string    `json:"type"`
-	ID               string    `json:"id"`
-	ParentID         *string   `json:"parentId"`
-	Timestamp        string    `json:"timestamp"`
-	Message          *Message  `json:"message,omitempty"`
-	Provider         string    `json:"provider,omitempty"`
-	ModelID          string    `json:"modelId,omitempty"`
-	ThinkingLevel    string    `json:"thinkingLevel,omitempty"`
-	Name             *string   `json:"name,omitempty"`
-	Summary          string    `json:"summary,omitempty"`
-	FirstKeptEntryID string    `json:"firstKeptEntryId,omitempty"`
-	TokensBefore     int       `json:"tokensBefore,omitempty"`
-	RetainedTail     []Message `json:"retainedTail,omitempty"`
-	FromID           string    `json:"fromId,omitempty"`
-	CustomType       string    `json:"customType,omitempty"`
+	Type             string          `json:"type"`
+	ID               string          `json:"id"`
+	ParentID         *string         `json:"parentId"`
+	Timestamp        string          `json:"timestamp"`
+	Message          *Message        `json:"message,omitempty"`
+	Provider         string          `json:"provider,omitempty"`
+	ModelID          string          `json:"modelId,omitempty"`
+	ThinkingLevel    string          `json:"thinkingLevel,omitempty"`
+	Name             *string         `json:"name,omitempty"`
+	Summary          string          `json:"summary,omitempty"`
+	FirstKeptEntryID string          `json:"firstKeptEntryId,omitempty"`
+	TokensBefore     int             `json:"tokensBefore,omitempty"`
+	RetainedTail     []Message       `json:"retainedTail,omitempty"`
+	FromID           string          `json:"fromId,omitempty"`
+	CustomType       string          `json:"customType,omitempty"`
+	Usage            *Usage          `json:"usage,omitempty"`
+	Details          json.RawMessage `json:"details,omitempty"`
 
 	raw json.RawMessage
 }
@@ -258,6 +260,23 @@ type Context struct {
 // the latest compaction on the path.
 // Context 从根到叶构建当前对话，并按路径上最近一次压缩截取。
 func (s *Session) Context() Context {
+	items, ctx := s.contextItems()
+	for _, item := range items {
+		ctx.Messages = append(ctx.Messages, item.message)
+	}
+	return ctx
+}
+
+// contextItem is one message of the active conversation with the entry it
+// came from; messages restored from a retained tail have no entry id.
+type contextItem struct {
+	entryID string
+	message Message
+}
+
+// contextItems builds the active conversation with entry ids, so compaction
+// can pick the entry where kept history starts.
+func (s *Session) contextItems() ([]contextItem, Context) {
 	path := s.branch()
 	var ctx Context
 	for _, entry := range path {
@@ -273,6 +292,7 @@ func (s *Session) Context() Context {
 		}
 	}
 
+	var items []contextItem
 	start := 0
 	compaction := -1
 	for i := len(path) - 1; i >= 0; i-- {
@@ -283,14 +303,16 @@ func (s *Session) Context() Context {
 	}
 	if compaction >= 0 {
 		c := path[compaction]
-		ctx.Messages = append(ctx.Messages, Message{Role: "compactionSummary", Summary: c.Summary, TokensBefore: c.TokensBefore})
+		items = append(items, contextItem{entryID: c.ID, message: Message{Role: "compactionSummary", Summary: c.Summary, TokensBefore: c.TokensBefore, Details: c.Details}})
 		if len(c.RetainedTail) > 0 {
-			ctx.Messages = append(ctx.Messages, c.RetainedTail...)
+			for _, m := range c.RetainedTail {
+				items = append(items, contextItem{message: m})
+			}
 		} else if c.FirstKeptEntryID != "" {
 			for i := 0; i < compaction; i++ {
 				if path[i].ID == c.FirstKeptEntryID {
 					for _, kept := range path[i:compaction] {
-						ctx.Messages = appendEntryMessage(ctx.Messages, kept)
+						items = appendEntryItem(items, kept)
 					}
 					break
 				}
@@ -299,27 +321,27 @@ func (s *Session) Context() Context {
 		start = compaction + 1
 	}
 	for _, entry := range path[start:] {
-		ctx.Messages = appendEntryMessage(ctx.Messages, entry)
+		items = appendEntryItem(items, entry)
 	}
-	return ctx
+	return items, ctx
 }
 
-func appendEntryMessage(messages []Message, entry *Entry) []Message {
+func appendEntryItem(items []contextItem, entry *Entry) []contextItem {
 	switch entry.Type {
 	case "message":
 		if entry.Message != nil {
-			return append(messages, *entry.Message)
+			return append(items, contextItem{entry.ID, *entry.Message})
 		}
 	case "custom_message":
 		var m Message
 		if json.Unmarshal(entry.raw, &m) == nil {
 			m.Role = "custom"
-			return append(messages, m)
+			return append(items, contextItem{entry.ID, m})
 		}
 	case "branch_summary":
-		return append(messages, Message{Role: "branchSummary", Summary: entry.Summary, FromID: entry.FromID})
+		return append(items, contextItem{entry.ID, Message{Role: "branchSummary", Summary: entry.Summary, FromID: entry.FromID}})
 	}
-	return messages
+	return items
 }
 
 func randomHex(n int) string {
