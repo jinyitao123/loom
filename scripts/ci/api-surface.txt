@@ -29,6 +29,7 @@ var ErrCompletionUnverified = errors.New("agent completion was not verified")
 var ErrJournalExecution = errors.New("journaled operation failed")
 var ErrJournalOutcomeUnknown = errors.New("journaled operation outcome is unknown")
 var ErrJournalStreamingUnsupported = errors.New("journaled execution does not support streaming")
+var ErrStreamIncomplete = errors.New("stream closed without a done chunk")
 var ErrToolChoiceNotHonored = errors.New("model response did not honor the requested tool choice")
 func CostBudgetHook(maxUSD float64) loom.StepHook
 func DispatchWithHooks(ctx context.Context, tools contract.ToolDispatcher, calls []contract.ToolCall, ...) ([]contract.ToolResult, error)
