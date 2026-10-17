@@ -1,0 +1,660 @@
+package interactive
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/jinyitao123/loom"
+	"github.com/jinyitao123/loom/contract"
+	"github.com/jinyitao123/loom/stdlib"
+)
+
+// LLMFactory builds the model client for one configured model.
+type LLMFactory func(model Model, apiKey string) (contract.LLM, error)
+
+// Options configures an Agent.
+type Options struct {
+	Cwd           string                  // working directory of the agent and its tools
+	SessionDir    string                  // directory that receives new session files
+	Catalog       *Catalog                // configured models and keys
+	NewLLM        LLMFactory              // model client factory
+	Tools         contract.ToolDispatcher // tools offered to the model
+	SystemPrompt  string                  // system prompt for every model request
+	MaxIterations int                     // model rounds per prompt; <=0 means 500
+	Emit          func(event any)         // receives every protocol event; must be safe for concurrent use
+}
+
+// ThinkingLevels lists the accepted thinking levels.
+var ThinkingLevels = []string{"off", "minimal", "low", "medium", "high", "xhigh", "max"}
+
+// ErrBusy reports a prompt sent while the agent is already working.
+var ErrBusy = errors.New("agent is already working; send it as steer or follow_up")
+
+// ErrNoModel reports a prompt with no model selected.
+var ErrNoModel = errors.New("no model selected")
+
+// Agent is one interactive session: it accepts prompts, runs them through a
+// stdlib tool loop one at a time, streams events and appends every message to
+// the session file as it completes.
+// Agent 是一个交互会话：逐条接收提问，交给 stdlib 工具循环执行，
+// 流式发出事件，并在每条消息完成时追加到会话文件。
+type Agent struct {
+	opts Options
+
+	mu             sync.Mutex
+	session        *Session
+	model          *Model
+	thinking       string
+	running        bool
+	cancel         context.CancelFunc
+	idle           chan struct{}
+	steering       []string
+	followUp       []string
+	autoCompaction bool
+	autoRetry      bool
+	steeringMode   string
+	followUpMode   string
+}
+
+// New opens sessionPath (or starts a new session when empty) and selects the
+// model: the explicit provider/model, else the session's last model, else the
+// first configured model.
+func New(opts Options, sessionPath, provider, modelID, thinking string) (*Agent, error) {
+	if opts.MaxIterations <= 0 {
+		opts.MaxIterations = 500
+	}
+	if opts.Catalog == nil {
+		opts.Catalog = &Catalog{keys: map[string]string{}}
+	}
+	a := &Agent{opts: opts, thinking: "medium", autoCompaction: true, autoRetry: true, steeringMode: "one-at-a-time", followUpMode: "one-at-a-time"}
+	a.idle = make(chan struct{})
+	close(a.idle)
+	if sessionPath != "" {
+		s, err := OpenSession(sessionPath)
+		if err != nil {
+			return nil, err
+		}
+		a.session = s
+	} else {
+		a.session = NewSession(opts.SessionDir, opts.Cwd, "")
+	}
+	a.restoreSettings()
+	if modelID != "" {
+		m, ok := opts.Catalog.Find(provider, modelID)
+		if !ok {
+			return nil, fmt.Errorf("model not found: %s/%s", provider, modelID)
+		}
+		a.model = &m
+	}
+	if thinking != "" {
+		if !validThinking(thinking) {
+			return nil, fmt.Errorf("invalid thinking level %q", thinking)
+		}
+		a.thinking = thinking
+	}
+	return a, nil
+}
+
+// restoreSettings picks the model and thinking level recorded in the session.
+func (a *Agent) restoreSettings() {
+	ctx := a.session.Context()
+	a.model = nil
+	if ctx.ModelID != "" {
+		if m, ok := a.opts.Catalog.Find(ctx.Provider, ctx.ModelID); ok {
+			a.model = &m
+		}
+	}
+	if a.model == nil && len(a.opts.Catalog.Models) > 0 {
+		m := a.opts.Catalog.Models[0]
+		a.model = &m
+	}
+	if ctx.ThinkingLevel != "" {
+		a.thinking = ctx.ThinkingLevel
+	}
+}
+
+func validThinking(level string) bool {
+	for _, l := range ThinkingLevels {
+		if l == level {
+			return true
+		}
+	}
+	return false
+}
+
+func (a *Agent) emit(event map[string]any) {
+	if a.opts.Emit != nil {
+		a.opts.Emit(event)
+	}
+}
+
+// State reports the session state.
+func (a *Agent) State() map[string]any {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	state := map[string]any{
+		"model":                 a.model,
+		"thinkingLevel":         a.thinking,
+		"isStreaming":           a.running,
+		"isCompacting":          false,
+		"steeringMode":          a.steeringMode,
+		"followUpMode":          a.followUpMode,
+		"sessionFile":           a.session.Path(),
+		"sessionId":             a.session.ID(),
+		"autoCompactionEnabled": a.autoCompaction,
+		"messageCount":          len(a.session.Context().Messages),
+		"pendingMessageCount":   len(a.steering) + len(a.followUp),
+	}
+	if name := a.session.Name(); name != "" {
+		state["sessionName"] = name
+	}
+	return state
+}
+
+// Prompt starts working on text. While the agent is working, behavior must be
+// "steer" or "followUp" and the text is queued instead.
+func (a *Agent) Prompt(text, behavior string) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.running {
+		switch behavior {
+		case "steer":
+			a.enqueueLocked(&a.steering, text)
+			return nil
+		case "followUp":
+			a.enqueueLocked(&a.followUp, text)
+			return nil
+		}
+		return ErrBusy
+	}
+	if a.model == nil {
+		return ErrNoModel
+	}
+	a.startLocked(text)
+	return nil
+}
+
+// Steer queues text for the running prompt. Until the tool loop accepts input
+// between model rounds, steering is delivered when the current prompt ends.
+// Steer 为正在执行的提问排队一条插话；在工具循环支持轮次间接收输入之前，插话在本次提问结束后送达。
+func (a *Agent) Steer(text string) error { return a.queue(&a.steering, text) }
+
+// FollowUp queues text to run after the current prompt.
+func (a *Agent) FollowUp(text string) error { return a.queue(&a.followUp, text) }
+
+func (a *Agent) queue(target *[]string, text string) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if !a.running {
+		if a.model == nil {
+			return ErrNoModel
+		}
+		a.startLocked(text)
+		return nil
+	}
+	a.enqueueLocked(target, text)
+	return nil
+}
+
+func (a *Agent) enqueueLocked(target *[]string, text string) {
+	*target = append(*target, text)
+	a.emitQueueLocked()
+}
+
+func (a *Agent) emitQueueLocked() {
+	a.emit(map[string]any{"type": "queue_update", "steering": append([]string{}, a.steering...), "followUp": append([]string{}, a.followUp...)})
+}
+
+func (a *Agent) startLocked(text string) {
+	ctx, cancel := context.WithCancel(context.Background())
+	a.running = true
+	a.cancel = cancel
+	idle := make(chan struct{})
+	a.idle = idle
+	go func() {
+		defer close(idle)
+		defer cancel()
+		next := text
+		for {
+			a.runPrompt(ctx, next)
+			a.mu.Lock()
+			if ctx.Err() != nil || len(a.steering)+len(a.followUp) == 0 {
+				a.running = false
+				a.mu.Unlock()
+				a.emit(map[string]any{"type": "agent_settled"})
+				return
+			}
+			if len(a.steering) > 0 {
+				next, a.steering = a.steering[0], a.steering[1:]
+			} else {
+				next, a.followUp = a.followUp[0], a.followUp[1:]
+			}
+			a.emitQueueLocked()
+			a.mu.Unlock()
+		}
+	}()
+}
+
+// Abort stops the running prompt, drops queued input and waits until idle.
+func (a *Agent) Abort() {
+	a.mu.Lock()
+	cancel, idle := a.cancel, a.idle
+	if len(a.steering)+len(a.followUp) > 0 {
+		a.steering, a.followUp = nil, nil
+		a.emitQueueLocked()
+	}
+	a.mu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+	<-idle
+}
+
+// NewSession aborts any running prompt and starts a fresh, unsaved session.
+func (a *Agent) NewSession(parentSession string) {
+	a.Abort()
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	model := a.model
+	a.session = NewSession(a.opts.SessionDir, a.opts.Cwd, parentSession)
+	a.model = model
+}
+
+// SwitchSession aborts any running prompt and opens another session file.
+func (a *Agent) SwitchSession(path string) error {
+	s, err := OpenSession(path)
+	if err != nil {
+		return err
+	}
+	a.Abort()
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.session = s
+	a.restoreSettings()
+	return nil
+}
+
+// Messages returns the active conversation.
+func (a *Agent) Messages() []Message {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.session.Context().Messages
+}
+
+// Models returns the configured models.
+func (a *Agent) Models() []Model { return a.opts.Catalog.Models }
+
+// SetModel switches the model and records the change in the session.
+func (a *Agent) SetModel(provider, id string) (Model, error) {
+	m, ok := a.opts.Catalog.Find(provider, id)
+	if !ok {
+		return Model{}, fmt.Errorf("model not found: %s/%s", provider, id)
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.model = &m
+	return m, a.session.Append(&Entry{Type: "model_change", Provider: m.Provider, ModelID: m.ID})
+}
+
+// SetThinkingLevel changes the thinking level and records it in the session.
+func (a *Agent) SetThinkingLevel(level string) error {
+	if !validThinking(level) {
+		return fmt.Errorf("invalid thinking level %q", level)
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.thinking = level
+	return a.session.Append(&Entry{Type: "thinking_level_change", ThinkingLevel: level})
+}
+
+// SetSessionName records a display name for the session.
+func (a *Agent) SetSessionName(name string) error {
+	name = strings.TrimSpace(strings.NewReplacer("\r", " ", "\n", " ").Replace(name))
+	if name == "" {
+		return errors.New("session name is empty")
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.session.Append(&Entry{Type: "session_info", Name: &name})
+}
+
+// SetQueueModes records the steering and follow-up delivery modes.
+func (a *Agent) SetQueueModes(steering, followUp string) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if steering != "" {
+		a.steeringMode = steering
+	}
+	if followUp != "" {
+		a.followUpMode = followUp
+	}
+}
+
+// SetAutoCompaction and SetAutoRetry record the host's preference.
+func (a *Agent) SetAutoCompaction(enabled bool) {
+	a.mu.Lock()
+	a.autoCompaction = enabled
+	a.mu.Unlock()
+}
+func (a *Agent) SetAutoRetry(enabled bool) { a.mu.Lock(); a.autoRetry = enabled; a.mu.Unlock() }
+
+// LastAssistantText returns the text of the last assistant message, if any.
+func (a *Agent) LastAssistantText() *string {
+	messages := a.Messages()
+	for i := len(messages) - 1; i >= 0; i-- {
+		if messages[i].Role == "assistant" {
+			text := messages[i].Text()
+			return &text
+		}
+	}
+	return nil
+}
+
+// ForkMessages lists the user messages of the active branch.
+func (a *Agent) ForkMessages() []map[string]string {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	var out []map[string]string
+	for _, entry := range a.session.branch() {
+		if entry.Type == "message" && entry.Message != nil && entry.Message.Role == "user" {
+			out = append(out, map[string]string{"entryId": entry.ID, "text": entry.Message.Text()})
+		}
+	}
+	return out
+}
+
+// Stats summarizes token use and cost across the whole session file.
+func (a *Agent) Stats() map[string]any {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	var users, assistants, calls, results, total int
+	var tokens Usage
+	var last *Usage
+	for _, entry := range a.session.Entries() {
+		if entry.Type != "message" || entry.Message == nil {
+			continue
+		}
+		m := entry.Message
+		total++
+		switch m.Role {
+		case "user":
+			users++
+		case "assistant":
+			assistants++
+			for _, b := range m.Content {
+				if b.Type == "toolCall" {
+					calls++
+				}
+			}
+			if m.Usage != nil {
+				tokens.Input += m.Usage.Input
+				tokens.Output += m.Usage.Output
+				tokens.CacheRead += m.Usage.CacheRead
+				tokens.CacheWrite += m.Usage.CacheWrite
+				tokens.Cost.Total += m.Usage.Cost.Total
+				last = m.Usage
+			}
+		case "toolResult":
+			results++
+		}
+	}
+	stats := map[string]any{
+		"sessionFile":       a.session.Path(),
+		"sessionId":         a.session.ID(),
+		"userMessages":      users,
+		"assistantMessages": assistants,
+		"toolCalls":         calls,
+		"toolResults":       results,
+		"totalMessages":     total,
+		"tokens": map[string]int{
+			"input": tokens.Input, "output": tokens.Output, "cacheRead": tokens.CacheRead, "cacheWrite": tokens.CacheWrite,
+			"total": tokens.Input + tokens.Output + tokens.CacheRead + tokens.CacheWrite,
+		},
+		"cost": tokens.Cost.Total,
+	}
+	if a.model != nil && a.model.ContextWindow > 0 {
+		usage := map[string]any{"contextWindow": a.model.ContextWindow, "tokens": nil, "percent": nil}
+		if last != nil {
+			used := last.Input + last.Output + last.CacheRead + last.CacheWrite
+			usage["tokens"] = used
+			usage["percent"] = float64(used) * 100 / float64(a.model.ContextWindow)
+		}
+		stats["contextUsage"] = usage
+	}
+	return stats
+}
+
+// run state shared by the model wrapper and the tool hooks of one prompt.
+type promptRun struct {
+	agent       *Agent
+	model       Model
+	thinking    string
+	added       []Message
+	assistant   *Message
+	toolResults []Message
+	turnHasTool bool
+	lastErr     error
+}
+
+func nowMillis() int64 { return time.Now().UnixMilli() }
+
+// append persists a message and emits its start and end events.
+func (r *promptRun) append(m Message) {
+	r.agent.mu.Lock()
+	err := r.agent.session.Append(&Entry{Type: "message", Message: &m})
+	r.agent.mu.Unlock()
+	if err != nil {
+		r.agent.emit(map[string]any{"type": "extension_error", "extensionPath": "session", "event": "persist", "error": err.Error()})
+	}
+	r.added = append(r.added, m)
+}
+
+func (r *promptRun) appendAndAnnounce(m Message) {
+	r.agent.emit(map[string]any{"type": "message_start", "message": m})
+	r.append(m)
+	r.agent.emit(map[string]any{"type": "message_end", "message": m})
+}
+
+func (a *Agent) runPrompt(ctx context.Context, text string) {
+	a.mu.Lock()
+	model, thinking := *a.model, a.thinking
+	history := a.session
+	a.mu.Unlock()
+
+	run := &promptRun{agent: a, model: model, thinking: thinking}
+	a.emit(map[string]any{"type": "agent_start"})
+	a.emit(map[string]any{"type": "turn_start"})
+	run.appendAndAnnounce(Message{Role: "user", Content: textBlocks(text), Timestamp: nowMillis()})
+
+	a.mu.Lock()
+	messages := toContract(history.Context().Messages)
+	a.mu.Unlock()
+
+	llm, err := a.opts.NewLLM(model, a.opts.Catalog.Key(model.Provider))
+	if err == nil {
+		step := stdlib.NewToolLoopStep(&observedLLM{inner: llm, run: run}, a.opts.Tools, stdlib.ToolLoopOpts{
+			Model:         model.ID,
+			SystemPrompt:  a.opts.SystemPrompt,
+			MaxIterations: a.opts.MaxIterations,
+			ToolHooks:     []contract.ToolHook{run.toolHook()},
+		})
+		_, err = step(ctx, loom.State{"messages": messages})
+	}
+	if err != nil && ctx.Err() == nil && !errors.Is(err, run.lastErr) {
+		run.appendAndAnnounce(Message{Role: "assistant", Content: nil, API: model.API, Provider: model.Provider, Model: model.ID,
+			Usage: &Usage{}, StopReason: "error", ErrorMessage: err.Error(), Timestamp: nowMillis()})
+	}
+	a.emit(map[string]any{"type": "turn_end", "message": run.assistant, "toolResults": nonNil(run.toolResults)})
+	a.emit(map[string]any{"type": "agent_end", "messages": nonNil(run.added), "willRetry": false})
+}
+
+func nonNil(messages []Message) []Message {
+	if messages == nil {
+		return []Message{}
+	}
+	return messages
+}
+
+// toolHook announces each tool call and records its result in the session.
+func (r *promptRun) toolHook() contract.ToolHook {
+	return contract.ToolHook{
+		Pre: func(_ context.Context, call contract.ToolCall) (contract.ToolCall, error) {
+			r.agent.emit(map[string]any{"type": "tool_execution_start", "toolCallId": call.ID, "toolName": call.Name, "args": rawArgs(call.Args)})
+			return call, nil
+		},
+		Post: func(_ context.Context, call contract.ToolCall, result *contract.ToolResult) error {
+			content := textBlocks(result.Content)
+			if content == nil {
+				content = []Block{}
+			}
+			r.agent.emit(map[string]any{"type": "tool_execution_end", "toolCallId": call.ID, "toolName": call.Name,
+				"result": map[string]any{"content": content, "details": map[string]any{}}, "isError": result.IsError})
+			m := Message{Role: "toolResult", ToolCallID: call.ID, ToolName: call.Name, Content: content, IsError: boolPtr(result.IsError), Timestamp: nowMillis()}
+			r.appendAndAnnounce(m)
+			r.toolResults = append(r.toolResults, m)
+			return nil
+		},
+	}
+}
+
+func rawArgs(args string) json.RawMessage {
+	if json.Valid([]byte(args)) && strings.TrimSpace(args) != "" {
+		return json.RawMessage(args)
+	}
+	return json.RawMessage("{}")
+}
+
+// observedLLM turns each model round of the tool loop into turn and message
+// events, streams text deltas, and persists the finished assistant message.
+// observedLLM 把工具循环的每一轮模型调用转成轮次与消息事件，流式转发文本增量，并持久化完整的助手消息。
+type observedLLM struct {
+	inner contract.LLM
+	run   *promptRun
+}
+
+func (o *observedLLM) Stream(ctx context.Context, req contract.ChatRequest) (<-chan contract.StreamChunk, error) {
+	return o.inner.Stream(ctx, req)
+}
+
+func (o *observedLLM) Chat(ctx context.Context, req contract.ChatRequest) (*contract.ChatResponse, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	r := o.run
+	a := r.agent
+	if r.turnHasTool {
+		a.emit(map[string]any{"type": "turn_end", "message": r.assistant, "toolResults": nonNil(r.toolResults)})
+		a.emit(map[string]any{"type": "turn_start"})
+		r.turnHasTool, r.toolResults = false, nil
+	}
+	req.Effort = effortFor(r.model, r.thinking)
+
+	partial := Message{Role: "assistant", Content: []Block{}, API: r.model.API, Provider: r.model.Provider, Model: r.model.ID, Usage: &Usage{}, Timestamp: nowMillis()}
+	a.emit(map[string]any{"type": "message_start", "message": partial})
+	sink := &deltaSink{agent: a}
+	resp, err := stdlib.NewStreamingLLM(o.inner, sink).Chat(ctx, req)
+
+	final := partial
+	if err != nil {
+		final.Content = textBlocks(sink.text.String())
+		if ctx.Err() != nil {
+			final.StopReason = "aborted"
+		} else {
+			final.StopReason = "error"
+			final.ErrorMessage = err.Error()
+			r.lastErr = err
+		}
+	} else {
+		final.Content = textBlocks(resp.Content)
+		for _, call := range resp.ToolCalls {
+			final.Content = append(final.Content, Block{Type: "toolCall", ID: call.ID, Name: call.Name, Arguments: rawArgs(call.Args)})
+		}
+		final.Usage = usageFor(r.model, resp.Usage)
+		final.StopReason = stopReason(resp)
+	}
+	if final.Content == nil {
+		final.Content = []Block{}
+	}
+	sink.close()
+	r.append(final)
+	a.emit(map[string]any{"type": "message_end", "message": final})
+	r.assistant = &final
+	r.turnHasTool = err == nil && len(resp.ToolCalls) > 0
+	return resp, err
+}
+
+func effortFor(model Model, thinking string) contract.EffortLevel {
+	if !model.Reasoning {
+		return ""
+	}
+	switch thinking {
+	case "off":
+		return ""
+	case "minimal", "low":
+		return contract.EffortLow
+	case "high", "xhigh", "max":
+		return contract.EffortHigh
+	default:
+		return contract.EffortMedium
+	}
+}
+
+func stopReason(resp *contract.ChatResponse) string {
+	if len(resp.ToolCalls) > 0 {
+		return "toolUse"
+	}
+	if resp.StopReason == "length" {
+		return "length"
+	}
+	return "stop"
+}
+
+func usageFor(model Model, u contract.Usage) *Usage {
+	usage := &Usage{Input: u.InputTokens, Output: u.OutputTokens, TotalTokens: u.InputTokens + u.OutputTokens}
+	usage.Cost.Input = float64(u.InputTokens) * model.Cost.Input / 1e6
+	usage.Cost.Output = float64(u.OutputTokens) * model.Cost.Output / 1e6
+	usage.Cost.Total = usage.Cost.Input + usage.Cost.Output
+	if u.CostUSD > 0 {
+		usage.Cost.Total = u.CostUSD
+	}
+	return usage
+}
+
+// deltaSink forwards text deltas as message_update events.
+type deltaSink struct {
+	agent   *Agent
+	text    strings.Builder
+	started bool
+	ended   bool
+}
+
+func (s *deltaSink) SendChunk(chunk contract.StreamChunk) error {
+	if chunk.Content != "" {
+		if !s.started {
+			s.started = true
+			s.update(map[string]any{"type": "text_start", "contentIndex": 0})
+		}
+		s.text.WriteString(chunk.Content)
+		s.update(map[string]any{"type": "text_delta", "contentIndex": 0, "delta": chunk.Content})
+	}
+	return nil
+}
+
+func (s *deltaSink) close() {
+	if s.started && !s.ended {
+		s.ended = true
+		s.update(map[string]any{"type": "text_end", "contentIndex": 0, "content": s.text.String()})
+	}
+}
+
+func (s *deltaSink) update(event map[string]any) {
+	s.agent.emit(map[string]any{"type": "message_update", "usage": Usage{}, "assistantMessageEvent": event})
+}
+
+func (s *deltaSink) SendEvent(string, any) error { return nil }
+func (s *deltaSink) Close() error                { return nil }

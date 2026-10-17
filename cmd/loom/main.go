@@ -31,7 +31,7 @@ var version = "dev"
 func main() {
 	// 未提供子命令：向 stderr 打印用法说明，并以退出码 2（"用法错误"的惯例值）退出。
 	if len(os.Args) < 2 {
-		fmt.Fprintln(os.Stderr, "usage: loom <command>\n\ncommands:\n  run        run one agent turn (reads prompt JSON from stdin)\n  version    print version")
+		fmt.Fprintln(os.Stderr, "usage: loom <command>\n\ncommands:\n  run        run one agent turn (reads prompt JSON from stdin)\n  agent      run an interactive agent (JSONL commands on stdin)\n  version    print version")
 		os.Exit(2)
 	}
 	// 以 os.Args[1] 作为子命令名分发；其余参数原样透传给子命令自行解析。
@@ -40,6 +40,9 @@ func main() {
 		// run 子命令：跑一轮 agent（stdin 读 prompt JSON）；runCmd 的返回值
 		// 直接作为进程退出码，宿主（weave 守护进程）据此判定本轮运行成败。
 		os.Exit(runCmd(os.Args[2:]))
+	case "agent":
+		// agent 子命令：长期运行的交互式智能体（stdio JSONL 命令/事件协议）。
+		os.Exit(agentCmd(os.Args[2:]))
 	case "version", "--version", "-v":
 		// version 子命令：打印版本号；同时兼容 --version / -v 两种常见写法。
 		fmt.Printf("loom %s\n", version)
