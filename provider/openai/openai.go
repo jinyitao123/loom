@@ -311,8 +311,11 @@ type oaiStreamOptions struct {
 // system/user 只用 Role+Content；assistant 可能携带 ToolCalls（历史回放）；
 // tool 角色用 ToolCallID 标明自己是哪一次调用的执行结果。
 type oaiMessage struct {
-	Role       string        `json:"role"`                   // 消息角色：system / user / assistant / tool
-	Content    string        `json:"content,omitempty"`      // 文本内容；纯工具调用的 assistant 消息可为空
+	Role string `json:"role"` // 消息角色：system / user / assistant / tool
+	// Content is a string, or a part array when a user message carries images;
+	// nil (empty text) is omitted, keeping text-only requests byte-identical.
+	// 中文：纯文本时为字符串；user 消息带图片时为片段数组；空文本为 nil 并被省略，纯文本请求逐字节不变。
+	Content    any           `json:"content,omitempty"`
 	ToolCalls  []oaiToolCall `json:"tool_calls,omitempty"`   // assistant 消息回放的历史工具调用
 	ToolCallID string        `json:"tool_call_id,omitempty"` // tool 消息与先前某次调用配对的 ID
 }
@@ -384,18 +387,44 @@ func (c *Client) resolveModel(model string) string {
 // assistant 消息里的历史 ToolCalls 必须"回放"给服务端，tool 角色消息则靠
 // ToolCallID 与先前的调用配对——这两者是多轮工具调用能够续接的关键。
 func (c *Client) buildMessages(msgs []contract.Message) []oaiMessage {
-	out := make([]oaiMessage, len(msgs)) // 一次分配，与输入一一对应
-	for i, m := range msgs {
+	out := make([]oaiMessage, 0, len(msgs))
+	// Images in tool results: chat completions has no image parts in tool
+	// messages, so they follow the batch of tool messages as one user message.
+	// 中文：tool 消息不能携带图片，故在本批 tool 消息之后补一条带图片的 user 消息。
+	var toolImages []oaiContentPart
+	flushToolImages := func() {
+		if len(toolImages) == 0 {
+			return
+		}
+		parts := append([]oaiContentPart{{Type: "text", Text: "Images returned by the tool calls above:"}}, toolImages...)
+		out = append(out, oaiMessage{Role: "user", Content: parts})
+		toolImages = nil
+	}
+	for _, m := range msgs {
+		if m.Role != "tool" {
+			flushToolImages()
+		}
 		// 基础字段映射：角色、文本内容、工具结果消息配对用的 tool_call_id。
-		out[i] = oaiMessage{
-			Role:       m.Role,
-			Content:    m.Content,
-			ToolCallID: m.ToolCallID,
+		msg := oaiMessage{Role: m.Role, ToolCallID: m.ToolCallID}
+		if m.Content != "" {
+			msg.Content = m.Content
+		}
+		if hasImagePart(m.Parts) {
+			switch m.Role {
+			case "user":
+				msg.Content = contentParts(m.Parts)
+			case "tool":
+				for _, p := range m.Parts {
+					if p.Type == "image" && p.Data != "" {
+						toolImages = append(toolImages, imagePart(p))
+					}
+				}
+			}
 		}
 		// 回放该条消息（通常是 assistant）曾发起的工具调用：
 		// wire 格式要求 type 固定为 "function"，参数保持原始 JSON 字符串不解析。
 		for _, tc := range m.ToolCalls {
-			out[i].ToolCalls = append(out[i].ToolCalls, oaiToolCall{
+			msg.ToolCalls = append(msg.ToolCalls, oaiToolCall{
 				ID:   tc.ID,      // 沿用供应商当初返回的调用 ID，服务端靠它与 tool 消息配对
 				Type: "function", // OpenAI 协议目前唯一的工具调用类型
 				// 匿名结构体字面量需复述 JSON tag，与 oaiToolCall.Function 的定义保持一致。
@@ -404,6 +433,50 @@ func (c *Client) buildMessages(msgs []contract.Message) []oaiMessage {
 					Arguments string `json:"arguments"`
 				}{Name: tc.Name, Arguments: tc.Args}, // 工具名 + 原始参数 JSON 原样透传
 			})
+		}
+		out = append(out, msg)
+	}
+	flushToolImages()
+	return out
+}
+
+// oaiContentPart 中文：多片段 content 中的一段：text 或 image_url（data URL）。
+type oaiContentPart struct {
+	Type     string       `json:"type"`
+	Text     string       `json:"text,omitempty"`
+	ImageURL *oaiImageURL `json:"image_url,omitempty"`
+}
+
+type oaiImageURL struct {
+	URL string `json:"url"`
+}
+
+func hasImagePart(parts []contract.ContentPart) bool {
+	for _, p := range parts {
+		if p.Type == "image" && p.Data != "" {
+			return true
+		}
+	}
+	return false
+}
+
+func imagePart(p contract.ContentPart) oaiContentPart {
+	return oaiContentPart{Type: "image_url", ImageURL: &oaiImageURL{URL: "data:" + p.MediaType + ";base64," + p.Data}}
+}
+
+// contentParts 中文：把 contract 片段映射为 wire 片段；未知类型忽略。
+func contentParts(parts []contract.ContentPart) []oaiContentPart {
+	out := make([]oaiContentPart, 0, len(parts))
+	for _, p := range parts {
+		switch p.Type {
+		case "text":
+			if p.Text != "" {
+				out = append(out, oaiContentPart{Type: "text", Text: p.Text})
+			}
+		case "image":
+			if p.Data != "" {
+				out = append(out, imagePart(p))
+			}
 		}
 	}
 	return out

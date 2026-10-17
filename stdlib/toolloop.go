@@ -114,6 +114,17 @@ type ToolLoopOpts struct {
 	// with ErrToolChoiceNotHonored before any of its tool calls are dispatched.
 	ToolChoicePolicy   ToolChoicePolicy
 	ToolChoicePolicyID string // stable policy identity, required for controlled loops
+	// BeforeRound, when set, receives the transcript about to be sent before
+	// every model request of the loop and returns the transcript to send
+	// instead. Round counts from 0. Hosts use it to deliver input that arrived
+	// while the loop runs, or to replace the history with a compacted form
+	// they persist themselves. It runs before Compaction; the returned
+	// transcript must keep every tool call answered. nil leaves every request
+	// unchanged. Not supported together with Control.
+	// BeforeRound：每次请求模型前拿到即将发送的历史并返回替代历史（round 从 0 计）。
+	// 宿主借此送达循环运行期间到达的输入，或换成自行持久化的压缩历史；
+	// 在 Compaction 之前执行，返回的历史必须保持工具调用都有回执。nil 时请求不变；不与 Control 同用。
+	BeforeRound func(ctx context.Context, round int, messages []contract.Message) ([]contract.Message, error)
 }
 
 // toolLoopPendingCall is the checkpoint-safe description of one parked tool call.
@@ -142,6 +153,11 @@ func NewToolLoopStep(llm contract.LLM, tools contract.ToolDispatcher, opts ToolL
 		opts.MaxIterations = 20
 	}
 	if opts.Control != nil {
+		if opts.BeforeRound != nil {
+			return func(context.Context, loom.State) (loom.State, error) {
+				return nil, fmt.Errorf("loom/toolloop: BeforeRound is not supported with Control")
+			}
+		}
 		return newControlledToolLoopStep(llm, tools, opts)
 	}
 
@@ -290,6 +306,11 @@ func NewToolLoopStep(llm contract.LLM, tools contract.ToolDispatcher, opts ToolL
 
 		// 主循环：最多 MaxIterations 次"LLM→工具"往返。
 		for i := 0; i < opts.MaxIterations; i++ {
+			if opts.BeforeRound != nil {
+				if msgs, err = opts.BeforeRound(ctx, i, msgs); err != nil {
+					return loom.State{"__error": err.Error()}, err
+				}
+			}
 			// Context compaction check.
 			// 每次调 LLM 前先做上下文压缩检查：触发则先归档（若配置）再压缩，
 			// 用摘要后的消息列表替换原历史，防止长会话撑爆模型上下文窗口。
