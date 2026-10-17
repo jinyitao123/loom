@@ -112,6 +112,7 @@ type harness struct {
 	lines  chan map[string]any
 	done   chan struct{}
 	agent  *Agent
+	server *Server
 	llm    *scriptedLLM
 	nextID int
 }
@@ -142,7 +143,7 @@ func newHarnessWith(t *testing.T, llm *scriptedLLM, configure func(*Options, *Mo
 		t.Fatal(err)
 	}
 	server.Attach(agent)
-	h := &harness{t: t, in: inW, lines: make(chan map[string]any, 1000), done: make(chan struct{}), agent: agent, llm: llm}
+	h := &harness{t: t, in: inW, lines: make(chan map[string]any, 1000), done: make(chan struct{}), agent: agent, llm: llm, server: server}
 	go func() {
 		scanner := bufio.NewScanner(outR)
 		scanner.Buffer(make([]byte, 0, 1<<20), 1<<24)

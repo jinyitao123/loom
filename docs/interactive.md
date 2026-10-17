@@ -19,7 +19,7 @@ model wrapper and tool hooks, so there is no second agent loop.
 
 ```sh
 loom agent --mode rpc [--cwd DIR] [--session FILE] [--session-dir DIR] \
-           [--provider NAME] [--model ID] [--thinking LEVEL] [--tools read,bash,edit,write]
+           [--provider NAME] [--model ID] [--thinking LEVEL] [--tools read,bash,edit,write] \n           [--skill PATH]... [--mcp-config FILE]...
 ```
 
 | Setting | Default |
@@ -46,6 +46,48 @@ API.
 If the working directory has an `AGENTS.md` (up to 64 KiB) it is appended to
 the system prompt.
 
+A model whose `input` lists `"image"` receives images (from prompts and from
+`read`) as image parts; other models receive a short note in their place.
+
+## Skills
+
+A skill is a `SKILL.md` file whose front matter names it and describes when to
+use it (`name`, `description`). Skills come from `--skill` paths, then
+`<cwd>/.loom/skills`, then `<configuration>/skills`; a path may be a
+`SKILL.md`, a directory holding one, or a directory of such directories, and
+the first skill with a name wins. The system prompt lists every skill with its
+location so the model reads the file when a task matches; a prompt
+`/skill:<name> [args]` inlines the skill followed by the arguments, and
+`get_commands` lists them as `skill:<name>`.
+
+## Tool servers (MCP)
+
+Model Context Protocol servers add tools. They are configured in
+`<configuration>/mcp.json`, `<cwd>/.loom/mcp.json` and `--mcp-config` files,
+later files replacing a server of the same name:
+
+```json
+{"mcpServers": {
+  "files": {"command": "npx", "args": ["-y", "some-mcp-server"], "env": {"TOKEN": "${FILES_TOKEN}"}},
+  "host":  {"url": "http://127.0.0.1:8123/mcp", "headers": {"Authorization": "Bearer ${HOST_TOKEN}"}, "toolPrefix": ""}
+}}
+```
+
+- `command` starts a stdio server; `url` speaks streamable HTTP (JSON or event
+  stream answers, `Mcp-Session-Id` sessions). `${VAR}` expands from the
+  environment. `disabled: true` skips a server.
+- Tools are named `mcp__<server>__<tool>`; `toolPrefix` replaces the prefix
+  (`""` keeps the server's names). `readOnlyHint` lets read-only tools run in
+  parallel.
+- A server's `instructions` are appended to the system prompt.
+- When a server asks for user input (elicitation), Loom shows it through the
+  dialog sub-protocol below: enumerations become selects (two to five of them
+  one questionnaire), booleans confirmations, other fields text input.
+- A server that fails to start is reported on stderr and as an
+  `extension_error` event; the agent runs without it. A
+  `tools/list_changed` notification refreshes its tools before the next
+  model round.
+
 ## Framing
 
 Lines are delimited by LF only; a trailing CR is stripped. Every command may
@@ -63,22 +105,23 @@ JSON answers `{"type": "response", "command": "parse", "success": false, ...}`.
 
 | Command | Behaviour |
 | --- | --- |
-| `prompt` | Start working on `message`. While working, `streamingBehavior` must be `steer` or `followUp` and the message is queued; otherwise the command fails |
-| `steer`, `follow_up` | Queue a message for after the current prompt (starts immediately when idle). Steering is currently delivered when the prompt ends, not between model rounds |
+| `prompt` | Start working on `message` and optional `images` (PNG, JPEG, GIF or WebP, base64, up to 8 of 20 MB each). While working, `streamingBehavior` must be `steer` or `followUp` and the message is queued; otherwise the command fails |
+| `steer`, `follow_up` | Queue a message (starts immediately when idle). Steering is delivered after the current round's tool calls, before the next model request; follow-ups run after the prompt finishes. `set_steering_mode` / `set_follow_up_mode` choose one at a time or all |
 | `abort` | Cancel the running prompt, drop queued messages and wait until idle. Text already streamed is kept as an assistant message with `stopReason: "aborted"` |
 | `get_state` | Model, thinking level, streaming flag, session file, id and name, queue size |
 | `get_messages` | The active conversation |
 | `new_session`, `switch_session` | Start an unsaved session, or open `sessionPath` |
 | `get_available_models`, `set_model`, `cycle_model` | Model selection; changes are recorded in the session |
 | `set_thinking_level`, `cycle_thinking_level`, `get_available_thinking_levels` | Reasoning level for models with `reasoning: true` |
-| `set_steering_mode`, `set_follow_up_mode`, `set_auto_compaction`, `set_auto_retry`, `abort_retry` | Accepted and recorded |
+| `compact` | Summarize older history now, with optional `customInstructions`; fails while a prompt runs |
+| `set_steering_mode`, `set_follow_up_mode`, `set_auto_compaction` | Queue delivery and automatic compaction |
+| `set_auto_retry`, `abort_retry` | Accepted and recorded |
 | `get_session_stats` | Message counts, token and cost totals, context usage |
 | `get_last_assistant_text`, `get_fork_messages`, `set_session_name`, `get_commands` | As named |
-| `extension_ui_response` | Accepted; no dialogs are issued yet |
+| `extension_ui_response` | Answer to a dialog (`value`, `confirmed` or `cancelled`); no response is sent |
 
-Not supported yet, answered with an error: `compact`, `fork`, `clone`,
-`bash`, `abort_bash`, `get_entries`, `get_tree`, `export_html`, and prompts
-with `images`.
+Not supported yet, answered with an error: `fork`, `clone`, `bash`,
+`abort_bash`, `get_entries`, `get_tree`, `export_html`.
 
 ## Events
 
@@ -101,9 +144,35 @@ agent_end                              all messages added by this prompt
 agent_settled                          after the queue is empty
 ```
 
+A steering message appears as `message_start/end` of a user message
+between a round's tool results and the next assistant message.
+
 `queue_update` reports the pending steering and follow-up messages whenever
-they change. Assistant `stopReason` is `stop`, `length`, `toolUse`, `error`
+they change. `compaction_start` (`reason`: `threshold`, `overflow` or
+`manual`) and `compaction_end` (`result`, `aborted`, `willRetry`,
+`errorMessage`) bracket a compaction. Assistant `stopReason` is `stop`, `length`, `toolUse`, `error`
 (with `errorMessage`) or `aborted`.
+
+## Dialogs
+
+`extension_ui_request` events carry an `id` and a `method`: `select`
+(`title`, `options`), `confirm` (`title`, `message`) or `input` (`title`,
+optional `placeholder`). The host answers with
+`{"type": "extension_ui_response", "id": ..., "value": ...}`, `"confirmed": true|false`
+or `"cancelled": true`. Selects belonging to one questionnaire carry
+`__prime_ask_user__<group>:<index>:<total>` as their first option.
+
+## Compaction
+
+When the conversation's context passes the model's window minus 16384 tokens
+(checked before every model round), when a request fails because the context
+is too long (followed by one retry), or on `compact`, the agent keeps the
+newest 20000 tokens verbatim and asks the model to summarize the rest in a
+structured checkpoint (goal, constraints, progress, decisions, next steps,
+critical context), listing the files read and modified. The summary is stored
+as a `compaction` entry whose `firstKeptEntryId` marks where verbatim history
+resumes; later compactions update the previous summary. Kept history never
+starts at a tool result.
 
 ## Session file
 
@@ -111,15 +180,15 @@ Line one is the header
 `{"type":"session","version":3,"id":...,"timestamp":...,"cwd":...}`; every
 further line is an entry with `id`, `parentId` and `timestamp`, forming a tree
 whose last entry is the current leaf. The agent writes `message`,
-`model_change`, `thinking_level_change` and `session_info` entries, and reads
-`compaction`, `branch_summary` and `custom_message` entries written by other
-tools when it rebuilds context. The file is created when the first assistant
+`model_change`, `thinking_level_change`, `session_info` and `compaction`
+entries, and also reads `branch_summary` and `custom_message` entries written
+by other tools when it rebuilds context. The file is created when the first assistant
 message completes.
 
 ## Limits of this version
 
-- Text only: images, reasoning text and tool-call argument deltas are not
-  streamed.
-- No automatic or manual compaction.
-- Steering is delivered after the current prompt.
-- Tool results are text.
+- Reasoning text and tool-call argument deltas are not streamed; only
+  answer text is.
+- Images are not resized; large images count fully against the context.
+- `.gitignore` handling in `grep` and `find` covers the common patterns of
+  the root file only.

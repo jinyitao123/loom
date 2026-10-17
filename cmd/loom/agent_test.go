@@ -132,3 +132,33 @@ func TestAgentCmdRejectsUnknownModeAndTool(t *testing.T) {
 		t.Fatalf("unknown tool exit = %d", code)
 	}
 }
+
+// A server that cannot start is reported as an extension_error; the agent
+// still answers commands.
+func TestAgentCmdReportsUnavailableMCPServer(t *testing.T) {
+	agentDir := t.TempDir()
+	config := filepath.Join(t.TempDir(), "mcp.json")
+	if err := os.WriteFile(config, []byte(`{"mcpServers":{"gone":{"command":"loom-no-such-mcp-server"}}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	getenv := func(name string) string {
+		if name == "LOOM_AGENT_DIR" {
+			return agentDir
+		}
+		return ""
+	}
+	var out, stderr bytes.Buffer
+	in := strings.NewReader(`{"id":"1","type":"get_state"}` + "\n")
+	if code := agentCmdIO([]string{"--cwd", t.TempDir(), "--mcp-config", config}, in, &out, &stderr, getenv); code != 0 {
+		t.Fatalf("exit %d: %s", code, stderr.String())
+	}
+	if !strings.Contains(out.String(), `"type":"extension_error"`) || !strings.Contains(out.String(), "gone") {
+		t.Fatalf("no extension_error for the unavailable server:\n%s", out.String())
+	}
+	if !strings.Contains(out.String(), `"command":"get_state"`) || !strings.Contains(out.String(), `"success":true`) {
+		t.Fatalf("get_state did not answer:\n%s", out.String())
+	}
+	if !strings.Contains(stderr.String(), "gone") {
+		t.Fatalf("stderr = %q", stderr.String())
+	}
+}

@@ -1,6 +1,8 @@
 package main
 
 import (
+	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
@@ -13,6 +15,7 @@ import (
 	"github.com/jinyitao123/loom/contract"
 	"github.com/jinyitao123/loom/interactive"
 	"github.com/jinyitao123/loom/localtools"
+	"github.com/jinyitao123/loom/mcpclient"
 	"github.com/jinyitao123/loom/provider/openai"
 )
 
@@ -41,6 +44,8 @@ func agentCmdIO(args []string, stdin io.Reader, stdout, stderr io.Writer, getenv
 	tools := fs.String("tools", strings.Join(localtools.Default, ","), "comma-separated local tools ("+strings.Join(localtools.All, ",")+")")
 	var skillPaths multiFlag
 	fs.Var(&skillPaths, "skill", "skill file or directory (repeatable)")
+	var mcpConfigs multiFlag
+	fs.Var(&mcpConfigs, "mcp-config", "MCP server configuration file (repeatable)")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
@@ -99,13 +104,31 @@ func agentCmdIO(args []string, stdin io.Reader, stdout, stderr io.Writer, getenv
 	skills = appendSkills(skills, interactive.LoadSkills("user", filepath.Join(agentDir, "skills")))
 
 	server := interactive.NewServer(stdout)
+	servers, err := mcpclient.LoadConfig(append([]string{filepath.Join(agentDir, "mcp.json"), filepath.Join(workdir, ".loom", "mcp.json")}, mcpConfigs...)...)
+	if err != nil {
+		fmt.Fprintf(stderr, "loom agent: %v\n", err)
+		return 1
+	}
+	mcp, failures := mcpclient.Connect(context.Background(), servers, mcpclient.Options{
+		ClientVersion: version,
+		Cwd:           workdir,
+		Elicit: func(ctx context.Context, source, message string, schema json.RawMessage) (mcpclient.ElicitResult, error) {
+			action, content, err := server.Elicit(ctx, source, message, schema)
+			return mcpclient.ElicitResult{Action: action, Content: content}, err
+		},
+	})
+	defer mcp.Close()
+	for _, failure := range failures {
+		fmt.Fprintf(stderr, "loom agent: %v\n", failure)
+	}
+
 	agent, err := interactive.New(interactive.Options{
 		Cwd:          workdir,
 		SessionDir:   dir,
 		Catalog:      catalog,
 		NewLLM:       newModelClient,
-		Tools:        dispatcher,
-		SystemPrompt: systemPrompt(workdir, names) + interactive.SkillsPrompt(skills),
+		Tools:        interactive.NewMultiDispatcher(dispatcher, mcp),
+		SystemPrompt: systemPrompt(workdir, names) + interactive.SkillsPrompt(skills) + mcp.Instructions(),
 		Skills:       skills,
 		Emit:         server.Emit,
 	}, *session, *provider, *model, *thinking)
@@ -114,6 +137,9 @@ func agentCmdIO(args []string, stdin io.Reader, stdout, stderr io.Writer, getenv
 		return 1
 	}
 	server.Attach(agent)
+	for _, failure := range failures {
+		server.Emit(map[string]any{"type": "extension_error", "extensionPath": "mcp", "event": "connect", "error": failure.Error()})
+	}
 	if err := server.Serve(stdin); err != nil {
 		fmt.Fprintf(stderr, "loom agent: %v\n", err)
 		return 1

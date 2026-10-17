@@ -20,6 +20,7 @@ type Server struct {
 	agent *Agent
 	mu    sync.Mutex
 	out   io.Writer
+	uiState
 }
 
 // NewServer returns a server writing to out. Call Attach before Serve.
@@ -55,6 +56,9 @@ type command struct {
 	Name               string  `json:"name"`
 	CustomInstructions string  `json:"customInstructions"`
 	EntryID            string  `json:"entryId"`
+	Value              *string `json:"value"`
+	Confirmed          *bool   `json:"confirmed"`
+	Cancelled          bool    `json:"cancelled"`
 }
 
 // Serve reads commands until in is exhausted, then aborts any running prompt.
@@ -194,7 +198,8 @@ func (s *Server) handle(line []byte) {
 		}
 		s.respond(cmd, map[string]any{"commands": commands}, nil)
 	case "extension_ui_response":
-		s.respond(cmd, nil, nil)
+		// Hosts send dialog answers without waiting for a reply.
+		s.deliverUI(cmd)
 	case "fork", "clone", "bash", "abort_bash", "get_entries", "get_tree", "export_html":
 		s.respond(cmd, nil, fmt.Errorf("%s is not supported by the Loom kernel yet", cmd.Type))
 	default:
