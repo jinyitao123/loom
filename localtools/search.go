@@ -32,55 +32,9 @@ func init() {
 		runFind)
 }
 
-// ignoreRules is a small .gitignore subset: plain and wildcard patterns,
-// trailing "/" for directories and a leading "/" anchored at the search root.
-// Negation and nested .gitignore files are not interpreted.
-// ignoreRules 只解读 .gitignore 的常用子集：普通与通配模式、以 "/" 结尾表示目录、
-// 以 "/" 开头锚定搜索根；不解读取反规则与子目录中的 .gitignore。
-type ignoreRules struct{ patterns []string }
-
-func loadIgnore(root string) ignoreRules {
-	var rules ignoreRules
-	data, err := os.ReadFile(filepath.Join(root, ".gitignore"))
-	if err != nil {
-		return rules
-	}
-	for _, line := range strings.Split(string(data), "\n") {
-		line = strings.TrimSpace(line)
-		if line == "" || strings.HasPrefix(line, "#") || strings.HasPrefix(line, "!") {
-			continue
-		}
-		rules.patterns = append(rules.patterns, line)
-	}
-	return rules
-}
-
-func (r ignoreRules) ignored(rel string, dir bool) bool {
-	base := path.Base(rel)
-	if dir && (base == ".git" || base == "node_modules") {
-		return true
-	}
-	for _, p := range r.patterns {
-		dirOnly := strings.HasSuffix(p, "/")
-		p = strings.TrimSuffix(p, "/")
-		if dirOnly && !dir {
-			continue
-		}
-		if strings.HasPrefix(p, "/") || strings.Contains(p, "/") {
-			if ok, _ := path.Match(strings.TrimPrefix(p, "/"), rel); ok {
-				return true
-			}
-			continue
-		}
-		if ok, _ := path.Match(p, base); ok {
-			return true
-		}
-	}
-	return false
-}
-
 // walk visits files under root (or root itself when it is a file), skipping
-// ignored directories and files. fn returns false to stop.
+// directories and files ignored by gitignore rules (see ignoreMatcher). fn
+// returns false to stop.
 func walk(ctx context.Context, root string, fn func(abs, rel string) bool) error {
 	info, err := os.Stat(root)
 	if err != nil {
@@ -90,7 +44,8 @@ func walk(ctx context.Context, root string, fn func(abs, rel string) bool) error
 		fn(root, filepath.Base(root))
 		return nil
 	}
-	rules := loadIgnore(root)
+	rules := newIgnoreMatcher(root)
+	rules.enter(root, "")
 	stop := errors.New("stop")
 	err = filepath.WalkDir(root, func(abs string, d fs.DirEntry, err error) error {
 		if ctx.Err() != nil {
@@ -106,7 +61,11 @@ func walk(ctx context.Context, root string, fn func(abs, rel string) bool) error
 			}
 			return nil
 		}
-		if d.IsDir() || !d.Type().IsRegular() {
+		if d.IsDir() {
+			rules.enter(root, rel)
+			return nil
+		}
+		if !d.Type().IsRegular() {
 			return nil
 		}
 		if !fn(abs, rel) {
