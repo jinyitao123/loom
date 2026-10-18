@@ -597,7 +597,7 @@ func decodeStagedStatePatch(raw any) ([]contract.ToolResult, error) {
 
 func decodeToolLoopUsage(raw any) (contract.Usage, error) {
 	if raw == nil {
-		return contract.Usage{}, nil
+		return contract.Usage{CacheReadReported: true, CacheWriteReported: true}, nil
 	}
 	if usage, ok := raw.(contract.Usage); ok {
 		return usage, nil
@@ -619,8 +619,8 @@ func addUsage(total, usage contract.Usage) contract.Usage {
 	total.CostUSD += usage.CostUSD
 	total.CacheReadTokens += usage.CacheReadTokens
 	total.CacheWriteTokens += usage.CacheWriteTokens
-	total.CacheReadReported = total.CacheReadReported || usage.CacheReadReported || usage.CacheReadTokens != 0
-	total.CacheWriteReported = total.CacheWriteReported || usage.CacheWriteReported || usage.CacheWriteTokens != 0
+	total.CacheReadReported = total.CacheReadReported && (usage.CacheReadReported || usage.CacheReadTokens != 0)
+	total.CacheWriteReported = total.CacheWriteReported && (usage.CacheWriteReported || usage.CacheWriteTokens != 0)
 	return total
 }
 
