@@ -67,6 +67,7 @@ type session struct {
 
 	instructions string
 	serverName   string
+	turnHooks    bool // the server declared the experimental "loom/turn" capability
 	onListChange func()
 }
 
@@ -196,6 +197,9 @@ func (s *session) initialize(ctx context.Context, clientVersion string) error {
 			Name string `json:"name"`
 		} `json:"serverInfo"`
 		Instructions string `json:"instructions"`
+		Capabilities struct {
+			Experimental map[string]json.RawMessage `json:"experimental"`
+		} `json:"capabilities"`
 	}
 	params := map[string]any{
 		"protocolVersion": ProtocolVersion,
@@ -207,6 +211,7 @@ func (s *session) initialize(ctx context.Context, clientVersion string) error {
 	}
 	s.instructions = result.Instructions
 	s.serverName = result.ServerInfo.Name
+	_, s.turnHooks = result.Capabilities.Experimental[TurnCapability]
 	return s.notify(ctx, "notifications/initialized")
 }
 

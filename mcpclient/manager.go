@@ -187,6 +187,40 @@ func (m *Manager) Instructions() string {
 	return b.String()
 }
 
+// TurnCapability is the experimental server capability that asks for
+// TurnStartedMethod at the start of every turn.
+const TurnCapability = "loom/turn"
+
+// TurnStartedMethod is the request sent to servers declaring TurnCapability
+// when a turn begins, with params {"prompt": "<the turn's user prompt>"}. The
+// turn waits for every answer, so a server can bind state to the prompt before
+// the model calls its tools.
+const TurnStartedMethod = "loom/turnStarted"
+
+// TurnStarted tells the servers that declared TurnCapability that a turn
+// begins with prompt, and waits for them. Errors from individual servers are
+// joined; the others are still told.
+// TurnStarted 通知声明了 TurnCapability 的服务器本轮开始及其提问，并等待其应答；
+// 单个服务器的错误合并返回，不影响通知其他服务器。
+func (m *Manager) TurnStarted(ctx context.Context, prompt string) error {
+	var wg sync.WaitGroup
+	errs := make([]error, len(m.servers))
+	for i, s := range m.servers {
+		if !s.session.turnHooks {
+			continue
+		}
+		wg.Add(1)
+		go func(i int, s *server) {
+			defer wg.Done()
+			if err := s.session.call(ctx, TurnStartedMethod, map[string]any{"prompt": prompt}, nil); err != nil {
+				errs[i] = fmt.Errorf("MCP server %s: %w", s.name, err)
+			}
+		}(i, s)
+	}
+	wg.Wait()
+	return errors.Join(errs...)
+}
+
 // Servers lists the connected server names.
 func (m *Manager) Servers() []string {
 	names := make([]string, len(m.servers))

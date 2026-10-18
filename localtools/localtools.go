@@ -16,6 +16,7 @@ import (
 	"fmt"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/jinyitao123/loom/contract"
 )
@@ -38,8 +39,27 @@ var All = []string{"read", "bash", "edit", "write", "grep", "find", "ls"}
 
 // Tools dispatches the local tools rooted at a working directory.
 type Tools struct {
-	cwd     string
-	enabled []string
+	cwd      string
+	enabled  []string
+	progress func(callID, output string)
+}
+
+// OnProgress receives the output so far of a running bash call, at most every
+// ProgressInterval, keyed by the tool call id. Set it before dispatching.
+// OnProgress 接收运行中 bash 调用的阶段输出（迄今输出，按工具调用 ID），
+// 至多每 ProgressInterval 一次；须在派发前设置。
+func (t *Tools) OnProgress(fn func(callID, output string)) { t.progress = fn }
+
+// ProgressInterval is the minimum gap between progress reports of one call.
+var ProgressInterval = 250 * time.Millisecond
+
+type callIDKey struct{}
+
+// report sends the output so far of the call running in ctx.
+func (t *Tools) report(ctx context.Context, output string) {
+	if id, _ := ctx.Value(callIDKey{}).(string); t.progress != nil && id != "" {
+		t.progress(id, output)
+	}
 }
 
 // New returns the named tools working in cwd; no names selects Default.
@@ -89,7 +109,7 @@ func (t *Tools) Dispatch(ctx context.Context, call contract.ToolCall) (*contract
 			return &contract.ToolResult{CallID: call.ID, Content: text, Parts: parts}, nil
 		}
 	}
-	content, err := tool.run(ctx, t, json.RawMessage(args))
+	content, err := tool.run(context.WithValue(ctx, callIDKey{}, call.ID), t, json.RawMessage(args))
 	if err != nil {
 		return &contract.ToolResult{CallID: call.ID, Content: err.Error(), IsError: true}, nil
 	}

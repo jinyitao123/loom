@@ -9,7 +9,9 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/jinyitao123/loom/contract"
 )
@@ -203,6 +205,35 @@ func TestBashReportsOutputExitCodeAndTimeout(t *testing.T) {
 		if !slow.IsError || !strings.Contains(slow.Content, "timed out") {
 			t.Fatalf("timeout: %+v", slow)
 		}
+	}
+}
+
+func TestBashReportsProgressWhileRunning(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("needs a POSIX shell with sleep")
+	}
+	tools, _ := newTools(t, All...)
+	old := ProgressInterval
+	ProgressInterval = 20 * time.Millisecond
+	t.Cleanup(func() { ProgressInterval = old })
+	var mu sync.Mutex
+	var reports []string
+	tools.OnProgress(func(callID, output string) {
+		mu.Lock()
+		defer mu.Unlock()
+		if callID != "c" {
+			t.Errorf("progress call id = %q", callID)
+		}
+		reports = append(reports, output)
+	})
+	result := call(t, tools, "bash", map[string]any{"command": "echo one; sleep 0.3; echo two; sleep 0.3"})
+	if result.IsError || result.Content != "one\ntwo\n" {
+		t.Fatalf("result = %+v", result)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(reports) != 2 || reports[0] != "one\n" || reports[1] != "one\ntwo\n" {
+		t.Fatalf("progress = %q, want each new output once", reports)
 	}
 }
 

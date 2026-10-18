@@ -131,11 +131,13 @@ func agentCmdIO(args []string, stdin io.Reader, stdout, stderr io.Writer, getenv
 		SystemPrompt: systemPrompt(workdir, names) + interactive.SkillsPrompt(skills) + mcp.Instructions(),
 		Skills:       skills,
 		Emit:         server.Emit,
+		OnTurnStart:  mcp.TurnStarted,
 	}, *session, *provider, *model, *thinking)
 	if err != nil {
 		fmt.Fprintf(stderr, "loom agent: %v\n", err)
 		return 1
 	}
+	dispatcher.OnProgress(agent.ToolProgress)
 	server.Attach(agent)
 	for _, failure := range failures {
 		server.Emit(map[string]any{"type": "extension_error", "extensionPath": "mcp", "event": "connect", "error": failure.Error()})

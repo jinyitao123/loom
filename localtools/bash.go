@@ -91,12 +91,33 @@ func runBash(ctx context.Context, t *Tools, raw json.RawMessage) (string, error)
 	}
 	done := make(chan error, 1)
 	go func() { done <- cmd.Wait() }()
+	var ticks <-chan time.Time
+	if t.progress != nil {
+		ticker := time.NewTicker(ProgressInterval)
+		defer ticker.Stop()
+		ticks = ticker.C
+	}
 	var waitErr error
-	select {
-	case waitErr = <-done:
-	case <-ctx.Done():
-		killProcess(cmd)
-		waitErr = <-done
+	reported := 0
+wait:
+	for {
+		select {
+		case waitErr = <-done:
+			break wait
+		case <-ctx.Done():
+			killProcess(cmd)
+			waitErr = <-done
+			break wait
+		case <-ticks:
+			out.mu.Lock()
+			total := out.total
+			tail, _ := truncateTail(out.buf.String())
+			out.mu.Unlock()
+			if total != reported {
+				reported = total
+				t.report(ctx, tail)
+			}
+		}
 	}
 
 	out.mu.Lock()

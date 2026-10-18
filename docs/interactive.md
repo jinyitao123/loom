@@ -11,9 +11,19 @@ coding-agent JSONL conventions (session format version 3), so a host written
 for such agents can drive Loom without a separate integration.
 
 Code: `interactive/` (session file, agent, protocol server), `localtools/`
-(local file and shell tools), `cmd/loom/agent.go` (flags and wiring). The
-agent runs each prompt through `stdlib.NewToolLoopStep`; events come from a
-model wrapper and tool hooks, so there is no second agent loop.
+(local file and shell tools), `mcpclient/` (tool servers), `cmd/loom/agent.go`
+(flags and wiring).
+
+Each prompt runs as a Loom graph of two steps, `prepare → round`, with an
+in-memory store for its checkpoints. `prepare` tells the tool servers a turn
+begins and loads the active conversation from the session file. `round` is a
+controlled `stdlib.NewToolLoopStep` that pauses after every model round; at
+each pause the agent hands queued steering to the loop through the resume
+grant (`ToolLoopResumeGrant.AppendMessages`) and resumes the graph. Any other
+pause (output limit, provider stop, repeated calls, the `MaxIterations` round
+budget) ends the turn. Compaction plugs into the loop's `CompactionPolicy`,
+automatic retry wraps the model client, and events come from that wrapper and
+the tool hooks, so there is no second agent loop.
 
 ## Starting
 
@@ -83,6 +93,10 @@ later files replacing a server of the same name:
 - When a server asks for user input (elicitation), Loom shows it through the
   dialog sub-protocol below: enumerations become selects (two to five of them
   one questionnaire), booleans confirmations, other fields text input.
+- A server that declares the experimental capability `loom/turn` receives a
+  `loom/turnStarted` request with `{"prompt": ...}` when a turn begins; the
+  model is called after every such server answered. A failure is reported
+  as an `extension_error` event and the turn continues.
 - A server that fails to start is reported on stderr and as an
   `extension_error` event; the agent runs without it. A
   `tools/list_changed` notification refreshes its tools before the next
@@ -115,7 +129,7 @@ JSON answers `{"type": "response", "command": "parse", "success": false, ...}`.
 | `set_thinking_level`, `cycle_thinking_level`, `get_available_thinking_levels` | Reasoning level for models with `reasoning: true` |
 | `compact` | Summarize older history now, with optional `customInstructions`; fails while a prompt runs |
 | `set_steering_mode`, `set_follow_up_mode`, `set_auto_compaction` | Queue delivery and automatic compaction |
-| `set_auto_retry`, `abort_retry` | Accepted and recorded |
+| `set_auto_retry`, `abort_retry` | Automatic retry (on by default) of a model round that failed transiently: rate limits, HTTP 408/409/425/429/5xx, overload, timeouts, dropped connections or streams; up to 3 retries after 2, 4 and 8 s. `abort_retry` cancels a waiting retry and the prompt ends with the error |
 | `get_session_stats` | Message counts, token and cost totals, context usage |
 | `get_last_assistant_text`, `get_fork_messages`, `set_session_name`, `get_commands` | As named |
 | `extension_ui_response` | Answer to a dialog (`value`, `confirmed` or `cancelled`); no response is sent |
@@ -135,6 +149,7 @@ message_start                          assistant message, empty content
 message_update  text_start | text_delta | text_end
 message_end                            complete assistant message
 tool_execution_start                   one per tool call
+tool_execution_update                  bash output so far, at most every 250 ms
 tool_execution_end
 message_start / message_end            one toolResult message per call
 turn_end, turn_start                   when the assistant called tools, the next model round
@@ -146,6 +161,11 @@ agent_settled                          after the queue is empty
 
 A steering message appears as `message_start/end` of a user message
 between a round's tool results and the next assistant message.
+
+A retried round shows the failed assistant message (`stopReason: error`,
+not stored), `auto_retry_start` (`attempt`, `maxAttempts`, `delayMs`,
+`errorMessage`), the next attempt's messages and finally `auto_retry_end`
+(`success`, `attempt`, `finalError` on failure).
 
 `queue_update` reports the pending steering and follow-up messages whenever
 they change. `compaction_start` (`reason`: `threshold`, `overflow` or

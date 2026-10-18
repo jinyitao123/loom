@@ -33,6 +33,8 @@ type fakeServer struct {
 	nextID    int
 	waiting   map[string]chan json.RawMessage
 	listCalls int
+	turn      bool   // declares the loom/turn capability
+	prompt    string // prompt of the last loom/turnStarted
 }
 
 func (f *fakeServer) handle(msg map[string]any) any {
@@ -59,7 +61,20 @@ func (f *fakeServer) handle(msg map[string]any) any {
 		if _, ok := caps["elicitation"]; !ok {
 			return map[string]any{"jsonrpc": "2.0", "id": id, "error": map[string]any{"code": -1, "message": "client lacks elicitation"}}
 		}
-		return reply(map[string]any{"protocolVersion": ProtocolVersion, "capabilities": map[string]any{"tools": map[string]any{"listChanged": true}}, "serverInfo": map[string]any{"name": "fake"}, "instructions": "Use echo for greetings."})
+		capabilities := map[string]any{"tools": map[string]any{"listChanged": true}}
+		if f.turn {
+			capabilities["experimental"] = map[string]any{TurnCapability: map[string]any{}}
+		}
+		return reply(map[string]any{"protocolVersion": ProtocolVersion, "capabilities": capabilities, "serverInfo": map[string]any{"name": "fake"}, "instructions": "Use echo for greetings."})
+	case TurnStartedMethod:
+		prompt, _ := msg["params"].(map[string]any)["prompt"].(string)
+		if prompt == "fail" {
+			return map[string]any{"jsonrpc": "2.0", "id": id, "error": map[string]any{"code": -1, "message": "turn refused"}}
+		}
+		f.mu.Lock()
+		f.prompt = prompt
+		f.mu.Unlock()
+		return reply(map[string]any{})
 	case "tools/list":
 		f.mu.Lock()
 		f.listCalls++
@@ -72,6 +87,9 @@ func (f *fakeServer) handle(msg map[string]any) any {
 		if calls > 1 {
 			tools = append(tools, map[string]any{"name": "late", "description": "Added later"})
 		}
+		if f.turn {
+			tools = append(tools, map[string]any{"name": "turn", "description": "Prompt of the turn", "inputSchema": map[string]any{"type": "object"}})
+		}
 		return reply(map[string]any{"tools": tools})
 	case "tools/call":
 		params := msg["params"].(map[string]any)
@@ -83,6 +101,10 @@ func (f *fakeServer) handle(msg map[string]any) any {
 				map[string]any{"type": "text", "text": "echo " + string(args)},
 				map[string]any{"type": "image", "data": "AAAA", "mimeType": "image/png"},
 			}})
+		case "turn":
+			f.mu.Lock()
+			defer f.mu.Unlock()
+			return reply(map[string]any{"content": []any{map[string]any{"type": "text", "text": f.prompt}}})
 		case "ask.color":
 			answer := f.elicit()
 			return reply(map[string]any{"content": []any{map[string]any{"type": "text", "text": "user said " + string(answer)}}, "isError": false})
@@ -113,7 +135,7 @@ func (f *fakeServer) elicit() json.RawMessage {
 
 func fakeStdioServer(in io.Reader, out io.Writer) {
 	var mu sync.Mutex
-	f := &fakeServer{}
+	f := &fakeServer{turn: os.Getenv("LOOM_FAKE_TURN") == "1"}
 	f.write = func(v any) {
 		line, _ := json.Marshal(v)
 		mu.Lock()
@@ -202,6 +224,38 @@ func TestStdioServer(t *testing.T) {
 		t.Fatalf("servers = %v", got)
 	}
 	exercise(t, m, "mcp__fake__")
+}
+
+func TestTurnStartedReachesServersThatAskForIt(t *testing.T) {
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	m, failures := Connect(context.Background(), map[string]ServerConfig{
+		"turn":  {Command: exe, Env: map[string]string{"LOOM_FAKE_MCP": "1", "LOOM_FAKE_TURN": "1"}},
+		"plain": {Command: exe, Env: map[string]string{"LOOM_FAKE_MCP": "1"}},
+	}, Options{ClientVersion: "test", Timeout: 5 * time.Second})
+	defer m.Close()
+	if len(failures) != 0 {
+		t.Fatal(failures)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if _, err := m.ListTools(ctx); err != nil {
+		t.Fatal(err)
+	}
+	// The plain server answers loom/turnStarted with an error, so a call to it
+	// would fail this.
+	if err := m.TurnStarted(ctx, "plan the release"); err != nil {
+		t.Fatal(err)
+	}
+	r, err := m.Dispatch(ctx, contract.ToolCall{ID: "1", Name: "mcp__turn__turn", Args: "{}"})
+	if err != nil || r.Content != "plan the release" {
+		t.Fatalf("prompt seen by the server = %+v, %v", r, err)
+	}
+	if err := m.TurnStarted(ctx, "fail"); err == nil || !strings.Contains(err.Error(), "turn refused") || !strings.Contains(err.Error(), "MCP server turn") {
+		t.Fatalf("refused turn = %v", err)
+	}
 }
 
 // fakeHTTP serves streamable HTTP: tool calls answer with an event stream so
