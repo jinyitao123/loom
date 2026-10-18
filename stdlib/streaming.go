@@ -18,8 +18,9 @@ var ErrStreamIncomplete = errors.New("stream closed without a done chunk")
 // NewStreamingLLM wraps an LLM so that Chat() drives the provider's token
 // Stream and forwards each delta to sink as it arrives — turning any
 // Chat-based step (e.g. the tool loop) into a streaming one without touching
-// the engine. Tool-call deltas stay internal: the wrapped Chat still returns
-// a fully assembled ChatResponse, so callers behave identically.
+// the engine. Reasoning deltas are forwarded as well. Tool-call deltas and
+// completed reasoning blocks stay internal: the wrapped Chat still returns a
+// fully assembled ChatResponse, so callers behave identically.
 //
 // If the provider's Stream fails, it falls back to a blocking Chat and emits
 // the whole message as a single chunk, so hosts can rely on the sink seeing
@@ -59,7 +60,12 @@ func (s *streamingLLM) Chat(ctx context.Context, req contract.ChatRequest) (*con
 		if cerr != nil {
 			return nil, cerr // 两条路径都失败才真正报错
 		}
-		// 把完整回复当作单个大块推给 sink，宿主侧仍能看到全部内容。
+		// 把完整回复当作单个大块推给 sink，宿主侧仍能看到全部内容（推理先于正文）。
+		for _, r := range resp.Reasoning {
+			if r.Text != "" {
+				_ = s.sink.SendChunk(contract.StreamChunk{Reasoning: r.Text})
+			}
+		}
 		if resp.Content != "" {
 			_ = s.sink.SendChunk(contract.StreamChunk{Content: resp.Content})
 		}
@@ -70,12 +76,13 @@ func (s *streamingLLM) Chat(ctx context.Context, req contract.ChatRequest) (*con
 	}
 
 	// 流式路径：一边消费通道一边累积，最终拼装出与阻塞式等价的完整响应。
-	var content strings.Builder       // 累积文本增量
-	var toolCalls []contract.ToolCall // 累积工具调用片段（不外推，保持内部）
-	var usage contract.Usage          // 记录 provider 上报的用量（通常在末尾块）
-	var finishReason string           // 终止块上的结束原因（stop / tool_calls / length ...）
-	done := false                     // 是否收到过 Done 终止块
-	for chunk := range ch {           // 通道由 provider 在流结束时关闭，循环自然退出
+	var content strings.Builder        // 累积文本增量
+	var toolCalls []contract.ToolCall  // 累积工具调用片段（不外推，保持内部）
+	var reasoning []contract.Reasoning // 累积完成的推理块（不外推，保持内部）
+	var usage contract.Usage           // 记录 provider 上报的用量（通常在末尾块）
+	var finishReason string            // 终止块上的结束原因（stop / tool_calls / length ...）
+	done := false                      // 是否收到过 Done 终止块
+	for chunk := range ch {            // 通道由 provider 在流结束时关闭，循环自然退出
 		// 错误块表示流异常收尾（取消、扫描失败、未见 [DONE] 等）：之前的增量可能缺失
 		// 文本或工具调用，必须作为错误上抛，也不向 sink 补发 Done。
 		if chunk.Err != nil {
@@ -86,6 +93,13 @@ func (s *streamingLLM) Chat(ctx context.Context, req contract.ChatRequest) (*con
 			// 实时把文本增量转发给 sink——这就是"边生成边显示"的来源；
 			// 推送失败同样忽略，不让展示层拖垮主流程。
 			_ = s.sink.SendChunk(contract.StreamChunk{Content: chunk.Content})
+		}
+		if chunk.Reasoning != "" {
+			// 推理增量只供展示，实时转发；保存以随后的完整推理块为准。
+			_ = s.sink.SendChunk(contract.StreamChunk{Reasoning: chunk.Reasoning})
+		}
+		if chunk.ReasoningBlock != nil {
+			reasoning = append(reasoning, *chunk.ReasoningBlock)
 		}
 		if len(chunk.ToolCalls) > 0 {
 			// 工具调用增量只累积、不推给 sink：它们属于工具循环的内部协议，
@@ -110,5 +124,5 @@ func (s *streamingLLM) Chat(ctx context.Context, req contract.ChatRequest) (*con
 	_ = s.sink.SendChunk(contract.StreamChunk{Done: true, Usage: &usage, FinishReason: finishReason})
 	// 返回组装好的完整响应：结束原因与阻塞式 Chat 一样放进 StopReason，
 	// 工具循环据此识别 length 截断。
-	return &contract.ChatResponse{Content: content.String(), ToolCalls: toolCalls, Usage: usage, StopReason: finishReason}, nil
+	return &contract.ChatResponse{Content: content.String(), ToolCalls: toolCalls, Usage: usage, StopReason: finishReason, Reasoning: reasoning}, nil
 }

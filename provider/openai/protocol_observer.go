@@ -240,7 +240,7 @@ func (p *protocolCapture) chatShape(raw []byte) {
 func unsupportedMessageFields(fields map[string]json.RawMessage) bool {
 	for key, value := range fields {
 		switch key {
-		case "content", "tool_calls", "role", "reasoning_content", "refusal":
+		case "content", "tool_calls", "role", "reasoning_content", "reasoning", "refusal":
 			continue
 		default:
 			if string(value) != "null" {

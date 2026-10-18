@@ -98,6 +98,45 @@ func TestStreamingLLMFallsBackToChat(t *testing.T) {
 	}
 }
 
+func TestStreamingLLMForwardsReasoningAndKeepsBlocks(t *testing.T) {
+	sink := &collectSink{}
+	llm := NewStreamingLLM(&chunkLLM{chunks: []contract.StreamChunk{
+		{Reasoning: "look "},
+		{Reasoning: "closer"},
+		{ReasoningBlock: &contract.Reasoning{Text: "look closer", Signature: "sig-1"}},
+		{ReasoningBlock: &contract.Reasoning{Signature: "hidden", Redacted: true}},
+		{Content: "found it"},
+		{Done: true, Usage: &contract.Usage{InputTokens: 10, CacheReadTokens: 6}},
+	}}, sink)
+
+	resp, err := llm.Chat(context.Background(), contract.ChatRequest{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []contract.Reasoning{{Text: "look closer", Signature: "sig-1"}, {Signature: "hidden", Redacted: true}}
+	if len(resp.Reasoning) != 2 || resp.Reasoning[0] != want[0] || resp.Reasoning[1] != want[1] {
+		t.Fatalf("reasoning = %+v", resp.Reasoning)
+	}
+	if resp.Usage.CacheReadTokens != 6 {
+		t.Fatalf("usage = %+v", resp.Usage)
+	}
+	var shown []string
+	for _, c := range sink.chunks {
+		if c.ReasoningBlock != nil {
+			t.Fatalf("completed blocks stay internal: %+v", c)
+		}
+		if c.Reasoning != "" {
+			shown = append(shown, c.Reasoning)
+		}
+	}
+	if strings.Join(shown, "") != "look closer" {
+		t.Fatalf("reasoning shown = %q", shown)
+	}
+	if msg := resp.AsMessage(); len(msg.Reasoning) != 2 {
+		t.Fatalf("assistant message lost its reasoning: %+v", msg)
+	}
+}
+
 func TestStreamingLLMReturnsFinishReason(t *testing.T) {
 	for _, reason := range []string{"stop", "length"} {
 		sink := &collectSink{}
