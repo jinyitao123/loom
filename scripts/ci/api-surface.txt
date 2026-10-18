@@ -10,6 +10,7 @@ type Message struct{ ... }
 type ProtocolContentObservation struct{ ... }
 type ProtocolObservation struct{ ... }
 type ProtocolRequestOptions struct{ ... }
+type Reasoning struct{ ... }
 type StateOp struct{ ... }
 type StreamChunk struct{ ... }
 type StreamSink interface{ ... }

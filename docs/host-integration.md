@@ -142,6 +142,8 @@ text tool-call markers (`｜DSML｜`) found in ordinary content, and reasoning
 frames/bytes. Marker text is not an executable call, so a zero-call response
 with markers indicates a provider-side text call carrier rather than a prose
 answer. Only counts are kept; no content or reasoning text is retained.
+Reasoning text itself reaches the caller through `ChatResponse.Reasoning` and
+`StreamChunk.Reasoning` / `ReasoningBlock`, never through observations.
 
 Absence means not collected or unsupported. `Complete=false` means the counts
 cannot establish zero calls. Malformed/unsupported frames, sparse/negative indexes, missing
@@ -153,7 +155,7 @@ Normal text with an observed finish and DONE can prove a complete zero-call
 protocol response, which is not proof that a requested task succeeded.
 
 The supported SSE delta and non-streaming message fields are `content`, `tool_calls`, `role`,
-`reasoning_content` and `refusal`. The last three do not carry tool calls and
+`reasoning_content`, `reasoning` and `refusal`. The last four do not carry tool calls and
 are never copied into observations. A non-null `function_call` or other unknown
 delta/message field makes the observation incomplete: the adapter does not execute that
 unsupported protocol, and cannot call its ignored value a complete zero-call
