@@ -55,6 +55,12 @@ type ToolLoopResumeGrant struct {
 	ExpectedYieldToken    string
 	ExpectedSlice         uint64
 	AuthorizedTotalRounds uint64
+	// AppendMessages is host input delivered at this pause, such as a message
+	// the user sent while the loop ran. It follows the last tool results and
+	// the next model round sees it. Only non-empty user messages are accepted.
+	// AppendMessages 是在本次暂停点送达的宿主输入（例如循环运行期间用户发来的消息），
+	// 接在最后一批工具结果之后、由下一轮模型调用看到；只接受非空的 user 消息。
+	AppendMessages []contract.Message
 }
 
 const maxToolLoopCounter uint64 = 1<<53 - 1
@@ -144,6 +150,23 @@ func PrepareToolLoopResume(state loom.State, grant ToolLoopResumeGrant) (loom.St
 		if err := cloneControlJSON(state[key], &delta, key); err != nil {
 			return nil, err
 		}
+	}
+	if len(grant.AppendMessages) > 0 {
+		var messages []contract.Message
+		if err := controlJSON(delta["__toolloop_msgs"], &messages); err != nil {
+			return nil, err
+		}
+		for _, message := range grant.AppendMessages {
+			if message.Role != "user" || len(message.ToolCalls) > 0 || message.ToolCallID != "" ||
+				(strings.TrimSpace(message.Content) == "" && len(message.Parts) == 0) {
+				return nil, fmt.Errorf("loom/toolloop: resume input must be non-empty user messages")
+			}
+			messages = append(messages, message)
+		}
+		if err := validateToolTranscript(messages, nil); err != nil {
+			return nil, err
+		}
+		delta["__toolloop_msgs"] = messages
 	}
 	delta["__toolloop_control"] = control
 	return delta, nil
