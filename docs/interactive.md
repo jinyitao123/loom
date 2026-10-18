@@ -76,6 +76,10 @@ Files over 64 KiB are skipped.
 
 A model whose `input` lists `"image"` receives images (from prompts and from
 `read`) as image parts; other models receive a short note in their place.
+Images from prompts and tool results larger than 2000 pixels on a side or
+about 3.75 MB are scaled down (PNG and GIF stay PNG unless that is still too
+large, JPEG stays JPEG) before they are stored and sent, followed by a note
+with the original size.
 
 ## Skills
 
@@ -226,6 +230,6 @@ message completes.
 ## Limits of this version
 
 - Tool-call argument deltas are not streamed.
-- Images are not resized; large images count fully against the context.
+- WebP images are not resized (the standard library cannot decode them).
 - `.gitignore` handling in `grep` and `find` covers the common patterns of
   the root file only.

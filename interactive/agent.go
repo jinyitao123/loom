@@ -596,7 +596,7 @@ func (a *Agent) userMessage(item queued) Message {
 		a.emit(map[string]any{"type": "extension_error", "extensionPath": "skills", "event": "expand", "error": err.Error()})
 	}
 	content := textBlocks(text)
-	content = append(content, item.images...)
+	content = append(content, fitImageBlocks(item.images)...)
 	return Message{Role: "user", Content: content, Timestamp: nowMillis()}
 }
 
@@ -651,6 +651,7 @@ func (r *promptRun) toolHook() contract.ToolHook {
 			r.toolMu.Lock()
 			delete(r.tools, call.ID)
 			r.toolMu.Unlock()
+			fitResultImages(result)
 			content := resultBlocks(result)
 			r.agent.emit(map[string]any{"type": "tool_execution_end", "toolCallId": call.ID, "toolName": call.Name,
 				"result": map[string]any{"content": content, "details": map[string]any{}}, "isError": result.IsError})
@@ -660,6 +661,36 @@ func (r *promptRun) toolHook() contract.ToolHook {
 			return nil
 		},
 	}
+}
+
+// fitResultImages scales a tool result's images down in place, before the
+// result reaches the model and the session.
+func fitResultImages(result *contract.ToolResult) {
+	has := false
+	for _, p := range result.Parts {
+		has = has || p.Type == "image"
+	}
+	if !has {
+		return
+	}
+	var blocks []Block
+	for _, p := range result.Parts {
+		switch p.Type {
+		case "text":
+			blocks = append(blocks, Block{Type: "text", Text: p.Text})
+		case "image":
+			blocks = append(blocks, Block{Type: "image", Data: p.Data, MimeType: p.MediaType})
+		}
+	}
+	parts := make([]contract.ContentPart, 0, len(blocks))
+	for _, b := range fitImageBlocks(blocks) {
+		if b.Type == "image" {
+			parts = append(parts, contract.ContentPart{Type: "image", Data: b.Data, MediaType: b.MimeType})
+		} else {
+			parts = append(parts, contract.ContentPart{Type: "text", Text: b.Text})
+		}
+	}
+	result.Parts = parts
 }
 
 // resultBlocks converts a tool result to content blocks, keeping its images.
