@@ -1,4 +1,6 @@
 # contract
+func ReportToolProgress(ctx context.Context, callID string, partial ToolResult)
+func WithToolProgress(ctx context.Context, report ToolProgress) context.Context
 type ChatRequest struct{ ... }
 type ChatResponse struct{ ... }
 type ContentPart struct{ ... }
@@ -21,6 +23,7 @@ type ToolChoiceMode string
 type ToolDef struct{ ... }
 type ToolDispatcher interface{ ... }
 type ToolHook struct{ ... }
+type ToolProgress func(callID string, partial ToolResult)
 type ToolResult struct{ ... }
 type Usage struct{ ... }
 # stdlib
