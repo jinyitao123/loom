@@ -1,6 +1,7 @@
 # contract
 type ChatRequest struct{ ... }
 type ChatResponse struct{ ... }
+type ContentPart struct{ ... }
 type EffortLevel string
     const EffortLow EffortLevel = "low" ...
 type Embedder interface{ ... }
