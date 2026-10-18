@@ -136,6 +136,7 @@ type Client struct {
 	// thinking+tools 必须回传 reasoning_content；M1 阶段不做 reasoning 连续性，
 	// 因此带 tools 的请求直接 fail-safe 关闭 thinking。
 	thinkingDisableWithTools bool
+	reasoningContentReplay   bool
 	// 中文：经 WithToolChoiceModes 声明的可用工具选择模式；nil 表示 OpenAI 协议的全部模式均可用。
 	toolChoiceModes map[contract.ToolChoiceMode]bool
 }
@@ -183,6 +184,13 @@ func WithThinkingControl(defaultMode string, disableWithTools bool) Option {
 		c.thinkingDefaultMode = defaultMode
 		c.thinkingDisableWithTools = disableWithTools
 	}
+}
+
+// WithReasoningContentReplay opts into the reasoning_content history dialect.
+// Only plain text blocks are representable; signatures and redacted blocks
+// fail before transport rather than losing their provider-specific data.
+func WithReasoningContentReplay() Option {
+	return func(c *Client) { c.reasoningContentReplay = true }
 }
 
 // WithToolChoiceModes restricts the ChatRequest.ToolChoice modes this endpoint
@@ -315,9 +323,10 @@ type oaiMessage struct {
 	// Content is a string, or a part array when a user message carries images;
 	// nil (empty text) is omitted, keeping text-only requests byte-identical.
 	// 中文：纯文本时为字符串；user 消息带图片时为片段数组；空文本为 nil 并被省略，纯文本请求逐字节不变。
-	Content    any           `json:"content,omitempty"`
-	ToolCalls  []oaiToolCall `json:"tool_calls,omitempty"`   // assistant 消息回放的历史工具调用
-	ToolCallID string        `json:"tool_call_id,omitempty"` // tool 消息与先前某次调用配对的 ID
+	Content          any           `json:"content,omitempty"`
+	ToolCalls        []oaiToolCall `json:"tool_calls,omitempty"`   // assistant 消息回放的历史工具调用
+	ToolCallID       string        `json:"tool_call_id,omitempty"` // tool 消息与先前某次调用配对的 ID
+	ReasoningContent string        `json:"reasoning_content,omitempty"`
 }
 
 // oaiTool 中文：请求中的工具定义外壳，type 固定为 "function"。
@@ -378,12 +387,21 @@ type oaiUsage struct {
 	PromptTokens        int `json:"prompt_tokens"`     // 输入侧 token 数
 	CompletionTokens    int `json:"completion_tokens"` // 输出侧 token 数
 	PromptTokensDetails struct {
-		CachedTokens int `json:"cached_tokens"`
+		CachedTokens *int `json:"cached_tokens"`
 	} `json:"prompt_tokens_details"`
+	PromptCacheHitTokens *int `json:"prompt_cache_hit_tokens"`
 }
 
 func (u oaiUsage) contract() contract.Usage {
-	return contract.Usage{InputTokens: u.PromptTokens, OutputTokens: u.CompletionTokens, CacheReadTokens: u.PromptTokensDetails.CachedTokens}
+	usage := contract.Usage{InputTokens: u.PromptTokens, OutputTokens: u.CompletionTokens}
+	cached := u.PromptTokensDetails.CachedTokens
+	if cached == nil {
+		cached = u.PromptCacheHitTokens
+	}
+	if cached != nil {
+		usage.CacheReadTokens, usage.CacheReadReported = *cached, true
+	}
+	return usage
 }
 
 // reasoningText returns whichever reasoning field the endpoint filled.
@@ -427,6 +445,11 @@ func (c *Client) buildMessages(msgs []contract.Message) []oaiMessage {
 		}
 		// 基础字段映射：角色、文本内容、工具结果消息配对用的 tool_call_id。
 		msg := oaiMessage{Role: m.Role, ToolCallID: m.ToolCallID}
+		if c.reasoningContentReplay && m.Role == "assistant" {
+			for _, block := range m.Reasoning {
+				msg.ReasoningContent += block.Text
+			}
+		}
 		if m.Content != "" {
 			msg.Content = m.Content
 		}
@@ -598,7 +621,31 @@ func (c *Client) applyThinkingControl(oaiReq *oaiRequest) {
 // covers Chinese prompts that embed the ASCII term (e.g. "请输出JSON格式").
 // 中文：json_object 模式发送前校验 messages 中存在明确的 JSON 输出指令；
 // 缺失时返回 ErrJSONModeInstructionMissing，请求不得发出（server 零命中）。
+func (c *Client) validateReasoningReplay(req contract.ChatRequest) error {
+	if !c.reasoningContentReplay {
+		return nil
+	}
+	for _, message := range req.Messages {
+		if message.Role != "assistant" && len(message.Reasoning) != 0 {
+			return errors.New("openai: reasoning history must belong to assistant messages")
+		}
+		for _, block := range message.Reasoning {
+			if block.Redacted || block.Signature != "" {
+				return errors.New("openai: reasoning_content cannot represent signed or redacted reasoning")
+			}
+		}
+	}
+	if c.thinkingDefaultMode == "enabled" && !(c.thinkingDisableWithTools && len(req.Tools) > 0) && req.ToolChoice != nil &&
+		(req.ToolChoice.Mode == contract.ToolChoiceRequired || req.ToolChoice.Mode == contract.ToolChoiceTool) {
+		return fmt.Errorf("%w: forced tool choice with enabled thinking", ErrToolChoiceUnsupported)
+	}
+	return nil
+}
+
 func (c *Client) requireJSONOutputInstruction(req contract.ChatRequest) error {
+	if err := c.validateReasoningReplay(req); err != nil {
+		return err
+	}
 	if !c.jsonObjectMode || req.Schema == nil {
 		return nil
 	}

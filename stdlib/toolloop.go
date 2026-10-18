@@ -619,6 +619,8 @@ func addUsage(total, usage contract.Usage) contract.Usage {
 	total.CostUSD += usage.CostUSD
 	total.CacheReadTokens += usage.CacheReadTokens
 	total.CacheWriteTokens += usage.CacheWriteTokens
+	total.CacheReadReported = total.CacheReadReported || usage.CacheReadReported || usage.CacheReadTokens != 0
+	total.CacheWriteReported = total.CacheWriteReported || usage.CacheWriteReported || usage.CacheWriteTokens != 0
 	return total
 }
 

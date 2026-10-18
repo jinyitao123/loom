@@ -108,6 +108,26 @@ completion (`result` carries final status + session id).
 process invocations. This is how a per-turn CLI sustains a multi-turn,
 in-presence agent.
 
+## Optional reasoning history and cache accounting
+
+The compatibility provider accepts `openai.WithReasoningContentReplay()` for
+endpoints using the `reasoning_content` history dialect. Without this option,
+history serialization is unchanged. With it, assistant text reasoning blocks
+are returned in order with the original tool-call history. Signed or redacted
+blocks cannot be represented by this dialect and are rejected before sending.
+Forced tool choices with explicitly enabled thinking are rejected as unsupported;
+the adapter never drops the constraint to make a request succeed. Hosts must
+freeze this capability with their provider configuration and persist completed
+`ReasoningBlock` values, rather than saving streamed display deltas twice.
+
+`Usage.CacheReadReported` and `CacheWriteReported` distinguish a reported zero
+from missing data. Non-zero counts also establish reporting for existing callers.
+Cache subtotals are already included in `InputTokens`, not added to it. The
+compatibility adapter reads `prompt_tokens_details.cached_tokens` and the
+`prompt_cache_hit_tokens` dialect; cache misses are not cache writes. Hosts must
+preserve these facts in physical receipts and checkpoints, and report incomplete
+coverage rather than inventing zero values for earlier unobserved calls.
+
 ## Optional provider protocol observations
 
 Embedded Go hosts may opt a single provider invocation into
