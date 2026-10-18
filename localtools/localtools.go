@@ -41,6 +41,7 @@ var All = []string{"read", "bash", "edit", "write", "grep", "find", "ls"}
 type Tools struct {
 	cwd      string
 	enabled  []string
+	shell    Shell
 	progress func(callID, output string)
 }
 
@@ -76,7 +77,7 @@ func New(cwd string, names ...string) (*Tools, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Tools{cwd: abs, enabled: append([]string(nil), names...)}, nil
+	return &Tools{cwd: abs, enabled: append([]string(nil), names...), shell: systemShell}, nil
 }
 
 // ListTools returns the enabled tool definitions.

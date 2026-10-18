@@ -4,12 +4,23 @@ package localtools
 
 import (
 	"os/exec"
+	"strings"
 	"syscall"
 )
 
-func bashCandidates() []string { return []string{"/bin/bash", "bash"} }
-
-func fallbackShell() (string, []string, string) { return "/bin/sh", []string{"-c"}, "sh" }
+// detectShell picks bash, or /bin/sh when there is none. LOOM_SHELL may name
+// another executable.
+func detectShell(override string) Shell {
+	if override = strings.TrimSpace(override); override != "" {
+		if path := lookShell([]string{override}, nil); path != "" {
+			return shellFor(path)
+		}
+	}
+	if path := lookShell([]string{"/bin/bash", "bash"}, nil); path != "" {
+		return Shell{Name: "bash", Path: path}
+	}
+	return Shell{Name: "sh", Path: "/bin/sh"}
+}
 
 // prepareProcess starts the command in its own process group so that killing
 // it also stops the processes it started.

@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"time"
 
@@ -178,6 +179,9 @@ func systemPrompt(cwd, agentDir string, tools []string) string {
 	b.WriteString("- Keep answers concise; show file paths when you mention files.\n")
 	b.WriteString("- Do not guess file contents or command results; use the tools.\n\n")
 	fmt.Fprintf(&b, "Current date: %s\nPlatform: %s/%s\nCurrent working directory: %s\n", time.Now().Format("2006-01-02"), runtime.GOOS, runtime.GOARCH, cwd)
+	if slices.Contains(tools, "bash") {
+		fmt.Fprintf(&b, "The bash tool runs commands in %s; write commands for that shell.\n", localtools.ShellName())
+	}
 	b.WriteString(interactive.ContextPrompt(interactive.LoadContextFiles(agentDir, cwd)))
 	return b.String()
 }

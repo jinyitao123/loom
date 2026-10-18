@@ -17,22 +17,11 @@ import (
 const maxCapture = 8 << 20
 
 func init() {
-	_, _, name := shellCommand()
 	register("bash",
-		fmt.Sprintf("Execute a %s command in the current working directory. Returns stdout and stderr. Output is truncated to last %d lines or %dKB (whichever is hit first). If truncated, full output is saved to a temp file. Optionally provide a timeout in seconds.", name, MaxLines, MaxBytes/1024),
+		fmt.Sprintf("Execute a %s command in the current working directory. Returns stdout and stderr. Output is truncated to last %d lines or %dKB (whichever is hit first). If truncated, full output is saved to a temp file. Optionally provide a timeout in seconds.", systemShell.Name, MaxLines, MaxBytes/1024),
 		false,
 		`{"type":"object","properties":{"command":{"type":"string","description":"Shell command to execute"},"timeout":{"type":"number","description":"Timeout in seconds (optional, no default timeout)"}},"required":["command"]}`,
 		runBash)
-}
-
-// shellCommand picks the shell: bash when available, otherwise the platform shell.
-func shellCommand() (path string, args []string, name string) {
-	for _, candidate := range bashCandidates() {
-		if p, err := exec.LookPath(candidate); err == nil {
-			return p, []string{"-c"}, "bash"
-		}
-	}
-	return fallbackShell()
 }
 
 // output collects combined stdout and stderr, keeping the newest maxCapture
@@ -80,8 +69,11 @@ func runBash(ctx context.Context, t *Tools, raw json.RawMessage) (string, error)
 		ctx, cancel = context.WithTimeout(ctx, time.Duration(args.Timeout*float64(time.Second)))
 		defer cancel()
 	}
-	shell, shellArgs, _ := shellCommand()
-	cmd := exec.Command(shell, append(shellArgs, args.Command)...)
+	cmd, cleanup, err := t.shell.command(args.Command)
+	if err != nil {
+		return "", fmt.Errorf("Could not start the command: %v", err)
+	}
+	defer cleanup()
 	cmd.Dir = t.cwd
 	out := &output{}
 	cmd.Stdout, cmd.Stderr = out, out

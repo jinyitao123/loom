@@ -81,6 +81,25 @@ about 3.75 MB are scaled down (PNG and GIF stay PNG unless that is still too
 large, JPEG stays JPEG) before they are stored and sent, followed by a note
 with the original size.
 
+## Local tools
+
+`bash` runs a command in the working directory with bash; where there is
+none it uses `/bin/sh`, and on Windows Git Bash, then PowerShell 7, Windows
+PowerShell and finally cmd (the WSL `bash.exe` is never used). `LOOM_SHELL`
+overrides the choice (`bash`, `powershell`, `cmd` or an executable path).
+The tool description and the system prompt name the shell, so the model
+writes commands for it. PowerShell receives the command as
+`-EncodedCommand` (a script file for very long commands), with UTF-8 output;
+a failing last statement exits with 1. On Windows commands open no console
+window.
+
+`grep` and `find` skip what git ignores: the `.gitignore` of every
+directory (nested files, `!` negation, anchored and directory-only patterns,
+`**`), `.gitignore` files between the repository root and the search
+directory, `.git/info/exclude`, the global excludes file
+(`core.excludesFile` or `~/.config/git/ignore`) and `.ignore` files. `.git`
+and `node_modules` directories are always skipped.
+
 ## Skills
 
 A skill is a `SKILL.md` file whose front matter names it and describes when to
@@ -231,5 +250,3 @@ message completes.
 
 - Tool-call argument deltas are not streamed.
 - WebP images are not resized (the standard library cannot decode them).
-- `.gitignore` handling in `grep` and `find` covers the common patterns of
-  the root file only.
