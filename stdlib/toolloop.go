@@ -881,8 +881,8 @@ func removeDeletedKey(staged loom.State, key string) {
 // DispatchWithHooks 按三阶段协议执行一批工具调用：
 //
 //	阶段 1：Pre 钩子——可改写调用参数，也可返回错误直接拦截（结果标记为被钩子挡下）；
-//	阶段 2：按 ToolDef.ReadOnly 分流执行——只读工具并行跑（无副作用、互不干扰），
-//	        有状态工具串行跑（副作用之间可能有依赖，必须保持模型给出的顺序）；
+//	阶段 2：按模型给出的顺序分段执行——相邻的只读调用组成一段并行跑，
+//	        每个有状态调用单独成段；段与段串行，只读调用不越过前面的写操作；
 //	阶段 3：Post 钩子——拿到调用与结果指针做审计/改写。
 //
 // 返回的结果切片与传入的 calls 按下标一一对应，保证回填消息历史时顺序正确。
@@ -936,80 +936,75 @@ func DispatchWithHooks(ctx context.Context, tools contract.ToolDispatcher,
 		calls[i] = call // store potentially modified call
 	}
 
-	// Phase 2: split by read-only vs stateful.
-	// 阶段 2 准备：给调用附带原始下标一起分流，执行完仍能把结果写回正确槽位。
-	type indexedCall struct {
-		idx  int               // 在 calls/results 中的原始下标
-		call contract.ToolCall // 待执行的调用（阶段 1 改写后的版本）
+	// Phase 2: dispatch in model order. Consecutive read-only calls form one
+	// parallel segment; each stateful call is a segment of its own. A read-only
+	// call never runs ahead of a stateful call the model placed before it.
+	// 阶段 2：按模型顺序分段执行。相邻只读调用并行，有状态调用单独串行；
+	// 段与段之间严格按顺序推进，后面的只读调用不会抢在前面的写操作之前执行。
+	dispatch := func(idx int) error {
+		c := calls[idx]
+		result, err := tools.Dispatch(ctx, c)
+		if err != nil {
+			if errors.Is(err, ErrJournalExecution) {
+				return err
+			}
+			// 单个工具失败不连坐：转成 IsError 结果，让模型自行决定如何应对。
+			results[idx] = contract.ToolResult{
+				CallID: c.ID, Content: fmt.Sprintf("error: %v", err),
+				IsError: true, ToolName: c.Name,
+			}
+			return nil
+		}
+		// 补上工具名（分发器不保证回填），再落入对应槽位。
+		result.ToolName = c.Name
+		results[idx] = *result
+		return nil
 	}
-	var readOnly, stateful []indexedCall
+	var segment []int // 当前累积中的只读段（原始下标）
+	flush := func() error {
+		defer func() { segment = segment[:0] }()
+		if len(segment) == 1 {
+			return dispatch(segment[0])
+		}
+		// 各 goroutine 写入 results 的不同下标，无数据竞争。
+		var wg sync.WaitGroup
+		fatal := make(chan error, len(segment))
+		for _, idx := range segment {
+			wg.Add(1)
+			go func(idx int) {
+				defer wg.Done()
+				if err := dispatch(idx); err != nil {
+					fatal <- err
+				}
+			}(idx)
+		}
+		wg.Wait() // 汇合点：本段只读调用全部完成后才推进到下一段
+		select {
+		case err := <-fatal:
+			return err
+		default:
+			return nil
+		}
+	}
 	for i, call := range calls {
 		// CallID 非空说明该槽位已在阶段 1 被填过（拦截结果），跳过执行。
 		if results[i].CallID != "" {
 			continue // already blocked
 		}
-		// 依据工具定义的 ReadOnly 标记分流；查不到定义的工具一律按有状态保守处理。
+		// 查不到定义的工具一律按有状态保守处理。
 		if d, ok := defMap[call.Name]; ok && d.ReadOnly {
-			readOnly = append(readOnly, indexedCall{i, call})
-		} else {
-			stateful = append(stateful, indexedCall{i, call})
-		}
-	}
-
-	// Read-only: parallel.
-	// 只读工具无副作用，可安全并行执行；用 WaitGroup 等待全部 goroutine 结束。
-	if len(readOnly) > 0 {
-		var wg sync.WaitGroup
-		fatal := make(chan error, len(readOnly))
-		for _, ic := range readOnly {
-			wg.Add(1)
-			// 下标与调用通过参数传入 goroutine，规避闭包捕获循环变量的经典陷阱；
-			// 各 goroutine 写入 results 的不同下标，无数据竞争。
-			go func(idx int, c contract.ToolCall) {
-				defer wg.Done()
-				result, err := tools.Dispatch(ctx, c)
-				if err != nil {
-					if errors.Is(err, ErrJournalExecution) {
-						fatal <- err
-						return
-					}
-					// 单个工具失败不连坐：转成 IsError 结果，让模型自行决定如何应对。
-					results[idx] = contract.ToolResult{
-						CallID: c.ID, Content: fmt.Sprintf("error: %v", err),
-						IsError: true, ToolName: c.Name,
-					}
-					return
-				}
-				// 补上工具名（分发器不保证回填），再落入对应槽位。
-				result.ToolName = c.Name
-				results[idx] = *result
-			}(ic.idx, ic.call)
-		}
-		wg.Wait() // 汇合点：所有只读调用完成后才进入串行阶段
-		select {
-		case err := <-fatal:
-			return nil, err
-		default:
-		}
-	}
-
-	// Stateful: serial (order matters).
-	// 有状态工具严格串行、保持模型给出的顺序——写操作之间可能存在先后依赖。
-	for _, ic := range stateful {
-		result, err := tools.Dispatch(ctx, ic.call)
-		if err != nil {
-			if errors.Is(err, ErrJournalExecution) {
-				return nil, err
-			}
-			// 失败同样转成 IsError 结果并继续执行后续调用，不中断整批。
-			results[ic.idx] = contract.ToolResult{
-				CallID: ic.call.ID, Content: fmt.Sprintf("error: %v", err),
-				IsError: true, ToolName: ic.call.Name,
-			}
+			segment = append(segment, i)
 			continue
 		}
-		result.ToolName = ic.call.Name // 同样补上工具名
-		results[ic.idx] = *result
+		if err := flush(); err != nil {
+			return nil, err
+		}
+		if err := dispatch(i); err != nil {
+			return nil, err
+		}
+	}
+	if err := flush(); err != nil {
+		return nil, err
 	}
 
 	// Phase 3: run Post hooks.

@@ -2,10 +2,18 @@ package stdlib
 
 import (
 	"context" // 透传给内层 LLM，承载超时/取消
+	"errors"  // ErrStreamIncomplete 哨兵错误
 	"strings" // strings.Builder 增量拼装流式文本，避免反复分配字符串
 
 	"github.com/jinyitao123/loom/contract" // 只依赖 contract 抽象，不接触任何具体 provider
 )
+
+// ErrStreamIncomplete reports a stream channel that closed without a Done
+// chunk or an Err chunk. The partial text is never returned as a completed
+// response.
+// ErrStreamIncomplete 表示流通道既没有 Done 终止块也没有 Err 错误块就关闭了：
+// 已收到的部分内容不能当作完整回复返回。
+var ErrStreamIncomplete = errors.New("stream closed without a done chunk")
 
 // NewStreamingLLM wraps an LLM so that Chat() drives the provider's token
 // Stream and forwards each delta to sink as it arrives — turning any
@@ -16,7 +24,9 @@ import (
 // If the provider's Stream fails, it falls back to a blocking Chat and emits
 // the whole message as a single chunk, so hosts can rely on the sink seeing
 // every assistant utterance either way. A final chunk with Done=true (and
-// Usage when the provider reports it) marks the end of each response.
+// Usage and FinishReason when the provider reports them) marks the end of
+// each response. An Err chunk, or a channel that closes without Done, is
+// returned as an error and no Done chunk is sent.
 //
 // NewStreamingLLM 是装饰器模式的典型运用：包装任意 LLM，使其 Chat 内部改走
 // provider 的 Stream 通道，把每个文本增量实时推给 sink，最终仍组装并返回
@@ -63,7 +73,14 @@ func (s *streamingLLM) Chat(ctx context.Context, req contract.ChatRequest) (*con
 	var content strings.Builder       // 累积文本增量
 	var toolCalls []contract.ToolCall // 累积工具调用片段（不外推，保持内部）
 	var usage contract.Usage          // 记录 provider 上报的用量（通常在末尾块）
+	var finishReason string           // 终止块上的结束原因（stop / tool_calls / length ...）
+	done := false                     // 是否收到过 Done 终止块
 	for chunk := range ch {           // 通道由 provider 在流结束时关闭，循环自然退出
+		// 错误块表示流异常收尾（取消、扫描失败、未见 [DONE] 等）：之前的增量可能缺失
+		// 文本或工具调用，必须作为错误上抛，也不向 sink 补发 Done。
+		if chunk.Err != nil {
+			return nil, chunk.Err
+		}
 		if chunk.Content != "" {
 			content.WriteString(chunk.Content) // 拼入完整文本
 			// 实时把文本增量转发给 sink——这就是"边生成边显示"的来源；
@@ -78,9 +95,20 @@ func (s *streamingLLM) Chat(ctx context.Context, req contract.ChatRequest) (*con
 		if chunk.Usage != nil {
 			usage = *chunk.Usage // 以最后一次上报为准（provider 通常仅在终止块携带）
 		}
+		if chunk.FinishReason != "" {
+			finishReason = chunk.FinishReason
+		}
+		if chunk.Done {
+			done = true
+		}
 	}
-	// 流正常结束：发 Done 终止块并附带用量，宿主据此收尾渲染。
-	_ = s.sink.SendChunk(contract.StreamChunk{Done: true, Usage: &usage})
-	// 返回组装好的完整响应：对调用方而言与直接调 inner.Chat 结果一致。
-	return &contract.ChatResponse{Content: content.String(), ToolCalls: toolCalls, Usage: usage}, nil
+	// 通道关闭却没有 Done：流被截断，不能把部分内容当作完整回复。
+	if !done {
+		return nil, ErrStreamIncomplete
+	}
+	// 流正常结束：发 Done 终止块并附带用量与结束原因，宿主据此收尾渲染。
+	_ = s.sink.SendChunk(contract.StreamChunk{Done: true, Usage: &usage, FinishReason: finishReason})
+	// 返回组装好的完整响应：结束原因与阻塞式 Chat 一样放进 StopReason，
+	// 工具循环据此识别 length 截断。
+	return &contract.ChatResponse{Content: content.String(), ToolCalls: toolCalls, Usage: usage, StopReason: finishReason}, nil
 }

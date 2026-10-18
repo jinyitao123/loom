@@ -111,7 +111,7 @@ func TestNoToolsDispatchErrors(t *testing.T) {
 
 func TestStreamingLLMStreamDelegates(t *testing.T) {
 	inner := &streamLLM{chunks: []contract.StreamChunk{{Content: "x"}}}
-	s := &streamingLLM{inner: inner, out: NewEmitter(&bytes.Buffer{})}
+	s := newStreamingLLM(inner, NewEmitter(&bytes.Buffer{}))
 	ch, err := s.Stream(context.Background(), contract.ChatRequest{})
 	if err != nil || ch == nil {
 		t.Fatalf("Stream should delegate: ch=%v err=%v", ch, err)

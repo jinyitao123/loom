@@ -97,3 +97,67 @@ func TestStreamingLLMFallsBackToChat(t *testing.T) {
 		t.Errorf("sink should see the whole message as one chunk, got %+v", sink.chunks)
 	}
 }
+
+func TestStreamingLLMReturnsFinishReason(t *testing.T) {
+	for _, reason := range []string{"stop", "length"} {
+		sink := &collectSink{}
+		llm := NewStreamingLLM(&chunkLLM{chunks: []contract.StreamChunk{
+			{Content: "partial"},
+			{Done: true, FinishReason: reason},
+		}}, sink)
+
+		resp, err := llm.Chat(context.Background(), contract.ChatRequest{})
+		if err != nil {
+			t.Fatalf("%s: %v", reason, err)
+		}
+		if resp.StopReason != reason {
+			t.Errorf("StopReason = %q, want %q", resp.StopReason, reason)
+		}
+		last := sink.chunks[len(sink.chunks)-1]
+		if !last.Done || last.FinishReason != reason {
+			t.Errorf("%s: final sink chunk = %+v", reason, last)
+		}
+	}
+}
+
+func TestStreamingLLMPropagatesStreamErrors(t *testing.T) {
+	probe := errors.New("probe")
+	for name, streamErr := range map[string]error{"error": probe, "cancel": context.Canceled} {
+		sink := &collectSink{}
+		llm := NewStreamingLLM(&chunkLLM{chunks: []contract.StreamChunk{
+			{Content: "partial"},
+			{Err: streamErr},
+		}}, sink)
+
+		resp, err := llm.Chat(context.Background(), contract.ChatRequest{})
+		if !errors.Is(err, streamErr) {
+			t.Fatalf("%s: err = %v, want %v", name, err, streamErr)
+		}
+		if resp != nil {
+			t.Errorf("%s: partial response returned as success: %+v", name, resp)
+		}
+		for _, c := range sink.chunks {
+			if c.Done {
+				t.Errorf("%s: sink saw Done after a stream error", name)
+			}
+		}
+	}
+}
+
+func TestStreamingLLMRejectsStreamWithoutDone(t *testing.T) {
+	sink := &collectSink{}
+	llm := NewStreamingLLM(&chunkLLM{chunks: []contract.StreamChunk{{Content: "partial"}}}, sink)
+
+	resp, err := llm.Chat(context.Background(), contract.ChatRequest{})
+	if !errors.Is(err, ErrStreamIncomplete) {
+		t.Fatalf("err = %v, want ErrStreamIncomplete", err)
+	}
+	if resp != nil {
+		t.Errorf("partial response returned as success: %+v", resp)
+	}
+	for _, c := range sink.chunks {
+		if c.Done {
+			t.Error("sink saw Done for a truncated stream")
+		}
+	}
+}
