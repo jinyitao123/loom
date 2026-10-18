@@ -638,6 +638,8 @@ func addUsage(total, usage contract.Usage) contract.Usage {
 	total.InputTokens += usage.InputTokens
 	total.OutputTokens += usage.OutputTokens
 	total.CostUSD += usage.CostUSD
+	total.CacheReadTokens += usage.CacheReadTokens
+	total.CacheWriteTokens += usage.CacheWriteTokens
 	return total
 }
 

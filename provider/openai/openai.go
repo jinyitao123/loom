@@ -357,20 +357,41 @@ type oaiResponse struct {
 			Role      string        `json:"role"`                 // 恒为 assistant
 			Content   string        `json:"content"`              // 回复文本
 			ToolCalls []oaiToolCall `json:"tool_calls,omitempty"` // 模型请求执行的工具调用
-			// ReasoningContent 中文：仅供协议观测计数，绝不进入 ChatResponse 或任何输出。
+			// ReasoningContent / Reasoning 中文：推理文本（DeepSeek 等用 reasoning_content，
+			// 部分网关用 reasoning），作为 ChatResponse.Reasoning 交付，同时计入协议观测。
 			ReasoningContent string `json:"reasoning_content,omitempty"`
+			Reasoning        string `json:"reasoning,omitempty"`
 		} `json:"message"`
 		FinishReason string `json:"finish_reason"` // 结束原因：stop / tool_calls / length 等
 	} `json:"choices"`
 	// Usage 中文：本次调用的 token 统计，映射回 contract.Usage。
-	Usage struct {
-		PromptTokens     int `json:"prompt_tokens"`     // 输入侧 token 数
-		CompletionTokens int `json:"completion_tokens"` // 输出侧 token 数
-	} `json:"usage"`
+	Usage oaiUsage `json:"usage"`
 	// Error 中文：响应体内嵌的 API 错误（可能伴随 200 状态码出现）。
 	Error *struct {
 		Message string `json:"message"`
 	} `json:"error,omitempty"`
+}
+
+// oaiUsage 中文：token 统计；prompt_tokens 含命中缓存的部分，
+// prompt_tokens_details.cached_tokens 即 contract.Usage.CacheReadTokens。
+type oaiUsage struct {
+	PromptTokens        int `json:"prompt_tokens"`     // 输入侧 token 数
+	CompletionTokens    int `json:"completion_tokens"` // 输出侧 token 数
+	PromptTokensDetails struct {
+		CachedTokens int `json:"cached_tokens"`
+	} `json:"prompt_tokens_details"`
+}
+
+func (u oaiUsage) contract() contract.Usage {
+	return contract.Usage{InputTokens: u.PromptTokens, OutputTokens: u.CompletionTokens, CacheReadTokens: u.PromptTokensDetails.CachedTokens}
+}
+
+// reasoningText returns whichever reasoning field the endpoint filled.
+func reasoningText(reasoningContent, reasoning string) string {
+	if reasoningContent != "" {
+		return reasoningContent
+	}
+	return reasoning
 }
 
 // resolveModel 中文：模型名解析——请求显式指定则优先，空串时回退到构造期的 defaultModel。
@@ -700,14 +721,15 @@ func (c *Client) Chat(ctx context.Context, req contract.ChatRequest) (*contract.
 	// 只取第一个 choice（框架不使用 n>1 的多候选），回填为 contract.ChatResponse。
 	choice := oaiResp.Choices[0]
 	probe.content(choice.Message.Content)
-	probe.reasoning(choice.Message.ReasoningContent)
+	reasoning := reasoningText(choice.Message.ReasoningContent, choice.Message.Reasoning)
+	probe.reasoning(reasoning)
 	chatResp := &contract.ChatResponse{
-		Content:    choice.Message.Content, // 助手文本内容
-		StopReason: choice.FinishReason,    // 结束原因（stop / tool_calls / length ...）原样透传
-		Usage: contract.Usage{
-			InputTokens:  oaiResp.Usage.PromptTokens,     // prompt_tokens -> 输入 token 数
-			OutputTokens: oaiResp.Usage.CompletionTokens, // completion_tokens -> 输出 token 数
-		},
+		Content:    choice.Message.Content,   // 助手文本内容
+		StopReason: choice.FinishReason,      // 结束原因（stop / tool_calls / length ...）原样透传
+		Usage:      oaiResp.Usage.contract(), // prompt/completion/cached tokens
+	}
+	if reasoning != "" {
+		chatResp.Reasoning = []contract.Reasoning{{Text: reasoning}}
 	}
 
 	// 把模型发起的 tool_calls 逐个映射回 contract.ToolCall；
@@ -747,17 +769,15 @@ type oaiStreamChunk struct {
 		Delta struct {
 			Content   string        `json:"content,omitempty"`    // 本块新增的文本片段
 			ToolCalls []oaiToolCall `json:"tool_calls,omitempty"` // 本块新增的工具调用增量（按 Index 归并）
-			// ReasoningContent 中文：仅供协议观测计数，绝不下发给消费方。
+			// ReasoningContent / Reasoning 中文：推理文本增量，作为 StreamChunk.Reasoning 下发并计入协议观测。
 			ReasoningContent string `json:"reasoning_content,omitempty"`
+			Reasoning        string `json:"reasoning,omitempty"`
 		} `json:"delta"`
 		FinishReason *string `json:"finish_reason"` // 指针区分"尚未结束"（null）与具体结束原因
 	} `json:"choices"`
 	// Usage 中文：仅在开启 stream_options.include_usage 后，于流末尾一个
 	// choices 为空的专用增量块中出现；其余块均为 nil。
-	Usage *struct {
-		PromptTokens     int `json:"prompt_tokens"`     // 输入侧 token 数
-		CompletionTokens int `json:"completion_tokens"` // 输出侧 token 数
-	} `json:"usage,omitempty"`
+	Usage *oaiUsage `json:"usage,omitempty"`
 }
 
 // Stream implements contract.LLM with SSE streaming.
@@ -860,6 +880,7 @@ func (c *Client) Stream(ctx context.Context, req contract.ChatRequest) (stream <
 		var lastUsage *contract.Usage // 暂存流尾 usage 块，随最终 Done 块一并交付
 		var lastFinishReason string   // 暂存流中首个非空 finish_reason，随终止块交付
 		sawContent := false           // 是否交付过任何文本增量（空响应判定用）
+		var reasoning strings.Builder // 累积推理文本，随终止块作为完整推理块交付
 
 		// 按行扫描 SSE 流：每个事件是一行 "data: {...}"，空行为事件分隔符。
 		scanner := bufio.NewScanner(resp.Body)
@@ -902,18 +923,20 @@ func (c *Client) Stream(ctx context.Context, req contract.ChatRequest) (stream <
 						tcs = append(tcs, *toolCallMap[index])
 					}
 					ch <- contract.StreamChunk{
-						ToolCalls:    tcs,
-						Done:         true,
-						Usage:        lastUsage,
-						FinishReason: lastFinishReason,
+						ToolCalls:      tcs,
+						Done:           true,
+						Usage:          lastUsage,
+						FinishReason:   lastFinishReason,
+						ReasoningBlock: reasoningBlock(reasoning.String()),
 					}
 					probe.end("done", lastFinishReason, true, len(tcs))
 				} else {
 					// 纯文本流：只发终止块（Done + usage）。
 					ch <- contract.StreamChunk{
-						Done:         true,
-						Usage:        lastUsage,
-						FinishReason: lastFinishReason,
+						Done:           true,
+						Usage:          lastUsage,
+						FinishReason:   lastFinishReason,
+						ReasoningBlock: reasoningBlock(reasoning.String()),
 					}
 					probe.end("done", lastFinishReason, true, 0)
 				}
@@ -934,10 +957,8 @@ func (c *Client) Stream(ctx context.Context, req contract.ChatRequest) (stream <
 			// 中文：usage 统计通常在流末尾一个 choices 为空的专用块中到达；
 			// 这里对任意块做捕获并暂存，等 [DONE] 时随终止块下发。
 			if chunk.Usage != nil {
-				lastUsage = &contract.Usage{
-					InputTokens:  chunk.Usage.PromptTokens,     // prompt_tokens -> 输入 token
-					OutputTokens: chunk.Usage.CompletionTokens, // completion_tokens -> 输出 token
-				}
+				usage := chunk.Usage.contract()
+				lastUsage = &usage
 			}
 
 			// 捕获 finish_reason：服务端在最后一个内容块的 delta 上给出非 null 值，
@@ -955,7 +976,12 @@ func (c *Client) Stream(ctx context.Context, req contract.ChatRequest) (stream <
 			// 只消费第一个 choice 的增量（框架不使用多候选）。
 			delta := chunk.Choices[0].Delta
 			probe.content(delta.Content)
-			probe.reasoning(delta.ReasoningContent)
+			reasoningDelta := reasoningText(delta.ReasoningContent, delta.Reasoning)
+			probe.reasoning(reasoningDelta)
+			if reasoningDelta != "" {
+				reasoning.WriteString(reasoningDelta)
+				ch <- contract.StreamChunk{Reasoning: reasoningDelta}
+			}
 
 			// 文本增量：即时透传给消费方，实现逐字输出。
 			if delta.Content != "" {
@@ -999,6 +1025,15 @@ func (c *Client) Stream(ctx context.Context, req contract.ChatRequest) (stream <
 	}()
 
 	return ch, nil // 立即返回通道，解析在后台进行
+}
+
+// reasoningBlock wraps streamed reasoning text as the completed block, or
+// nil when the response had none.
+func reasoningBlock(text string) *contract.Reasoning {
+	if text == "" {
+		return nil
+	}
+	return &contract.Reasoning{Text: text}
 }
 
 // Compile-time interface check.
