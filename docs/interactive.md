@@ -55,6 +55,10 @@ environment resolves to that variable. Supported APIs:
 - `openai-completions`: OpenAI-compatible chat completions (`baseUrl` ends
   in `/v1`). Reasoning returned as `reasoning_content` or `reasoning` is
   shown; cached prompt tokens are reported.
+- `openai-responses`: the OpenAI Responses API (`baseUrl` such as
+  `https://api.openai.com/v1`), stateless (`store: false`). The thinking
+  level sets the reasoning effort; reasoning summaries are shown and the
+  encrypted reasoning goes back to the model on later rounds.
 - `anthropic-messages`: the Anthropic Messages API (`baseUrl` such as
   `https://api.anthropic.com`). The thinking level sets the extended
   thinking budget (low 2048, medium 8192, high 16384 tokens); signed thinking

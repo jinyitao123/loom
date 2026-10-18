@@ -18,6 +18,7 @@ import (
 	"github.com/jinyitao123/loom/mcpclient"
 	"github.com/jinyitao123/loom/provider/anthropic"
 	"github.com/jinyitao123/loom/provider/openai"
+	"github.com/jinyitao123/loom/provider/openairesponses"
 )
 
 // maxContextFile bounds an AGENTS.md file folded into the system prompt.
@@ -151,7 +152,7 @@ func agentCmdIO(args []string, stdin io.Reader, stdout, stderr io.Writer, getenv
 }
 
 // newModelClient builds the client for a configured model: OpenAI-compatible
-// chat completions or the Anthropic Messages API.
+// chat completions, the OpenAI Responses API or the Anthropic Messages API.
 func newModelClient(model interactive.Model, apiKey string) (contract.LLM, error) {
 	switch model.API {
 	case "openai-completions":
@@ -160,6 +161,8 @@ func newModelClient(model interactive.Model, apiKey string) (contract.LLM, error
 			opts = append(opts, openai.WithBaseURL(model.BaseURL), openai.WithChatPath("/chat/completions"))
 		}
 		return openai.New(apiKey, opts...), nil
+	case "openai-responses":
+		return openairesponses.New(apiKey, openairesponses.WithBaseURL(model.BaseURL), openairesponses.WithDefaultModel(model.ID)), nil
 	case "anthropic-messages":
 		return anthropic.New(apiKey, anthropic.WithBaseURL(model.BaseURL), anthropic.WithDefaultModel(model.ID)), nil
 	default:
