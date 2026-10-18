@@ -21,9 +21,6 @@ import (
 	"github.com/jinyitao123/loom/provider/openairesponses"
 )
 
-// maxContextFile bounds an AGENTS.md file folded into the system prompt.
-const maxContextFile = 64 << 10
-
 // agentCmd runs `loom agent --mode rpc`: a long-lived interactive agent that
 // reads JSONL commands on stdin and writes responses and events on stdout.
 // See docs/interactive.md for the protocol.
@@ -130,7 +127,7 @@ func agentCmdIO(args []string, stdin io.Reader, stdout, stderr io.Writer, getenv
 		Catalog:      catalog,
 		NewLLM:       newModelClient,
 		Tools:        interactive.NewMultiDispatcher(dispatcher, mcp),
-		SystemPrompt: systemPrompt(workdir, names) + interactive.SkillsPrompt(skills) + mcp.Instructions(),
+		SystemPrompt: systemPrompt(workdir, agentDir, names) + interactive.SkillsPrompt(skills) + mcp.Instructions(),
 		Skills:       skills,
 		Emit:         server.Emit,
 		OnTurnStart:  mcp.TurnStarted,
@@ -171,8 +168,8 @@ func newModelClient(model interactive.Model, apiKey string) (contract.LLM, error
 }
 
 // systemPrompt describes the environment and tools, followed by the
-// working directory's AGENTS.md when present.
-func systemPrompt(cwd string, tools []string) string {
+// context files that apply to the working directory.
+func systemPrompt(cwd, agentDir string, tools []string) string {
 	var b strings.Builder
 	b.WriteString("You are an expert assistant working on the user's computer. You help by reading files, running commands, editing code and writing new files.\n\n")
 	b.WriteString("Available tools: " + strings.Join(tools, ", ") + ".\n\n")
@@ -181,11 +178,7 @@ func systemPrompt(cwd string, tools []string) string {
 	b.WriteString("- Keep answers concise; show file paths when you mention files.\n")
 	b.WriteString("- Do not guess file contents or command results; use the tools.\n\n")
 	fmt.Fprintf(&b, "Current date: %s\nPlatform: %s/%s\nCurrent working directory: %s\n", time.Now().Format("2006-01-02"), runtime.GOOS, runtime.GOARCH, cwd)
-	if data, err := os.ReadFile(filepath.Join(cwd, "AGENTS.md")); err == nil && len(data) <= maxContextFile {
-		b.WriteString("\n# Project instructions (AGENTS.md)\n\n")
-		b.Write(data)
-		b.WriteString("\n")
-	}
+	b.WriteString(interactive.ContextPrompt(interactive.LoadContextFiles(agentDir, cwd)))
 	return b.String()
 }
 

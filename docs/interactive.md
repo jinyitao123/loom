@@ -69,8 +69,10 @@ Thinking appears as `thinking_start/delta/end` message updates and is stored
 as `thinking` content (with `thinkingSignature`, or `redacted: true`).
 It is sent back only to the model that produced it.
 
-If the working directory has an `AGENTS.md` (up to 64 KiB) it is appended to
-the system prompt.
+Context files are appended to the system prompt: `<configuration>/AGENTS.md`,
+then `AGENTS.md` (or, where there is none, `CLAUDE.md`) of every directory
+from the filesystem root down to the working directory, nearer files last.
+Files over 64 KiB are skipped.
 
 A model whose `input` lists `"image"` receives images (from prompts and from
 `read`) as image parts; other models receive a short note in their place.
