@@ -9,7 +9,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/jinyitao123/loom"
 	"github.com/jinyitao123/loom/contract"
 	"github.com/jinyitao123/loom/stdlib"
 )
@@ -30,6 +29,10 @@ type Options struct {
 	KeepRecentTokens int                     // recent history kept verbatim by compaction; <=0 means 20000
 	Skills           []Skill                 // skills offered by "/skill:<name>" (also listed in SystemPrompt by the caller)
 	Emit             func(event any)         // receives every protocol event; must be safe for concurrent use
+	// OnTurnStart runs when a turn begins, before the model sees the
+	// conversation; capability servers use it to bind the turn's prompt. An
+	// error is reported as an extension_error event and the turn continues.
+	OnTurnStart func(ctx context.Context, prompt string) error
 }
 
 // queued is a prompt waiting to be delivered.
@@ -69,6 +72,8 @@ type Agent struct {
 	autoRetry      bool
 	steeringMode   string
 	followUpMode   string
+	retryCancel    chan struct{} // closed by AbortRetry while a retry waits
+	currentRun     *promptRun    // the prompt in progress, for tool progress
 }
 
 // New opens sessionPath (or starts a new session when empty) and selects the
@@ -523,6 +528,44 @@ type promptRun struct {
 	toolResults []Message
 	turnHasTool bool
 	lastErr     error
+
+	toolMu           sync.Mutex
+	tools            map[string]toolCallInfo // running tool calls by id, for progress events
+	compactionFailed bool                    // threshold compaction failed; not retried this turn
+}
+
+// toolCallInfo is what a progress event repeats about its tool call.
+type toolCallInfo struct {
+	name string
+	args json.RawMessage
+}
+
+func (a *Agent) setCurrentRun(run *promptRun) {
+	a.mu.Lock()
+	a.currentRun = run
+	a.mu.Unlock()
+}
+
+// ToolProgress reports partial output of a running tool call as a
+// tool_execution_update event; output is the whole output so far. Calls that
+// are not running in the current prompt are ignored.
+// ToolProgress 以 tool_execution_update 事件报告运行中工具调用的阶段输出（迄今全部输出）；
+// 不属于当前提问的调用忽略。
+func (a *Agent) ToolProgress(callID, output string) {
+	a.mu.Lock()
+	run := a.currentRun
+	a.mu.Unlock()
+	if run == nil {
+		return
+	}
+	run.toolMu.Lock()
+	info, ok := run.tools[callID]
+	run.toolMu.Unlock()
+	if !ok {
+		return
+	}
+	a.emit(map[string]any{"type": "tool_execution_update", "toolCallId": callID, "toolName": info.name, "args": info.args,
+		"partialResult": map[string]any{"content": []Block{{Type: "text", Text: output}}, "details": map[string]any{}}})
 }
 
 func nowMillis() int64 { return time.Now().UnixMilli() }
@@ -580,78 +623,6 @@ func (a *Agent) needsCompaction() bool {
 	return threshold > 0 && contextTokens(a.session.Context().Messages) > threshold
 }
 
-func (a *Agent) runPrompt(ctx context.Context, items []queued) {
-	a.mu.Lock()
-	model, thinking := *a.model, a.thinking
-	a.mu.Unlock()
-	vision := supportsImages(model)
-
-	run := &promptRun{agent: a, model: model, thinking: thinking}
-	a.emit(map[string]any{"type": "agent_start"})
-	a.emit(map[string]any{"type": "turn_start"})
-	for _, item := range items {
-		run.appendAndAnnounce(a.userMessage(item))
-	}
-
-	// beforeRound delivers steering queued while the loop runs and compacts
-	// the session when the context grows past the threshold; either way the
-	// loop continues from the transcript rebuilt from the session.
-	beforeRound := func(ctx context.Context, round int, messages []contract.Message) ([]contract.Message, error) {
-		changed := false
-		if round > 0 {
-			a.mu.Lock()
-			steering := takeLocked(&a.steering, a.steeringMode)
-			if steering != nil {
-				a.emitQueueLocked()
-			}
-			a.mu.Unlock()
-			for _, item := range steering {
-				run.appendAndAnnounce(a.userMessage(item))
-				changed = true
-			}
-		}
-		if a.needsCompaction() {
-			if _, err := a.compact(ctx, "threshold", "", false); err == nil {
-				changed = true
-			}
-		}
-		if !changed {
-			return messages, nil
-		}
-		return a.loopMessages(messages, vision), nil
-	}
-
-	runLoop := func() error {
-		llm, err := a.opts.NewLLM(model, a.opts.Catalog.Key(model.Provider))
-		if err != nil {
-			return err
-		}
-		step := stdlib.NewToolLoopStep(&observedLLM{inner: llm, run: run}, a.opts.Tools, stdlib.ToolLoopOpts{
-			Model:         model.ID,
-			SystemPrompt:  a.opts.SystemPrompt,
-			MaxIterations: a.opts.MaxIterations,
-			ToolHooks:     []contract.ToolHook{run.toolHook()},
-			BeforeRound:   beforeRound,
-		})
-		_, err = step(ctx, loom.State{"messages": a.loopMessages(nil, vision)})
-		return err
-	}
-	err := runLoop()
-	// The request did not fit the context window: compact and try once more.
-	if err != nil && ctx.Err() == nil && IsContextOverflow(err) && a.autoCompactionEnabled() {
-		if _, cerr := a.compact(ctx, "overflow", "", true); cerr == nil {
-			run.lastErr = nil
-			err = runLoop()
-		}
-	}
-	if err != nil && ctx.Err() == nil && !errors.Is(err, run.lastErr) {
-		run.appendAndAnnounce(Message{Role: "assistant", Content: nil, API: model.API, Provider: model.Provider, Model: model.ID,
-			Usage: &Usage{}, StopReason: "error", ErrorMessage: err.Error(), Timestamp: nowMillis()})
-	}
-	a.emit(map[string]any{"type": "turn_end", "message": run.assistant, "toolResults": nonNil(run.toolResults)})
-	a.emit(map[string]any{"type": "agent_end", "messages": nonNil(run.added), "willRetry": false})
-}
-
 func (a *Agent) autoCompactionEnabled() bool {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -669,10 +640,17 @@ func nonNil(messages []Message) []Message {
 func (r *promptRun) toolHook() contract.ToolHook {
 	return contract.ToolHook{
 		Pre: func(_ context.Context, call contract.ToolCall) (contract.ToolCall, error) {
-			r.agent.emit(map[string]any{"type": "tool_execution_start", "toolCallId": call.ID, "toolName": call.Name, "args": rawArgs(call.Args)})
+			args := rawArgs(call.Args)
+			r.toolMu.Lock()
+			r.tools[call.ID] = toolCallInfo{name: call.Name, args: args}
+			r.toolMu.Unlock()
+			r.agent.emit(map[string]any{"type": "tool_execution_start", "toolCallId": call.ID, "toolName": call.Name, "args": args})
 			return call, nil
 		},
 		Post: func(_ context.Context, call contract.ToolCall, result *contract.ToolResult) error {
+			r.toolMu.Lock()
+			delete(r.tools, call.ID)
+			r.toolMu.Unlock()
 			content := resultBlocks(result)
 			r.agent.emit(map[string]any{"type": "tool_execution_end", "toolCallId": call.ID, "toolName": call.Name,
 				"result": map[string]any{"content": content, "details": map[string]any{}}, "isError": result.IsError})
@@ -723,6 +701,11 @@ func (o *observedLLM) Stream(ctx context.Context, req contract.ChatRequest) (<-c
 	return o.inner.Stream(ctx, req)
 }
 
+// Chat runs one model round. Transient provider failures (rate limits,
+// server errors, dropped streams) are retried with backoff while automatic
+// retry is on; the failed attempt is shown but not stored.
+// Chat 执行一轮模型调用；自动重试开启时，限流、服务端错误、流中断等暂时性失败按退避重试，
+// 失败的那次只显示、不入会话。
 func (o *observedLLM) Chat(ctx context.Context, req contract.ChatRequest) (*contract.ChatResponse, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -736,10 +719,47 @@ func (o *observedLLM) Chat(ctx context.Context, req contract.ChatRequest) (*cont
 	}
 	req.Effort = effortFor(r.model, r.thinking)
 
+	attempts := 0 // retries announced so far
+	for retry := 0; ; retry++ {
+		resp, final, err := o.attempt(ctx, req)
+		if err != nil && ctx.Err() == nil && retry < maxRetries && IsTransient(err) && a.autoRetryEnabled() {
+			a.emit(map[string]any{"type": "message_end", "message": final})
+			delay := retryDelay(retry)
+			attempts = retry + 1
+			cancel := a.armRetry()
+			a.emit(map[string]any{"type": "auto_retry_start", "attempt": attempts, "maxAttempts": maxRetries, "delayMs": delay.Milliseconds(), "errorMessage": err.Error()})
+			if a.waitForRetry(ctx, cancel, delay) {
+				continue
+			}
+		}
+		if attempts > 0 {
+			if err == nil {
+				a.emit(map[string]any{"type": "auto_retry_end", "success": true, "attempt": attempts})
+			} else {
+				a.emit(map[string]any{"type": "auto_retry_end", "success": false, "attempt": attempts, "finalError": err.Error()})
+			}
+		}
+		if err != nil && ctx.Err() == nil {
+			r.lastErr = err
+		}
+		r.append(final)
+		a.emit(map[string]any{"type": "message_end", "message": final})
+		r.assistant = &final
+		r.turnHasTool = err == nil && len(resp.ToolCalls) > 0
+		return resp, err
+	}
+}
+
+// attempt streams one model request and returns the response with the
+// assistant message it produced; the message is not stored yet.
+func (o *observedLLM) attempt(ctx context.Context, req contract.ChatRequest) (*contract.ChatResponse, Message, error) {
+	r := o.run
+	a := r.agent
 	partial := Message{Role: "assistant", Content: []Block{}, API: r.model.API, Provider: r.model.Provider, Model: r.model.ID, Usage: &Usage{}, Timestamp: nowMillis()}
 	a.emit(map[string]any{"type": "message_start", "message": partial})
 	sink := &deltaSink{agent: a}
 	resp, err := stdlib.NewStreamingLLM(o.inner, sink).Chat(ctx, req)
+	sink.close()
 
 	final := partial
 	if err != nil {
@@ -749,9 +769,16 @@ func (o *observedLLM) Chat(ctx context.Context, req contract.ChatRequest) (*cont
 		} else {
 			final.StopReason = "error"
 			final.ErrorMessage = err.Error()
-			r.lastErr = err
 		}
 	} else {
+		// The controlled tool loop reads stop reasons strictly; providers
+		// differ, so they are normalized here: tool calls, length, or stop.
+		switch {
+		case len(resp.ToolCalls) > 0:
+			resp.StopReason = "tool_calls"
+		case resp.StopReason != "length":
+			resp.StopReason = "stop"
+		}
 		final.Content = textBlocks(resp.Content)
 		for _, call := range resp.ToolCalls {
 			final.Content = append(final.Content, Block{Type: "toolCall", ID: call.ID, Name: call.Name, Arguments: rawArgs(call.Args)})
@@ -762,12 +789,7 @@ func (o *observedLLM) Chat(ctx context.Context, req contract.ChatRequest) (*cont
 	if final.Content == nil {
 		final.Content = []Block{}
 	}
-	sink.close()
-	r.append(final)
-	a.emit(map[string]any{"type": "message_end", "message": final})
-	r.assistant = &final
-	r.turnHasTool = err == nil && len(resp.ToolCalls) > 0
-	return resp, err
+	return resp, final, err
 }
 
 func effortFor(model Model, thinking string) contract.EffortLevel {

@@ -132,6 +132,8 @@ func (s *Server) handle(line []byte) {
 	case "abort", "abort_retry":
 		if cmd.Type == "abort" {
 			a.Abort()
+		} else {
+			a.AbortRetry()
 		}
 		s.respond(cmd, nil, nil)
 	case "new_session":
