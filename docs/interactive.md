@@ -50,8 +50,20 @@ Models come from `<configuration>/models.json`:
 API keys may also be stored in `<configuration>/auth.json` as
 `{"<provider>": {"type": "api_key", "key": "..."}}`, which takes precedence.
 A key that looks like an environment variable name and is set in the
-environment resolves to that variable. `openai-completions` is the supported
-API.
+environment resolves to that variable. Supported APIs:
+
+- `openai-completions`: OpenAI-compatible chat completions (`baseUrl` ends
+  in `/v1`). Reasoning returned as `reasoning_content` or `reasoning` is
+  shown; cached prompt tokens are reported.
+- `anthropic-messages`: the Anthropic Messages API (`baseUrl` such as
+  `https://api.anthropic.com`). The thinking level sets the extended
+  thinking budget (low 2048, medium 8192, high 16384 tokens); signed thinking
+  blocks go back to the model on later rounds. The system prompt, tool list
+  and newest message are marked for prompt caching.
+
+Thinking appears as `thinking_start/delta/end` message updates and is stored
+as `thinking` content (with `thinkingSignature`, or `redacted: true`).
+It is sent back only to the model that produced it.
 
 If the working directory has an `AGENTS.md` (up to 64 KiB) it is appended to
 the system prompt.
@@ -207,8 +219,7 @@ message completes.
 
 ## Limits of this version
 
-- Reasoning text and tool-call argument deltas are not streamed; only
-  answer text is.
+- Tool-call argument deltas are not streamed.
 - Images are not resized; large images count fully against the context.
 - `.gitignore` handling in `grep` and `find` covers the common patterns of
   the root file only.

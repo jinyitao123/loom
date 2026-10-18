@@ -117,6 +117,103 @@ wait:
 	}
 }
 
+// TestAgentCmdStreamsAnthropicThinking runs `loom agent` against a local
+// Anthropic Messages endpoint: thinking and text stream back, and the stored
+// message keeps the signed thinking block.
+func TestAgentCmdStreamsAnthropicThinking(t *testing.T) {
+	var gotPath, gotKey string
+	var gotBody map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath, gotKey = r.URL.Path, r.Header.Get("x-api-key")
+		_ = json.NewDecoder(r.Body).Decode(&gotBody)
+		w.Header().Set("Content-Type", "text/event-stream")
+		for _, event := range []string{
+			`{"type":"message_start","message":{"usage":{"input_tokens":5,"cache_read_input_tokens":20}}}`,
+			`{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}`,
+			`{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"brief"}}`,
+			`{"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"sig"}}`,
+			`{"type":"content_block_stop","index":0}`,
+			`{"type":"content_block_start","index":1,"content_block":{"type":"text","text":""}}`,
+			`{"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"hello"}}`,
+			`{"type":"content_block_stop","index":1}`,
+			`{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":3}}`,
+			`{"type":"message_stop"}`,
+		} {
+			fmt.Fprintf(w, "event: x\ndata: %s\n\n", event)
+		}
+	}))
+	defer server.Close()
+
+	agentDir := t.TempDir()
+	models := fmt.Sprintf(`{"providers":{"claude":{"baseUrl":%q,"api":"anthropic-messages","apiKey":"secret","models":[{"id":"c","reasoning":true}]}}}`, server.URL)
+	if err := os.WriteFile(filepath.Join(agentDir, "models.json"), []byte(models), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	getenv := func(name string) string { return map[string]string{"LOOM_AGENT_DIR": agentDir}[name] }
+	inR, inW := io.Pipe()
+	outR, outW := io.Pipe()
+	var stderr bytes.Buffer
+	exit := make(chan int, 1)
+	go func() {
+		exit <- agentCmdIO([]string{"--mode", "rpc", "--cwd", t.TempDir(), "--tools", "read"}, inR, outW, &stderr, getenv)
+		_ = outW.Close()
+	}()
+	lines := make(chan map[string]any, 100)
+	go func() {
+		scanner := bufio.NewScanner(outR)
+		for scanner.Scan() {
+			var v map[string]any
+			if json.Unmarshal(scanner.Bytes(), &v) == nil {
+				lines <- v
+			}
+		}
+		close(lines)
+	}()
+	if _, err := io.WriteString(inW, `{"id":"1","type":"prompt","message":"hi"}`+"\n"); err != nil {
+		t.Fatal(err)
+	}
+	var kinds []string
+	var final map[string]any
+	timeout := time.After(10 * time.Second)
+wait:
+	for {
+		select {
+		case v, ok := <-lines:
+			if !ok {
+				t.Fatalf("output closed early; stderr: %s", stderr.String())
+			}
+			if v["type"] == "message_update" {
+				kinds = append(kinds, v["assistantMessageEvent"].(map[string]any)["type"].(string))
+			}
+			if v["type"] == "message_end" && v["message"].(map[string]any)["role"] == "assistant" {
+				final = v["message"].(map[string]any)
+			}
+			if v["type"] == "agent_settled" {
+				break wait
+			}
+		case <-timeout:
+			t.Fatalf("no answer; stderr: %s", stderr.String())
+		}
+	}
+	_ = inW.Close()
+	<-exit
+
+	if gotPath != "/v1/messages" || gotKey != "secret" || gotBody["thinking"] == nil {
+		t.Fatalf("request path %q key %q body %v", gotPath, gotKey, gotBody)
+	}
+	if got := strings.Join(kinds, ","); got != "thinking_start,thinking_delta,thinking_end,text_start,text_delta,text_end" {
+		t.Fatalf("updates = %s", got)
+	}
+	content := final["content"].([]any)
+	thinking := content[0].(map[string]any)
+	if thinking["type"] != "thinking" || thinking["thinking"] != "brief" || thinking["thinkingSignature"] != "sig" {
+		t.Fatalf("final content = %v", content)
+	}
+	if usage := final["usage"].(map[string]any); usage["input"] != float64(5) || usage["cacheRead"] != float64(20) {
+		t.Fatalf("usage = %v", usage)
+	}
+}
+
 func TestAgentCmdRejectsUnknownModeAndTool(t *testing.T) {
 	getenv := func(name string) string {
 		if name == "LOOM_AGENT_DIR" {

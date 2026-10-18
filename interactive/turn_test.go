@@ -233,3 +233,59 @@ func TestRoundBudgetEndsTheTurn(t *testing.T) {
 		t.Fatalf("stored roles = %s", got)
 	}
 }
+
+func TestThinkingIsStreamedStoredAndSentBack(t *testing.T) {
+	llm := &scriptedLLM{rounds: []contract.ChatResponse{
+		{
+			Reasoning: []contract.Reasoning{{Text: "plan the lookup", Signature: "sig-1"}, {Signature: "hidden", Redacted: true}},
+			ToolCalls: []contract.ToolCall{{ID: "c1", Name: "lookup", Args: "{}"}},
+			Usage:     contract.Usage{InputTokens: 1000, CacheReadTokens: 600, CacheWriteTokens: 300, OutputTokens: 20},
+		},
+		{Content: "done"},
+	}}
+	h := newHarness(t, llm, true)
+	h.send(map[string]any{"type": "prompt", "message": "go"})
+	events := h.until(isType("agent_settled"))
+
+	var updates []string
+	for _, kind := range types(events) {
+		if strings.HasPrefix(kind, "message_update/") || kind == "tool_execution_start" {
+			updates = append(updates, strings.TrimPrefix(kind, "message_update/"))
+		}
+	}
+	if got := strings.Join(updates, ","); got != "thinking_start,thinking_delta,thinking_end,tool_execution_start,text_start,text_delta,text_end" {
+		t.Fatalf("stream = %s", got)
+	}
+	messages := h.agent.Messages()
+	first := messages[1]
+	if len(first.Content) < 3 || first.Content[0].Type != "thinking" || first.Content[0].Thinking != "plan the lookup" ||
+		first.Content[0].ThinkingSignature != "sig-1" || !first.Content[1].Redacted || first.Content[2].Type != "toolCall" {
+		t.Fatalf("stored assistant = %+v", first.Content)
+	}
+	if u := first.Usage; u.Input != 100 || u.CacheRead != 600 || u.CacheWrite != 300 || u.TotalTokens != 1020 {
+		t.Fatalf("usage = %+v", u)
+	}
+	second := llm.seen[1]
+	var assistant contract.Message
+	for _, m := range second {
+		if m.Role == "assistant" {
+			assistant = m
+		}
+	}
+	if len(assistant.Reasoning) != 2 || assistant.Reasoning[0].Signature != "sig-1" || !assistant.Reasoning[1].Redacted {
+		t.Fatalf("reasoning sent back = %+v", assistant.Reasoning)
+	}
+}
+
+func TestReasoningGoesBackOnlyToTheSameModel(t *testing.T) {
+	messages := []Message{
+		{Role: "user", Content: textBlocks("hi")},
+		{Role: "assistant", Provider: "p", Model: "m", Content: []Block{{Type: "thinking", Thinking: "x", ThinkingSignature: "s"}, {Type: "text", Text: "hello"}}},
+	}
+	if got := toContract(messages, Model{Provider: "p", ID: "m"})[1].Reasoning; len(got) != 1 || got[0].Signature != "s" {
+		t.Fatalf("same model = %+v", got)
+	}
+	if got := toContract(messages, Model{Provider: "p", ID: "other"})[1].Reasoning; got != nil {
+		t.Fatalf("other model = %+v", got)
+	}
+}

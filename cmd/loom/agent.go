@@ -16,6 +16,7 @@ import (
 	"github.com/jinyitao123/loom/interactive"
 	"github.com/jinyitao123/loom/localtools"
 	"github.com/jinyitao123/loom/mcpclient"
+	"github.com/jinyitao123/loom/provider/anthropic"
 	"github.com/jinyitao123/loom/provider/openai"
 )
 
@@ -149,8 +150,8 @@ func agentCmdIO(args []string, stdin io.Reader, stdout, stderr io.Writer, getenv
 	return 0
 }
 
-// newModelClient builds the client for a configured model. OpenAI-compatible
-// chat completions is the supported API.
+// newModelClient builds the client for a configured model: OpenAI-compatible
+// chat completions or the Anthropic Messages API.
 func newModelClient(model interactive.Model, apiKey string) (contract.LLM, error) {
 	switch model.API {
 	case "openai-completions":
@@ -159,6 +160,8 @@ func newModelClient(model interactive.Model, apiKey string) (contract.LLM, error
 			opts = append(opts, openai.WithBaseURL(model.BaseURL), openai.WithChatPath("/chat/completions"))
 		}
 		return openai.New(apiKey, opts...), nil
+	case "anthropic-messages":
+		return anthropic.New(apiKey, anthropic.WithBaseURL(model.BaseURL), anthropic.WithDefaultModel(model.ID)), nil
 	default:
 		return nil, fmt.Errorf("model API %q is not supported by the Loom kernel yet", model.API)
 	}

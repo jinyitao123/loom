@@ -602,9 +602,9 @@ func (a *Agent) userMessage(item queued) Message {
 
 // loopMessages rebuilds the transcript of the running loop from the session,
 // keeping the system message the loop prepended.
-func (a *Agent) loopMessages(current []contract.Message, vision bool) []contract.Message {
+func (a *Agent) loopMessages(current []contract.Message, target Model) []contract.Message {
 	a.mu.Lock()
-	history := toContract(a.session.Context().Messages, vision)
+	history := toContract(a.session.Context().Messages, target)
 	a.mu.Unlock()
 	if len(current) > 0 && current[0].Role == "system" {
 		return append([]contract.Message{current[0]}, history...)
@@ -763,7 +763,10 @@ func (o *observedLLM) attempt(ctx context.Context, req contract.ChatRequest) (*c
 
 	final := partial
 	if err != nil {
-		final.Content = textBlocks(sink.text.String())
+		if thought := sink.thinking.String(); thought != "" {
+			final.Content = append(final.Content, Block{Type: "thinking", Thinking: thought})
+		}
+		final.Content = append(final.Content, textBlocks(sink.text.String())...)
 		if ctx.Err() != nil {
 			final.StopReason = "aborted"
 		} else {
@@ -779,7 +782,8 @@ func (o *observedLLM) attempt(ctx context.Context, req contract.ChatRequest) (*c
 		case resp.StopReason != "length":
 			resp.StopReason = "stop"
 		}
-		final.Content = textBlocks(resp.Content)
+		final.Content = thinkingBlocks(resp.Reasoning)
+		final.Content = append(final.Content, textBlocks(resp.Content)...)
 		for _, call := range resp.ToolCalls {
 			final.Content = append(final.Content, Block{Type: "toolCall", ID: call.ID, Name: call.Name, Arguments: rawArgs(call.Args)})
 		}
@@ -819,40 +823,67 @@ func stopReason(resp *contract.ChatResponse) string {
 }
 
 func usageFor(model Model, u contract.Usage) *Usage {
-	usage := &Usage{Input: u.InputTokens, Output: u.OutputTokens, TotalTokens: u.InputTokens + u.OutputTokens}
-	usage.Cost.Input = float64(u.InputTokens) * model.Cost.Input / 1e6
+	// The contract's input includes the cached parts; the session format
+	// counts them separately.
+	input := u.InputTokens - u.CacheReadTokens - u.CacheWriteTokens
+	if input < 0 {
+		input = 0
+	}
+	usage := &Usage{Input: input, Output: u.OutputTokens, CacheRead: u.CacheReadTokens, CacheWrite: u.CacheWriteTokens,
+		TotalTokens: input + u.OutputTokens + u.CacheReadTokens + u.CacheWriteTokens}
+	usage.Cost.Input = float64(input) * model.Cost.Input / 1e6
 	usage.Cost.Output = float64(u.OutputTokens) * model.Cost.Output / 1e6
-	usage.Cost.Total = usage.Cost.Input + usage.Cost.Output
+	usage.Cost.CacheRead = float64(u.CacheReadTokens) * model.Cost.CacheRead / 1e6
+	usage.Cost.CacheWrite = float64(u.CacheWriteTokens) * model.Cost.CacheWrite / 1e6
+	usage.Cost.Total = usage.Cost.Input + usage.Cost.Output + usage.Cost.CacheRead + usage.Cost.CacheWrite
 	if u.CostUSD > 0 {
 		usage.Cost.Total = u.CostUSD
 	}
 	return usage
 }
 
-// deltaSink forwards text deltas as message_update events.
+// deltaSink forwards thinking and text deltas as message_update events. Each
+// run of one kind is a content block, thinking_start/delta/end or
+// text_start/delta/end, numbered in the order the blocks open.
 type deltaSink struct {
-	agent   *Agent
-	text    strings.Builder
-	started bool
-	ended   bool
+	agent    *Agent
+	text     strings.Builder // all answer text
+	thinking strings.Builder // all reasoning text
+	kind     string          // "text" or "thinking" while a block is open
+	index    int             // content index of the open block
+	block    strings.Builder // text of the open block
+	opened   int             // blocks opened so far
 }
 
 func (s *deltaSink) SendChunk(chunk contract.StreamChunk) error {
+	if chunk.Reasoning != "" {
+		s.thinking.WriteString(chunk.Reasoning)
+		s.delta("thinking", chunk.Reasoning)
+	}
 	if chunk.Content != "" {
-		if !s.started {
-			s.started = true
-			s.update(map[string]any{"type": "text_start", "contentIndex": 0})
-		}
 		s.text.WriteString(chunk.Content)
-		s.update(map[string]any{"type": "text_delta", "contentIndex": 0, "delta": chunk.Content})
+		s.delta("text", chunk.Content)
 	}
 	return nil
 }
 
+func (s *deltaSink) delta(kind, text string) {
+	if s.kind != kind {
+		s.close()
+		s.kind, s.index = kind, s.opened
+		s.opened++
+		s.block.Reset()
+		s.update(map[string]any{"type": kind + "_start", "contentIndex": s.index})
+	}
+	s.block.WriteString(text)
+	s.update(map[string]any{"type": kind + "_delta", "contentIndex": s.index, "delta": text})
+}
+
+// close ends the open block.
 func (s *deltaSink) close() {
-	if s.started && !s.ended {
-		s.ended = true
-		s.update(map[string]any{"type": "text_end", "contentIndex": 0, "content": s.text.String()})
+	if s.kind != "" {
+		s.update(map[string]any{"type": s.kind + "_end", "contentIndex": s.index, "content": s.block.String()})
+		s.kind = ""
 	}
 }
 

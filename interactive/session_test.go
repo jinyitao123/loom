@@ -110,7 +110,7 @@ func TestToContractAnswersEveryToolCall(t *testing.T) {
 		{Role: "toolResult", ToolCallID: "c1", ToolName: "read", Content: textBlocks("contents")},
 		{Role: "assistant", StopReason: "aborted"},
 	}
-	out := toContract(messages, false)
+	out := toContract(messages, Model{})
 	if len(out) != 4 {
 		t.Fatalf("got %d messages: %+v", len(out), out)
 	}

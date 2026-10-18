@@ -25,14 +25,19 @@ import (
 // Block is one typed content block of a message.
 // Block 是消息中的一个内容块：文本、图片、思考或工具调用。
 type Block struct {
-	Type      string          `json:"type"`
-	Text      string          `json:"text,omitempty"`
-	Thinking  string          `json:"thinking,omitempty"`
-	Data      string          `json:"data,omitempty"`
-	MimeType  string          `json:"mimeType,omitempty"`
-	ID        string          `json:"id,omitempty"`
-	Name      string          `json:"name,omitempty"`
-	Arguments json.RawMessage `json:"arguments,omitempty"`
+	Type     string `json:"type"`
+	Text     string `json:"text,omitempty"`
+	Thinking string `json:"thinking,omitempty"`
+	// ThinkingSignature is the provider's opaque signature of a thinking
+	// block, or the withheld reasoning of a redacted one; it goes back to
+	// the same model with the block.
+	ThinkingSignature string          `json:"thinkingSignature,omitempty"`
+	Redacted          bool            `json:"redacted,omitempty"`
+	Data              string          `json:"data,omitempty"`
+	MimeType          string          `json:"mimeType,omitempty"`
+	ID                string          `json:"id,omitempty"`
+	Name              string          `json:"name,omitempty"`
+	Arguments         json.RawMessage `json:"arguments,omitempty"`
 }
 
 // Cost is a monetary breakdown in USD.
@@ -125,6 +130,15 @@ func (m Message) Text() string {
 	return b.String()
 }
 
+// thinkingBlocks stores reasoning blocks as thinking content.
+func thinkingBlocks(reasoning []contract.Reasoning) []Block {
+	var blocks []Block
+	for _, r := range reasoning {
+		blocks = append(blocks, Block{Type: "thinking", Thinking: r.Text, ThinkingSignature: r.Signature, Redacted: r.Redacted})
+	}
+	return blocks
+}
+
 func textBlocks(text string) []Block {
 	if text == "" {
 		return nil
@@ -142,7 +156,8 @@ func boolPtr(v bool) *bool { return &v }
 // unanswered call.
 // toContract 把会话消息转换成工具循环使用的中性历史：思考块不进请求；
 // 模型支持图片时图片以 Parts 送出，否则以说明文字代替；保证每个工具调用都有回执。
-func toContract(messages []Message, vision bool) []contract.Message {
+func toContract(messages []Message, target Model) []contract.Message {
+	vision := supportsImages(target)
 	out := make([]contract.Message, 0, len(messages))
 	answered := map[string]bool{}
 	for _, m := range messages {
@@ -159,8 +174,14 @@ func toContract(messages []Message, vision bool) []contract.Message {
 			}
 		case "assistant":
 			msg := contract.Message{Role: "assistant", Content: m.Text()}
+			// Reasoning goes back only to the model that produced it; its
+			// signature means nothing to another model.
+			sameModel := m.Provider == target.Provider && m.Model == target.ID
 			var missing []string
 			for _, block := range m.Content {
+				if block.Type == "thinking" && sameModel && (block.Thinking != "" || block.ThinkingSignature != "") {
+					msg.Reasoning = append(msg.Reasoning, contract.Reasoning{Text: block.Thinking, Signature: block.ThinkingSignature, Redacted: block.Redacted})
+				}
 				if block.Type != "toolCall" {
 					continue
 				}

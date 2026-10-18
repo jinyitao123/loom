@@ -73,7 +73,6 @@ func (a *Agent) runGraph(ctx context.Context, run *promptRun, prompt string) err
 	if err != nil {
 		return err
 	}
-	vision := supportsImages(run.model)
 	maxTokens := run.model.MaxTokens
 	if maxTokens <= 0 || maxTokens > maxOutputTokens {
 		maxTokens = maxOutputTokens
@@ -84,11 +83,11 @@ func (a *Agent) runGraph(ctx context.Context, run *promptRun, prompt string) err
 		MaxIterations: 1, // one model round per slice: the loop pauses between rounds
 		MaxTokens:     maxTokens,
 		ToolHooks:     []contract.ToolHook{run.toolHook()},
-		Compaction:    a.compactionPolicy(run, vision),
+		Compaction:    a.compactionPolicy(run),
 		Control:       &stdlib.ToolLoopControl{ID: "prompt", InitialTotalRounds: uint64(a.opts.MaxIterations)},
 	})
 	graph := loom.NewGraph(promptGraphName, "prepare", loom.WithMergeConfig(loom.NewMergeConfig()))
-	graph.AddStep("prepare", a.prepareStep(prompt, vision), loom.Always("round"))
+	graph.AddStep("prepare", a.prepareStep(prompt, run.model), loom.Always("round"))
 	graph.AddStep("round", round, loom.End())
 	store := loom.NewMemStore()
 
@@ -106,7 +105,7 @@ func (a *Agent) runGraph(ctx context.Context, run *promptRun, prompt string) err
 		if !ok || token == "" {
 			return fmt.Errorf("interactive: paused turn has no resume boundary")
 		}
-		steering, input := a.takeSteering(vision)
+		steering, input := a.takeSteering(run.model)
 		delta, perr := stdlib.PrepareToolLoopResume(result.State, stdlib.ToolLoopResumeGrant{
 			ID: fmt.Sprintf("round-%d", grants), ExpectedRunID: result.RunID, ExpectedCheckpointSeq: seq,
 			ExpectedYieldToken: token, ExpectedSlice: outcome.Slice,
@@ -127,7 +126,7 @@ func (a *Agent) runGraph(ctx context.Context, run *promptRun, prompt string) err
 // prepareStep starts a turn: it lets the capability servers bind the turn's
 // prompt, then loads the active conversation (compactions applied) as the
 // loop's messages.
-func (a *Agent) prepareStep(prompt string, vision bool) loom.Step {
+func (a *Agent) prepareStep(prompt string, target Model) loom.Step {
 	return func(ctx context.Context, _ loom.State) (loom.State, error) {
 		if a.opts.OnTurnStart != nil {
 			if err := a.opts.OnTurnStart(ctx, prompt); err != nil {
@@ -135,7 +134,7 @@ func (a *Agent) prepareStep(prompt string, vision bool) loom.Step {
 			}
 		}
 		a.mu.Lock()
-		messages := toContract(a.session.Context().Messages, vision)
+		messages := toContract(a.session.Context().Messages, target)
 		a.mu.Unlock()
 		return loom.State{"messages": messages}, nil
 	}
@@ -143,7 +142,7 @@ func (a *Agent) prepareStep(prompt string, vision bool) loom.Step {
 
 // takeSteering removes the steering due at this round boundary and returns
 // the session messages with their model form.
-func (a *Agent) takeSteering(vision bool) ([]Message, []contract.Message) {
+func (a *Agent) takeSteering(target Model) ([]Message, []contract.Message) {
 	a.mu.Lock()
 	items := takeLocked(&a.steering, a.steeringMode)
 	if items != nil {
@@ -154,7 +153,7 @@ func (a *Agent) takeSteering(vision bool) ([]Message, []contract.Message) {
 	for _, item := range items {
 		stored = append(stored, a.userMessage(item))
 	}
-	return stored, toContract(stored, vision)
+	return stored, toContract(stored, target)
 }
 
 // compactionPolicy plugs session compaction into the tool loop's compaction
@@ -164,7 +163,7 @@ func (a *Agent) takeSteering(vision bool) ([]Message, []contract.Message) {
 // not retried within the turn.
 // compactionPolicy 把会话压缩接入工具循环的压缩钩子：会话上下文超过阈值时触发，
 // 追加压缩条目并把从会话重建的对话交给循环；压缩失败或无可压缩时保持原样，本轮不再重试。
-func (a *Agent) compactionPolicy(run *promptRun, vision bool) *stdlib.CompactionPolicy {
+func (a *Agent) compactionPolicy(run *promptRun) *stdlib.CompactionPolicy {
 	return &stdlib.CompactionPolicy{
 		Trigger: func([]contract.Message, int) bool { return !run.compactionFailed && a.needsCompaction() },
 		Compactor: func(ctx context.Context, messages []contract.Message) ([]contract.Message, error) {
@@ -172,7 +171,7 @@ func (a *Agent) compactionPolicy(run *promptRun, vision bool) *stdlib.Compaction
 				run.compactionFailed = true
 				return messages, nil
 			}
-			return a.loopMessages(messages, vision), nil
+			return a.loopMessages(messages, run.model), nil
 		},
 	}
 }

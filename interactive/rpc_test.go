@@ -57,12 +57,17 @@ func (s *scriptedLLM) Stream(ctx context.Context, req contract.ChatRequest) (<-c
 	}
 	s.mu.Unlock()
 	input := requestTokens(req)
-	ch := make(chan contract.StreamChunk, 4)
+	ch := make(chan contract.StreamChunk, 16)
 	go func() {
 		defer close(ch)
 		if fail != nil {
 			ch <- contract.StreamChunk{Err: fail}
 			return
+		}
+		for _, r := range resp.Reasoning {
+			r := r
+			ch <- contract.StreamChunk{Reasoning: r.Text}
+			ch <- contract.StreamChunk{ReasoningBlock: &r}
 		}
 		if resp.Content != "" {
 			ch <- contract.StreamChunk{Content: resp.Content}
@@ -75,7 +80,11 @@ func (s *scriptedLLM) Stream(ctx context.Context, req contract.ChatRequest) (<-c
 				return
 			}
 		}
-		ch <- contract.StreamChunk{ToolCalls: resp.ToolCalls, Done: true, FinishReason: "stop", Usage: &contract.Usage{InputTokens: input, OutputTokens: 2}}
+		usage := &contract.Usage{InputTokens: input, OutputTokens: 2}
+		if resp.Usage.InputTokens > 0 {
+			usage = &resp.Usage
+		}
+		ch <- contract.StreamChunk{ToolCalls: resp.ToolCalls, Done: true, FinishReason: "stop", Usage: usage}
 	}()
 	return ch, nil
 }
