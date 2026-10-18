@@ -43,7 +43,7 @@ func (s *streamLLM) Chat(_ context.Context, _ contract.ChatRequest) (*contract.C
 func TestStreamingLLMStreamsDeltas(t *testing.T) {
 	var buf bytes.Buffer
 	inner := &streamLLM{chunks: []contract.StreamChunk{{Content: "Hello"}, {Content: " world"}, {Done: true}}}
-	s := &streamingLLM{inner: inner, out: NewEmitter(&buf)}
+	s := newStreamingLLM(inner, NewEmitter(&buf))
 
 	resp, err := s.Chat(context.Background(), contract.ChatRequest{})
 	if err != nil {
@@ -67,7 +67,7 @@ func TestStreamingLLMStreamsDeltas(t *testing.T) {
 func TestStreamingLLMFallsBackToChat(t *testing.T) {
 	var buf bytes.Buffer
 	inner := &streamLLM{streamErr: errors.New("no stream"), chatResp: contract.ChatResponse{Content: "blocking answer"}}
-	s := &streamingLLM{inner: inner, out: NewEmitter(&buf)}
+	s := newStreamingLLM(inner, NewEmitter(&buf))
 
 	resp, err := s.Chat(context.Background(), contract.ChatRequest{})
 	if err != nil {
@@ -84,7 +84,7 @@ func TestStreamingLLMFallsBackToChat(t *testing.T) {
 func TestStreamingLLMAccumulatesToolCalls(t *testing.T) {
 	var buf bytes.Buffer
 	inner := &streamLLM{chunks: []contract.StreamChunk{{ToolCalls: []contract.ToolCall{{ID: "c1", Name: "t"}}}, {Done: true}}}
-	s := &streamingLLM{inner: inner, out: NewEmitter(&buf)}
+	s := newStreamingLLM(inner, NewEmitter(&buf))
 
 	resp, err := s.Chat(context.Background(), contract.ChatRequest{})
 	if err != nil {
@@ -98,7 +98,7 @@ func TestStreamingLLMAccumulatesToolCalls(t *testing.T) {
 func TestStreamingLLMFallbackPropagatesChatError(t *testing.T) {
 	var buf bytes.Buffer
 	inner := &streamLLM{streamErr: errors.New("no stream"), chatErr: errors.New("upstream 500")}
-	s := &streamingLLM{inner: inner, out: NewEmitter(&buf)}
+	s := newStreamingLLM(inner, NewEmitter(&buf))
 	if _, err := s.Chat(context.Background(), contract.ChatRequest{}); err == nil {
 		t.Fatal("want chat error propagated")
 	}
@@ -108,7 +108,7 @@ func TestStreamingLLMReturnsStreamErrorChunk(t *testing.T) {
 	var buf bytes.Buffer
 	cut := errors.New("stream closed without [DONE]")
 	inner := &streamLLM{chunks: []contract.StreamChunk{{Content: "partial"}, {Err: cut}}}
-	s := &streamingLLM{inner: inner, out: NewEmitter(&buf)}
+	s := newStreamingLLM(inner, NewEmitter(&buf))
 	if resp, err := s.Chat(context.Background(), contract.ChatRequest{}); !errors.Is(err, cut) || resp != nil {
 		t.Fatalf("truncated stream became a response: %#v, %v", resp, err)
 	}

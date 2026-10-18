@@ -214,11 +214,11 @@ type runDeps struct {
 //	streaming tool-loop (text deltas + tool events) → (save session) → result
 //
 // loom.Graph.Run is synchronous; text is streamed by wrapping the LLM
-// (streamingLLM). Tool calls surface via ToolHooks. Session continuity (--resume)
+// (newStreamingLLM). Tool calls surface via ToolHooks. Session continuity (--resume)
 // uses the injected store.
 // runAgent 是一轮 agent 的总装配线：确定会话 id → 恢复历史 → 组装初始状态 →
 // 按 spec 选择单体或编排路径执行 → 成功则落盘会话 → 发出终态事件。
-// 图执行本身是同步的，流式文本靠 streamingLLM 装饰器在 LLM 层旁路发射。
+// 图执行本身是同步的，流式文本靠 newStreamingLLM 装饰器在 LLM 层旁路发射。
 func runAgent(ctx context.Context, d runDeps, p promptInput, cfg runConfig) error {
 	sessionID := cfg.resume // --resume 提供的 id 直接复用，实现会话延续
 	if sessionID == "" {
@@ -238,7 +238,7 @@ func runAgent(ctx context.Context, d runDeps, p promptInput, cfg runConfig) erro
 	state := loom.State{"messages": messages, "last_user_message": p.Instruction}
 
 	// 用流式装饰器包住 LLM：文本/思考增量在生成途中即经 sink 外发。
-	streaming := &streamingLLM{inner: d.llm, out: d.out}
+	streaming := newStreamingLLM(d.llm, d.out)
 
 	// Orchestrating specs (declared sub_agents) run a compiled deterministic-
 	// routing graph; everything else keeps the original single tool-loop path

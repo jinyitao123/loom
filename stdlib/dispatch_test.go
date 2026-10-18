@@ -185,6 +185,55 @@ func TestReadWriteDispatch_StatefulSerial(t *testing.T) {
 	}
 }
 
+func TestReadWriteDispatch_ReadOnlyDoesNotPassEarlierWrite(t *testing.T) {
+	var order []string
+	var mu sync.Mutex
+	tools := &mockTools{handler: func(c contract.ToolCall) *contract.ToolResult {
+		mu.Lock()
+		order = append(order, c.Name)
+		mu.Unlock()
+		return &contract.ToolResult{CallID: c.ID, Content: "ok", ToolName: c.Name}
+	}}
+	defs := []contract.ToolDef{{Name: "write", ReadOnly: false}, {Name: "read", ReadOnly: true}}
+	calls := []contract.ToolCall{{ID: "1", Name: "write"}, {ID: "2", Name: "read"}}
+
+	results, err := stdlib.DispatchWithHooks(context.Background(), tools, calls, defs, nil)
+	if err != nil {
+		t.Fatalf("DispatchWithHooks() error = %v", err)
+	}
+	if len(order) != 2 || order[0] != "write" || order[1] != "read" {
+		t.Fatalf("dispatch order = %v, want [write read]", order)
+	}
+	if results[0].CallID != "1" || results[1].CallID != "2" {
+		t.Fatalf("results not aligned with calls: %+v", results)
+	}
+}
+
+func TestReadWriteDispatch_SegmentsKeepModelOrder(t *testing.T) {
+	var order []string
+	var mu sync.Mutex
+	tools := &mockTools{handler: func(c contract.ToolCall) *contract.ToolResult {
+		mu.Lock()
+		order = append(order, c.Name)
+		mu.Unlock()
+		return &contract.ToolResult{CallID: c.ID, Content: "ok", ToolName: c.Name}
+	}}
+	defs := []contract.ToolDef{
+		{Name: "read1", ReadOnly: true}, {Name: "read2", ReadOnly: true},
+		{Name: "write", ReadOnly: false}, {Name: "read3", ReadOnly: true},
+	}
+	calls := []contract.ToolCall{
+		{ID: "1", Name: "read1"}, {ID: "2", Name: "read2"}, {ID: "3", Name: "write"}, {ID: "4", Name: "read3"},
+	}
+
+	if _, err := stdlib.DispatchWithHooks(context.Background(), tools, calls, defs, nil); err != nil {
+		t.Fatalf("DispatchWithHooks() error = %v", err)
+	}
+	if len(order) != 4 || order[2] != "write" || order[3] != "read3" {
+		t.Fatalf("dispatch order = %v, want read1/read2 in any order, then write, then read3", order)
+	}
+}
+
 // --- Compaction tests ---
 
 func TestCompaction_TriggersAtThreshold(t *testing.T) {
