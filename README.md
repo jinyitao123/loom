@@ -152,7 +152,9 @@ loom/
 ├── contract/         Pure interfaces: LLM / ToolDispatcher / Embedder
 ├── stdlib/           Pre-built Steps & Hooks (tool loop, permissions, budget, session, …)
 ├── pgstore/          PostgreSQL Store
-├── provider/         LLM providers (OpenAI-compatible / DeepSeek)
+├── provider/         LLM providers (OpenAI-compatible / DeepSeek / Anthropic / Responses)
+├── localtools/       Opt-in local files, search and shell ToolDispatcher
+├── mcpclient/        Opt-in stdio / streamable HTTP ToolDispatcher
 ├── cmd/loom/         The `loom` CLI
 ├── tests/            Black-box test suite (public API only)
 └── docs/             Host-integration contract & orchestration design

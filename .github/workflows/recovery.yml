@@ -7,14 +7,18 @@ on:
     paths:
       - "stdlib/**"
       - "contract/**"
-      - "provider/openai/**"
+      - "provider/**"
+      - "localtools/**"
+      - "mcpclient/**"
       - "go.mod"
       - ".github/workflows/recovery.yml"
   pull_request:
     paths:
       - "stdlib/**"
       - "contract/**"
-      - "provider/openai/**"
+      - "provider/**"
+      - "localtools/**"
+      - "mcpclient/**"
       - "go.mod"
       - ".github/workflows/recovery.yml"
 
@@ -34,10 +38,10 @@ jobs:
       - name: stdlib
         run: go test -count=1 ./stdlib/...
       - name: provider protocol observations
-        run: go test -count=1 ./provider/openai/...
+        run: go test -count=1 ./provider/... ./localtools/... ./mcpclient/...
       - name: recovery matrix under the race detector
         if: runner.os == 'Linux'
-        run: go test -race -count=1 ./stdlib -run 'TestRecovery|TestJournal'
+        run: go test -race -count=1 ./stdlib -run 'TestRecovery|TestJournal|TestNativeProvider'
       - name: provider protocol observations under the race detector
         if: runner.os == 'Linux'
-        run: go test -race -count=1 ./provider/openai/...
+        run: go test -race -count=1 ./provider/... ./localtools/... ./mcpclient/...

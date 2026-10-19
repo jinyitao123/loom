@@ -128,6 +128,58 @@ compatibility adapter reads `prompt_tokens_details.cached_tokens` and the
 preserve these facts in physical receipts and checkpoints, and report incomplete
 coverage rather than inventing zero values for earlier unobserved calls.
 
+## Optional native providers and tool adapters
+
+Embedded hosts may construct `provider/anthropic.New` for Messages or
+`provider/openairesponses.New` for Responses and inject either as `contract.LLM`.
+This adds leaf adapters; the existing CLI, compiler and OpenAI-compatible client
+keep their defaults. Protocol selection, model capabilities, credentials and
+published configuration freezing remain the host's responsibility. A signed
+reasoning block must only be replayed to the protocol and provider that produced
+it; the generic contract does not encode its provenance.
+
+Both clients stream internally, preserve completed reasoning blocks and tool
+order, reject invalid tool-choice constraints before sending, and map `Schema`
+to native JSON-schema output fields. Model-specific schema or effort support is
+still enforced by the endpoint; there is no silent fallback to plain text.
+Anthropic maps effort to explicit token-budget thinking and rejects forced tool
+choice or an insufficient output limit when thinking is requested. This adapter
+does not implement adaptive thinking. Responses uses `store=false` and encrypted
+reasoning items; it does not use server-side conversation IDs. Responses cache
+read counts are already included in input tokens. Anthropic's three input
+components are normalized into one total. Reported-zero cache subtotals remain
+distinct from omitted fields; neither adapter invents cache-write accounting.
+`WithAttemptTimeout` may bound a physical request including its streamed body;
+without it, the caller's context bounds the body. Truncation, malformed stream
+JSON and provider errors return errors; length/refusal/pause stop reasons remain
+available for the host's completion policy.
+
+`localtools.New` and `mcpclient.Connect` are optional `contract.ToolDispatcher`
+implementations. No default execution path loads them. `localtools` supplies local
+text/image reads, exact edits, writes, searches and platform-specific shell
+commands. Its working directory is a base for relative paths, **not a sandbox**;
+absolute paths and parent traversal are supported. A host grants filesystem and
+shell access explicitly and owns document extraction, authentication and output
+retention. The image read limit is 20 MiB; the server host may impose a smaller
+limit. Binary office documents are not extracted by this adapter.
+
+`mcpclient` supports stdio and streamable HTTP, tool catalogs, ordered text/image
+results, host-mediated elicitation and an opt-in experimental `loom/turn`
+capability. Partial connection failures are returned separately and must be
+handled according to the host's required server set. Catalog refresh failures,
+ambiguous mapped names and excessive pagination fail closed. Server read-only
+annotations are hints, not an authorization decision. The adapter does not own
+business permissions, durable action receipts, automatic retries, OAuth login or
+HTTP session recovery. Hosts with an existing authenticated tool boundary can
+keep it and inject that dispatcher instead.
+
+Protocol references: [Responses migration](https://developers.openai.com/api/docs/guides/migrate-to-responses),
+[Responses streaming](https://developers.openai.com/api/reference/resources/responses/streaming-events),
+[Messages structured output](https://platform.claude.com/docs/en/build-with-claude/structured-outputs),
+[Messages cache accounting](https://platform.claude.com/docs/en/build-with-claude/prompt-caching).
+Local protocol fixtures and journal-replay tests do not establish live endpoint
+or application business acceptance.
+
 ## Optional provider protocol observations
 
 Embedded Go hosts may opt a single provider invocation into
