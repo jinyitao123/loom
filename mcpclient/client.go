@@ -242,9 +242,12 @@ func (s *session) listTools(ctx context.Context) ([]tool, error) {
 		}
 		tools = append(tools, result.Tools...)
 		if result.NextCursor == "" {
-			break
+			return tools, nil
 		}
 		cursor = result.NextCursor
+	}
+	if cursor != "" {
+		return nil, errors.New("MCP tool listing exceeded pagination limit")
 	}
 	return tools, nil
 }

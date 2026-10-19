@@ -204,13 +204,13 @@ func TestRequestCarriesHistoryThinkingAndCacheMarks(t *testing.T) {
 	}
 }
 
-func TestThinkingIsOffForForcedToolsAndSmallLimits(t *testing.T) {
+func TestThinkingRejectsForcedToolsAndBoundsBudget(t *testing.T) {
 	c := New("k", WithDefaultModel("m"))
 	msgs := []contract.Message{{Role: "user", Content: "x"}}
-	forced, _ := c.buildRequest(contract.ChatRequest{Messages: msgs, Effort: contract.EffortHigh,
+	_, err := c.buildRequest(contract.ChatRequest{Messages: msgs, Effort: contract.EffortHigh,
 		Tools: []contract.ToolDef{{Name: "a"}}, ToolChoice: &contract.ToolChoice{Mode: contract.ToolChoiceRequired}})
-	if forced.Thinking != nil || forced.ToolChoice.Type != "any" {
-		t.Fatalf("forced = %+v", forced)
+	if err == nil {
+		t.Fatal("forced tool choice must not silently remove thinking")
 	}
 	small, _ := c.buildRequest(contract.ChatRequest{Messages: msgs, Effort: contract.EffortHigh, MaxTokens: 4000})
 	if small.Thinking == nil || small.Thinking.BudgetTokens != 2000 {
@@ -256,7 +256,7 @@ func TestErrorsAreReported(t *testing.T) {
 }
 
 func TestStopReasons(t *testing.T) {
-	for in, want := range map[string]string{"end_turn": "stop", "stop_sequence": "stop", "tool_use": "tool_calls", "max_tokens": "length", "refusal": "stop"} {
+	for in, want := range map[string]string{"end_turn": "stop", "stop_sequence": "stop", "tool_use": "tool_calls", "max_tokens": "length", "refusal": "refusal", "pause_turn": "pause_turn"} {
 		if got := stopReason(in); got != want {
 			t.Errorf("stopReason(%q) = %q, want %q", in, got, want)
 		}

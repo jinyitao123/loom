@@ -243,9 +243,15 @@ func (m *Manager) ListTools(ctx context.Context) ([]contract.ToolDef, error) {
 		s.stale = false
 		s.mu.Unlock()
 		if stale {
-			if tools, err := s.session.listTools(ctx); err == nil {
-				s.tools = tools
+			tools, err := s.session.listTools(ctx)
+			if err != nil {
+				s.mu.Lock()
+				s.stale = true
+				s.mu.Unlock()
+				m.routes = map[string]route{}
+				return nil, fmt.Errorf("MCP server %s refresh tools: %w", s.name, err)
 			}
+			s.tools = tools
 		}
 		for _, t := range s.tools {
 			name := s.prefix + sanitize(t.Name)
@@ -253,7 +259,8 @@ func (m *Manager) ListTools(ctx context.Context) ([]contract.ToolDef, error) {
 				name = name[:64]
 			}
 			if _, taken := m.routes[name]; taken {
-				continue
+				m.routes = map[string]route{}
+				return nil, fmt.Errorf("MCP tool name collision: %s", name)
 			}
 			schema := t.InputSchema
 			if len(schema) == 0 || string(schema) == "null" {

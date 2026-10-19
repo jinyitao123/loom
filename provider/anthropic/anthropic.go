@@ -19,10 +19,12 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"sort"
 	"strings"
 	"time"
 
 	"github.com/jinyitao123/loom/contract"
+	"github.com/jinyitao123/loom/provider/internal/requestcheck"
 )
 
 // DefaultBaseURL is the public API endpoint; requests go to <base>/v1/messages.
@@ -86,6 +88,16 @@ func WithHeaderTimeout(d time.Duration) Option {
 	}
 }
 
+// WithAttemptTimeout bounds one complete physical request, including its stream.
+// A non-positive duration leaves the caller-context-only default unchanged.
+func WithAttemptTimeout(d time.Duration) Option {
+	return func(c *Client) {
+		if d > 0 {
+			c.http.Timeout = d
+		}
+	}
+}
+
 // New returns a client authenticated with apiKey.
 func New(apiKey string, opts ...Option) *Client {
 	transport := http.DefaultTransport.(*http.Transport).Clone()
@@ -100,15 +112,24 @@ func New(apiKey string, opts ...Option) *Client {
 // ---- request ----
 
 type request struct {
-	Model       string      `json:"model"`
-	MaxTokens   int         `json:"max_tokens"`
-	System      []block     `json:"system,omitempty"`
-	Messages    []message   `json:"messages"`
-	Tools       []tool      `json:"tools,omitempty"`
-	ToolChoice  *toolChoice `json:"tool_choice,omitempty"`
-	Temperature *float64    `json:"temperature,omitempty"`
-	Thinking    *thinking   `json:"thinking,omitempty"`
-	Stream      bool        `json:"stream"`
+	Model        string        `json:"model"`
+	MaxTokens    int           `json:"max_tokens"`
+	System       []block       `json:"system,omitempty"`
+	Messages     []message     `json:"messages"`
+	Tools        []tool        `json:"tools,omitempty"`
+	ToolChoice   *toolChoice   `json:"tool_choice,omitempty"`
+	Temperature  *float64      `json:"temperature,omitempty"`
+	Thinking     *thinking     `json:"thinking,omitempty"`
+	Stream       bool          `json:"stream"`
+	OutputConfig *outputConfig `json:"output_config,omitempty"`
+}
+
+type outputConfig struct {
+	Format outputFormat `json:"format"`
+}
+type outputFormat struct {
+	Type   string          `json:"type"`
+	Schema json.RawMessage `json:"schema"`
 }
 
 type message struct {
@@ -163,6 +184,9 @@ var ephemeral = &cacheControl{Type: "ephemeral"}
 
 // buildRequest converts a contract request to the wire form.
 func (c *Client) buildRequest(req contract.ChatRequest) (request, error) {
+	if err := requestcheck.Validate(req); err != nil {
+		return request{}, fmt.Errorf("anthropic: %w", err)
+	}
 	model := req.Model
 	if model == "" {
 		model = c.defaultModel
@@ -173,6 +197,9 @@ func (c *Client) buildRequest(req contract.ChatRequest) (request, error) {
 	out := request{Model: model, MaxTokens: req.MaxTokens, Temperature: req.Temperature, Stream: true}
 	if out.MaxTokens <= 0 {
 		out.MaxTokens = DefaultMaxTokens
+	}
+	if req.Schema != nil {
+		out.OutputConfig = &outputConfig{Format: outputFormat{Type: "json_schema", Schema: *req.Schema}}
 	}
 	var system []string
 	for _, m := range req.Messages {
@@ -238,7 +265,13 @@ func (c *Client) buildRequest(req contract.ChatRequest) (request, error) {
 			budget = out.MaxTokens / 2
 		}
 		forced := out.ToolChoice != nil && (out.ToolChoice.Type == "any" || out.ToolChoice.Type == "tool")
-		if budget >= 1024 && !forced {
+		if forced {
+			return request{}, errors.New("anthropic: forced tool choice is incompatible with thinking")
+		}
+		if budget < 1024 {
+			return request{}, errors.New("anthropic: max tokens too small for thinking")
+		}
+		if budget >= 1024 {
 			out.Thinking = &thinking{Type: "enabled", BudgetTokens: budget}
 			out.Temperature = nil
 		}
@@ -338,10 +371,10 @@ type event struct {
 }
 
 type usage struct {
-	InputTokens              int `json:"input_tokens"`
-	OutputTokens             int `json:"output_tokens"`
-	CacheCreationInputTokens int `json:"cache_creation_input_tokens"`
-	CacheReadInputTokens     int `json:"cache_read_input_tokens"`
+	InputTokens              int  `json:"input_tokens"`
+	OutputTokens             int  `json:"output_tokens"`
+	CacheCreationInputTokens *int `json:"cache_creation_input_tokens"`
+	CacheReadInputTokens     *int `json:"cache_read_input_tokens"`
 }
 
 // openBlock accumulates one content block while it streams.
@@ -361,8 +394,10 @@ func stopReason(reason string) string {
 		return "tool_calls"
 	case "max_tokens", "model_context_window_exceeded":
 		return "length"
-	default:
+	case "end_turn", "stop_sequence":
 		return "stop"
+	default:
+		return reason
 	}
 }
 
@@ -437,7 +472,7 @@ func (c *Client) read(ctx context.Context, body io.ReadCloser, ch chan<- contrac
 	fail := func(err error) { send(contract.StreamChunk{Err: err}) }
 
 	blocks := map[int]*openBlock{}
-	var calls []contract.ToolCall
+	calls := map[int]contract.ToolCall{}
 	var total usage
 	var reason string
 	sawOutput := false
@@ -455,7 +490,8 @@ func (c *Client) read(ctx context.Context, body io.ReadCloser, ch chan<- contrac
 		}
 		var ev event
 		if err := json.Unmarshal([]byte(data), &ev); err != nil {
-			continue
+			fail(fmt.Errorf("anthropic: invalid stream event: %w", err))
+			return
 		}
 		switch ev.Type {
 		case "message_start":
@@ -521,7 +557,7 @@ func (c *Client) read(ctx context.Context, body io.ReadCloser, ch chan<- contrac
 				if strings.TrimSpace(b.call.Args) == "" {
 					b.call.Args = "{}"
 				}
-				calls = append(calls, b.call)
+				calls[ev.Index] = b.call
 				sawOutput = true
 			}
 		case "message_delta":
@@ -535,25 +571,31 @@ func (c *Client) read(ctx context.Context, body io.ReadCloser, ch chan<- contrac
 				if ev.Usage.InputTokens > 0 {
 					total.InputTokens = ev.Usage.InputTokens
 				}
-				if ev.Usage.CacheReadInputTokens > 0 {
+				if ev.Usage.CacheReadInputTokens != nil {
 					total.CacheReadInputTokens = ev.Usage.CacheReadInputTokens
 				}
-				if ev.Usage.CacheCreationInputTokens > 0 {
+				if ev.Usage.CacheCreationInputTokens != nil {
 					total.CacheCreationInputTokens = ev.Usage.CacheCreationInputTokens
 				}
 			}
 		case "message_stop":
+			if len(blocks) != 0 || reason == "" {
+				fail(errors.New("anthropic: incomplete message before message_stop"))
+				return
+			}
 			if !sawOutput {
 				fail(fmt.Errorf("%w (stop reason %q)", ErrEmptyResponse, reason))
 				return
 			}
 			u := contract.Usage{
-				InputTokens:      total.InputTokens + total.CacheReadInputTokens + total.CacheCreationInputTokens,
-				OutputTokens:     total.OutputTokens,
-				CacheReadTokens:  total.CacheReadInputTokens,
-				CacheWriteTokens: total.CacheCreationInputTokens,
+				InputTokens:        total.InputTokens + tokenCount(total.CacheReadInputTokens) + tokenCount(total.CacheCreationInputTokens),
+				OutputTokens:       total.OutputTokens,
+				CacheReadTokens:    tokenCount(total.CacheReadInputTokens),
+				CacheReadReported:  total.CacheReadInputTokens != nil,
+				CacheWriteTokens:   tokenCount(total.CacheCreationInputTokens),
+				CacheWriteReported: total.CacheCreationInputTokens != nil,
 			}
-			send(contract.StreamChunk{ToolCalls: calls, Done: true, Usage: &u, FinishReason: stopReason(reason)})
+			send(contract.StreamChunk{ToolCalls: orderedCalls(calls), Done: true, Usage: &u, FinishReason: stopReason(reason)})
 			return
 		case "error":
 			if ev.Error != nil {
@@ -600,7 +642,31 @@ func (c *Client) Chat(ctx context.Context, req contract.ChatRequest) (*contract.
 			return &resp, nil
 		}
 	}
+	if ctx.Err() != nil {
+		return nil, ctx.Err()
+	}
 	return nil, errors.New("anthropic: stream closed without a result")
 }
 
 var _ contract.LLM = (*Client)(nil)
+
+// orderedCalls preserves provider output order even if blocks finish out of order.
+func orderedCalls(calls map[int]contract.ToolCall) []contract.ToolCall {
+	indices := make([]int, 0, len(calls))
+	for i := range calls {
+		indices = append(indices, i)
+	}
+	sort.Ints(indices)
+	var out []contract.ToolCall
+	for _, i := range indices {
+		out = append(out, calls[i])
+	}
+	return out
+}
+
+func tokenCount(n *int) int {
+	if n == nil {
+		return 0
+	}
+	return *n
+}

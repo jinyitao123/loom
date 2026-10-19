@@ -17,10 +17,12 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"sort"
 	"strings"
 	"time"
 
 	"github.com/jinyitao123/loom/contract"
+	"github.com/jinyitao123/loom/provider/internal/requestcheck"
 )
 
 // DefaultBaseURL is the public API base; requests go to <base>/responses.
@@ -57,6 +59,16 @@ func WithBaseURL(url string) Option {
 // WithDefaultModel sets the model used when a request names none.
 func WithDefaultModel(model string) Option { return func(c *Client) { c.defaultModel = model } }
 
+// WithAttemptTimeout bounds one complete physical request, including its stream.
+// A non-positive duration leaves the caller-context-only default unchanged.
+func WithAttemptTimeout(d time.Duration) Option {
+	return func(c *Client) {
+		if d > 0 {
+			c.http.Timeout = d
+		}
+	}
+}
+
 // New returns a client authenticated with apiKey.
 func New(apiKey string, opts ...Option) *Client {
 	transport := http.DefaultTransport.(*http.Transport).Clone()
@@ -71,17 +83,28 @@ func New(apiKey string, opts ...Option) *Client {
 // ---- request ----
 
 type request struct {
-	Model           string     `json:"model"`
-	Instructions    string     `json:"instructions,omitempty"`
-	Input           []any      `json:"input"`
-	Tools           []tool     `json:"tools,omitempty"`
-	ToolChoice      any        `json:"tool_choice,omitempty"`
-	MaxOutputTokens int        `json:"max_output_tokens,omitempty"`
-	Temperature     *float64   `json:"temperature,omitempty"`
-	Reasoning       *reasoning `json:"reasoning,omitempty"`
-	Include         []string   `json:"include,omitempty"`
-	Store           bool       `json:"store"`
-	Stream          bool       `json:"stream"`
+	Model           string      `json:"model"`
+	Instructions    string      `json:"instructions,omitempty"`
+	Input           []any       `json:"input"`
+	Tools           []tool      `json:"tools,omitempty"`
+	ToolChoice      any         `json:"tool_choice,omitempty"`
+	MaxOutputTokens int         `json:"max_output_tokens,omitempty"`
+	Temperature     *float64    `json:"temperature,omitempty"`
+	Reasoning       *reasoning  `json:"reasoning,omitempty"`
+	Include         []string    `json:"include,omitempty"`
+	Store           bool        `json:"store"`
+	Stream          bool        `json:"stream"`
+	Text            *textConfig `json:"text,omitempty"`
+}
+
+type textConfig struct {
+	Format outputFormat `json:"format"`
+}
+type outputFormat struct {
+	Type   string          `json:"type"`
+	Name   string          `json:"name"`
+	Strict bool            `json:"strict"`
+	Schema json.RawMessage `json:"schema"`
 }
 
 type tool struct {
@@ -128,6 +151,9 @@ type functionOutput struct {
 }
 
 func (c *Client) buildRequest(req contract.ChatRequest) (request, error) {
+	if err := requestcheck.Validate(req); err != nil {
+		return request{}, fmt.Errorf("openairesponses: %w", err)
+	}
 	model := req.Model
 	if model == "" {
 		model = c.defaultModel
@@ -136,6 +162,9 @@ func (c *Client) buildRequest(req contract.ChatRequest) (request, error) {
 		return request{}, errors.New("openai responses: no model")
 	}
 	out := request{Model: model, MaxOutputTokens: req.MaxTokens, Temperature: req.Temperature, Stream: true}
+	if req.Schema != nil {
+		out.Text = &textConfig{Format: outputFormat{Type: "json_schema", Name: "output", Strict: true, Schema: *req.Schema}}
+	}
 	var system []string
 	for _, m := range req.Messages {
 		switch m.Role {
@@ -278,7 +307,7 @@ type responseObject struct {
 		InputTokens        int `json:"input_tokens"`
 		OutputTokens       int `json:"output_tokens"`
 		InputTokensDetails struct {
-			CachedTokens int `json:"cached_tokens"`
+			CachedTokens *int `json:"cached_tokens"`
 		} `json:"input_tokens_details"`
 	} `json:"usage"`
 }
@@ -349,7 +378,7 @@ func read(ctx context.Context, body io.ReadCloser, ch chan<- contract.StreamChun
 	}
 	fail := func(err error) { send(contract.StreamChunk{Err: err}) }
 
-	var calls []contract.ToolCall
+	calls := map[int]contract.ToolCall{}
 	sawText := false
 	summaryStarted := map[int]bool{} // reasoning items whose summary already streamed text
 
@@ -366,7 +395,8 @@ func read(ctx context.Context, body io.ReadCloser, ch chan<- contract.StreamChun
 		}
 		var ev event
 		if err := json.Unmarshal([]byte(data), &ev); err != nil {
-			continue
+			fail(fmt.Errorf("openairesponses: invalid stream event: %w", err))
+			return
 		}
 		switch ev.Type {
 		case "response.output_text.delta":
@@ -411,7 +441,7 @@ func read(ctx context.Context, body io.ReadCloser, ch chan<- contract.StreamChun
 				if strings.TrimSpace(args) == "" {
 					args = "{}"
 				}
-				calls = append(calls, contract.ToolCall{ID: ev.Item.CallID, Name: ev.Item.Name, Args: args})
+				calls[ev.OutputIndex] = contract.ToolCall{ID: ev.Item.CallID, Name: ev.Item.Name, Args: args}
 			}
 		case "response.completed", "response.incomplete":
 			r := ev.Response
@@ -429,16 +459,24 @@ func read(ctx context.Context, body io.ReadCloser, ch chan<- contract.StreamChun
 			}
 			finish := "stop"
 			switch {
+			case ev.Type == "response.incomplete":
+				if r.IncompleteDetails == nil || r.IncompleteDetails.Reason != "max_output_tokens" {
+					fail(errors.New("openai responses: response incomplete"))
+					return
+				}
+				finish = "length"
 			case len(calls) > 0:
 				finish = "tool_calls"
-			case r.IncompleteDetails != nil && r.IncompleteDetails.Reason == "max_output_tokens":
-				finish = "length"
 			}
-			var usage contract.Usage
+			var usage *contract.Usage
 			if r.Usage != nil {
-				usage = contract.Usage{InputTokens: r.Usage.InputTokens, OutputTokens: r.Usage.OutputTokens, CacheReadTokens: r.Usage.InputTokensDetails.CachedTokens}
+				usage = &contract.Usage{InputTokens: r.Usage.InputTokens, OutputTokens: r.Usage.OutputTokens}
+				if n := r.Usage.InputTokensDetails.CachedTokens; n != nil {
+					usage.CacheReadTokens = *n
+					usage.CacheReadReported = true
+				}
 			}
-			send(contract.StreamChunk{ToolCalls: calls, Done: true, Usage: &usage, FinishReason: finish})
+			send(contract.StreamChunk{ToolCalls: orderedCalls(calls), Done: true, Usage: usage, FinishReason: finish})
 			return
 		case "response.failed":
 			if ev.Response != nil && ev.Response.Error != nil {
@@ -488,7 +526,24 @@ func (c *Client) Chat(ctx context.Context, req contract.ChatRequest) (*contract.
 			return &resp, nil
 		}
 	}
+	if ctx.Err() != nil {
+		return nil, ctx.Err()
+	}
 	return nil, errors.New("openai responses: stream closed without a result")
 }
 
 var _ contract.LLM = (*Client)(nil)
+
+// orderedCalls preserves provider output order even if blocks finish out of order.
+func orderedCalls(calls map[int]contract.ToolCall) []contract.ToolCall {
+	indices := make([]int, 0, len(calls))
+	for i := range calls {
+		indices = append(indices, i)
+	}
+	sort.Ints(indices)
+	var out []contract.ToolCall
+	for _, i := range indices {
+		out = append(out, calls[i])
+	}
+	return out
+}

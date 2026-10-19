@@ -108,6 +108,10 @@ type Usage struct {
 	// CacheReadTokens / CacheWriteTokens 是 InputTokens 中读自、写入提供方提示缓存的部分（提供方上报时填写）。
 	CacheReadTokens  int `json:"cache_read_tokens,omitempty"`
 	CacheWriteTokens int `json:"cache_write_tokens,omitempty"`
+	// Reported distinguishes a provider-reported zero from missing accounting.
+	// Non-zero subtotals also prove reporting for callers predating these flags.
+	CacheReadReported  bool `json:"cache_read_reported,omitempty"`
+	CacheWriteReported bool `json:"cache_write_reported,omitempty"`
 }
 
 // StreamChunk represents a piece of streaming output.
