@@ -134,7 +134,7 @@ go install github.com/jinyitao123/loom/cmd/loom@latest
 curl -fsSL https://raw.githubusercontent.com/jinyitao123/loom/main/install.sh | sh
 ```
 
-See [cmd/loom/README.md](cmd/loom/README.md) for the event wire format, and [docs/host-integration.md](docs/host-integration.md) for driving it from any host process.
+See [cmd/loom/README.md](cmd/loom/README.md) for the event wire format, and [docs/host-integration.md](docs/host-integration.md) for driving it from any host process. For a long-lived interactive agent with a session file, see [docs/interactive.md](docs/interactive.md) (`loom agent --mode rpc`).
 
 ## Project structure
 
