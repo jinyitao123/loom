@@ -719,8 +719,10 @@ func (c *Client) Chat(ctx context.Context, req contract.ChatRequest) (*contract.
 	if err != nil {
 		return nil, err // URL 非法等构造错误，原样返回
 	}
-	httpReq.Header.Set("Content-Type", "application/json")  // 请求体为 JSON
-	httpReq.Header.Set("Authorization", "Bearer "+c.apiKey) // OpenAI 风格的 Bearer 鉴权
+	httpReq.Header.Set("Content-Type", "application/json") // 请求体为 JSON
+	if c.apiKey != "" {
+		httpReq.Header.Set("Authorization", "Bearer "+c.apiKey)
+	}
 
 	// 发起同步请求；网络层错误（连接失败、ctx 取消等）在此返回。
 	resp, err := c.client.Do(httpReq)
@@ -740,7 +742,7 @@ func (c *Client) Chat(ctx context.Context, req contract.ChatRequest) (*contract.
 	// 非 200 一律视为失败，把原始响应体附进错误便于排查（通常含厂商错误 JSON）。
 	if resp.StatusCode != http.StatusOK {
 		probe.end("http_error", "", false, 0)
-		return nil, fmt.Errorf("openai: HTTP %d: %s", resp.StatusCode, string(respBody))
+		return nil, responseError(resp, respBody)
 	}
 
 	// 解析 wire 响应。
@@ -892,9 +894,11 @@ func (c *Client) Stream(ctx context.Context, req contract.ChatRequest) (stream <
 	if err != nil {
 		return nil, err // URL 构造失败
 	}
-	httpReq.Header.Set("Content-Type", "application/json")  // 请求体仍是 JSON
-	httpReq.Header.Set("Authorization", "Bearer "+c.apiKey) // Bearer 鉴权
-	httpReq.Header.Set("Accept", "text/event-stream")       // 声明期望 SSE 流式响应
+	httpReq.Header.Set("Content-Type", "application/json") // 请求体仍是 JSON
+	if c.apiKey != "" {
+		httpReq.Header.Set("Authorization", "Bearer "+c.apiKey)
+	}
+	httpReq.Header.Set("Accept", "text/event-stream") // 声明期望 SSE 流式响应
 
 	// 发起请求；成功后响应体是一条保持打开的 SSE 长连接。
 	resp, err := c.client.Do(httpReq)
@@ -908,7 +912,7 @@ func (c *Client) Stream(ctx context.Context, req contract.ChatRequest) (stream <
 		probe.end("http_error", "", false, 0)
 		defer resp.Body.Close()
 		errBody, _ := io.ReadAll(resp.Body) // 错误详情尽力而为，读失败也不影响主错误
-		return nil, fmt.Errorf("openai: HTTP %d: %s", resp.StatusCode, string(errBody))
+		return nil, responseError(resp, errBody)
 	}
 
 	// 带缓冲的增量块通道：允许解析端小幅领先消费端，降低相互阻塞。
