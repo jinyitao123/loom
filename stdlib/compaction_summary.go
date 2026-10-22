@@ -15,6 +15,11 @@ type SummaryCompactionOpts struct {
 	Prompt         string
 	Prefix         string
 	PreCompact     func(context.Context, []contract.Message) error
+	// PinTask keeps the first user message, the task, verbatim ahead of every
+	// summary instead of folding it into one, so repeated compactions cannot
+	// wear the original request down. A transcript holding nothing to
+	// summarize beyond the pinned task is left as it is.
+	PinTask bool
 }
 
 // NewSummaryCompactionPolicy creates a complete trigger-and-summary policy for
@@ -50,6 +55,12 @@ func NewSummaryCompactionPolicy(llm contract.LLM, opts SummaryCompactionOpts) *C
 				system = &copy
 				start = 1
 			}
+			var task *contract.Message
+			if opts.PinTask && start < len(messages) && messages[start].Role == "user" {
+				copy := messages[start]
+				task = &copy
+				start++
+			}
 			if len(messages)-start <= keepLast {
 				return messages, nil
 			}
@@ -78,9 +89,12 @@ func NewSummaryCompactionPolicy(llm contract.LLM, opts SummaryCompactionOpts) *C
 			if err != nil || response == nil {
 				return messages, nil
 			}
-			compacted := make([]contract.Message, 0, len(messages)-cut+2)
+			compacted := make([]contract.Message, 0, len(messages)-cut+3)
 			if system != nil {
 				compacted = append(compacted, *system)
+			}
+			if task != nil {
+				compacted = append(compacted, *task)
 			}
 			compacted = append(compacted, contract.Message{Role: "assistant", Content: prefix + response.Content})
 			compacted = append(compacted, messages[cut:]...)

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/jinyitao123/loom/contract"
@@ -92,5 +93,59 @@ func TestSummaryCompactionFailureKeepsTranscript(t *testing.T) {
 	got, err := policy.Compactor(context.Background(), messages)
 	if err != nil || len(got) != len(messages) {
 		t.Fatalf("failed summary changed transcript: got=%#v err=%v", got, err)
+	}
+}
+
+func TestSummaryCompactionPinsTaskAcrossRepeatedReads(t *testing.T) {
+	llm := &summaryLLM{}
+	policy := stdlib.NewSummaryCompactionPolicy(llm, stdlib.SummaryCompactionOpts{KeepLast: 2, PinTask: true})
+	task := contract.Message{Role: "user", Content: "Compare clause 7 of both contracts and list every difference."}
+	messages := []contract.Message{{Role: "system", Content: "identity"}, task}
+	read := func(id string) {
+		messages = append(messages,
+			contract.Message{Role: "assistant", ToolCalls: []contract.ToolCall{{ID: id, Name: "read", Args: `{}`}}},
+			contract.Message{Role: "tool", ToolCallID: id, Content: "long material " + id})
+	}
+	for round, id := range []string{"a", "b", "c"} {
+		read(id)
+		got, err := policy.Compactor(context.Background(), messages)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if round > 0 && (len(got) >= len(messages) || got[2].Role != "assistant") {
+			t.Fatalf("round %d did not compact: %#v", round, got)
+		}
+		if !reflect.DeepEqual(got[1], task) {
+			t.Fatalf("round %d lost the task: %#v", round, got[1])
+		}
+		for _, message := range llm.request.Messages {
+			if message.Content != "" && strings.Contains(message.Content, task.Content) {
+				t.Fatalf("round %d summarized the pinned task", round)
+			}
+		}
+		// The newest read stays whole: its tool call and its result together.
+		tail := got[len(got)-2:]
+		if tail[0].Role != "assistant" || len(tail[0].ToolCalls) != 1 || tail[1].ToolCallID != tail[0].ToolCalls[0].ID {
+			t.Fatalf("round %d split the newest tool exchange: %#v", round, tail)
+		}
+		messages = got
+	}
+}
+
+func TestSummaryCompactionDoesNotSummarizeOnlyPinnedTask(t *testing.T) {
+	llm := &summaryLLM{}
+	policy := stdlib.NewSummaryCompactionPolicy(llm, stdlib.SummaryCompactionOpts{KeepLast: 2, PinTask: true})
+	messages := []contract.Message{
+		{Role: "system", Content: "identity"},
+		{Role: "user", Content: "a very long task"},
+		{Role: "assistant", ToolCalls: []contract.ToolCall{{ID: "a", Name: "read", Args: `{}`}}},
+		{Role: "tool", ToolCallID: "a", Content: "result"},
+	}
+	got, err := policy.Compactor(context.Background(), messages)
+	if err != nil || !reflect.DeepEqual(got, messages) {
+		t.Fatalf("compacted a transcript holding only the pinned task and the newest exchange: %#v %v", got, err)
+	}
+	if llm.request.Model != "" || len(llm.request.Messages) != 0 {
+		t.Fatal("called the summary model with nothing to summarize")
 	}
 }
