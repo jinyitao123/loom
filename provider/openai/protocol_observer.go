@@ -97,6 +97,13 @@ func (p *protocolCapture) request(request *oaiRequest) {
 	options := &contract.ProtocolRequestOptions{
 		ReasoningEffort: protocolEnum(request.ReasoningEffort, "none", "minimal", "low", "medium", "high", "xhigh", "max"),
 		ToolChoice:      wireToolChoiceMode(request.ToolChoice),
+		Temperature:     request.Temperature != nil,
+	}
+	switch {
+	case request.MaxCompletionTokens > 0:
+		options.OutputLimit = "max_completion_tokens"
+	case request.MaxTokens > 0:
+		options.OutputLimit = "max_tokens"
 	}
 	if request.Thinking != nil {
 		options.Thinking = protocolEnum(request.Thinking.Type, "enabled", "disabled")

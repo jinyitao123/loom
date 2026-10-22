@@ -37,6 +37,12 @@ type ProtocolRequestOptions struct {
 	ReasoningEffort string `json:"reasoning_effort,omitempty"`
 	ResponseFormat  string `json:"response_format,omitempty"`
 	ToolChoice      string `json:"tool_choice,omitempty"`
+	// OutputLimit names the field that carried the output limit
+	// (max_tokens or max_completion_tokens); empty when none was sent.
+	OutputLimit string `json:"output_limit,omitempty"`
+	// Temperature reports that a sampling temperature was sent; its value is
+	// not recorded.
+	Temperature bool `json:"temperature,omitempty"`
 }
 
 // ProtocolContentObservation counts bytes and markers without retaining text.

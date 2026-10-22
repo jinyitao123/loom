@@ -137,6 +137,9 @@ type Client struct {
 	// 因此带 tools 的请求直接 fail-safe 关闭 thinking。
 	thinkingDisableWithTools bool
 	reasoningContentReplay   bool
+	// maxCompletionTokens sends ChatRequest.MaxTokens as max_completion_tokens.
+	// 中文：为 true 时输出上限以 max_completion_tokens 下发，而不是已弃用的 max_tokens。
+	maxCompletionTokens bool
 	// 中文：经 WithToolChoiceModes 声明的可用工具选择模式；nil 表示 OpenAI 协议的全部模式均可用。
 	toolChoiceModes map[contract.ToolChoiceMode]bool
 }
@@ -208,6 +211,16 @@ func WithToolChoiceModes(modes ...contract.ToolChoiceMode) Option {
 	}
 }
 
+// WithMaxCompletionTokens sends the request's output limit as
+// max_completion_tokens, the field OpenAI reasoning models and some compatible
+// endpoints require in place of max_tokens. Without it
+// the limit is sent as max_tokens. Only one of the two is ever sent.
+// 中文：输出上限改用 max_completion_tokens 下发。未设置时仍为 max_tokens；
+// 两者绝不同时出现。
+func WithMaxCompletionTokens() Option {
+	return func(c *Client) { c.maxCompletionTokens = true }
+}
+
 // WithChatPath overrides the path appended to the base URL for chat completions
 // (default: /v1/chat/completions). Needed by OpenAI-compatible providers whose
 // base URL already carries a version segment, e.g. Zhipu GLM, whose endpoint is
@@ -257,15 +270,18 @@ func New(apiKey string, opts ...Option) *Client {
 // 仅在本包内部使用，收发两端各做一次与 contract 类型的映射。
 
 type oaiRequest struct {
-	Model          string             `json:"model"`                     // 模型名（已经过 resolveModel 兜底）
-	Messages       []oaiMessage       `json:"messages"`                  // 对话历史，由 contract.Message 映射而来
-	Tools          []oaiTool          `json:"tools,omitempty"`           // 工具定义列表；为 nil 时整个字段缺省
-	ToolChoice     any                `json:"tool_choice,omitempty"`     // "auto"/"none"/"required" 或指名 function；nil 时整个字段缺省
-	MaxTokens      int                `json:"max_tokens,omitempty"`      // 输出 token 上限；0 时省略，交给服务端默认
-	Temperature    *float64           `json:"temperature,omitempty"`     // 采样温度；用指针区分"未设置"与显式 0
-	Stream         bool               `json:"stream,omitempty"`          // true 时服务端切换为 SSE 流式返回
-	StreamOptions  *oaiStreamOptions  `json:"stream_options,omitempty"`  // 流式附加选项（仅流式请求携带）
-	ResponseFormat *oaiResponseFormat `json:"response_format,omitempty"` // 结构化输出模式（json_object / json_schema）
+	Model      string       `json:"model"`                 // 模型名（已经过 resolveModel 兜底）
+	Messages   []oaiMessage `json:"messages"`              // 对话历史，由 contract.Message 映射而来
+	Tools      []oaiTool    `json:"tools,omitempty"`       // 工具定义列表；为 nil 时整个字段缺省
+	ToolChoice any          `json:"tool_choice,omitempty"` // "auto"/"none"/"required" 或指名 function；nil 时整个字段缺省
+	MaxTokens  int          `json:"max_tokens,omitempty"`  // 输出 token 上限；0 时省略，交给服务端默认
+	// MaxCompletionTokens carries the output limit instead of MaxTokens when
+	// the client is built WithMaxCompletionTokens.
+	MaxCompletionTokens int                `json:"max_completion_tokens,omitempty"`
+	Temperature         *float64           `json:"temperature,omitempty"`     // 采样温度；用指针区分"未设置"与显式 0
+	Stream              bool               `json:"stream,omitempty"`          // true 时服务端切换为 SSE 流式返回
+	StreamOptions       *oaiStreamOptions  `json:"stream_options,omitempty"`  // 流式附加选项（仅流式请求携带）
+	ResponseFormat      *oaiResponseFormat `json:"response_format,omitempty"` // 结构化输出模式（json_object / json_schema）
 	// ReasoningEffort maps contract.ChatRequest.Effort for reasoning models
 	// (gpt-5.x / o-series). Omitted when unset; models that don't support the
 	// parameter reject it, so callers opt in per request.
@@ -613,6 +629,14 @@ func (c *Client) applyThinkingControl(oaiReq *oaiRequest) {
 	}
 }
 
+// applyOutputLimitField moves the output limit to max_completion_tokens for a
+// client declared WithMaxCompletionTokens.
+func (c *Client) applyOutputLimitField(oaiReq *oaiRequest) {
+	if c.maxCompletionTokens {
+		oaiReq.MaxCompletionTokens, oaiReq.MaxTokens = oaiReq.MaxTokens, 0
+	}
+}
+
 // requireJSONOutputInstruction is the pre-send guard for json_object mode.
 // Providers like DeepSeek only guarantee "the output is a JSON object" when
 // the prompt explicitly asks for JSON; without the instruction the model may
@@ -688,6 +712,7 @@ func (c *Client) Chat(ctx context.Context, req contract.ChatRequest) (*contract.
 	// thinking capability：provider 显式 opt-in 才携带 thinking 键；
 	// thinking enabled 时裁剪 temperature（见 applyThinkingControl）。
 	c.applyThinkingControl(&oaiReq)
+	c.applyOutputLimitField(&oaiReq)
 	// 结构化输出：调用方提供了 JSON Schema 时设置 response_format。
 	if req.Schema != nil {
 		if c.jsonObjectMode {
@@ -864,6 +889,7 @@ func (c *Client) Stream(ctx context.Context, req contract.ChatRequest) (stream <
 	}
 	// thinking capability：与 Chat 完全一致的 opt-in 语义与 temperature 裁剪。
 	c.applyThinkingControl(&oaiReq)
+	c.applyOutputLimitField(&oaiReq)
 	// 结构化输出设置：与 Chat 相同的两种模式。
 	if req.Schema != nil {
 		if c.jsonObjectMode {

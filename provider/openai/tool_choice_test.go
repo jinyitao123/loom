@@ -129,7 +129,7 @@ func TestProtocolObserverRecordsWireOptions(t *testing.T) {
 		t.Fatal(err)
 	}
 	observation := <-observations
-	want := contract.ProtocolRequestOptions{Thinking: "disabled", ReasoningEffort: "none", ResponseFormat: "json_object", ToolChoice: "tool"}
+	want := contract.ProtocolRequestOptions{Thinking: "disabled", ReasoningEffort: "none", ResponseFormat: "json_object", ToolChoice: "tool", Temperature: true}
 	if observation.RequestOptions == nil || *observation.RequestOptions != want {
 		t.Fatalf("request options = %#v, want %#v", observation.RequestOptions, want)
 	}
