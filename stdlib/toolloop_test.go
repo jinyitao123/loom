@@ -1070,3 +1070,30 @@ func (c *chatCapture) Chat(ctx context.Context, req contract.ChatRequest) (*cont
 func (c *chatCapture) Stream(ctx context.Context, req contract.ChatRequest) (<-chan contract.StreamChunk, error) {
 	return c.inner.Stream(ctx, req)
 }
+
+func TestToolLoopProviderDefaultEffortLeavesEffortUnset(t *testing.T) {
+	for _, tc := range []struct {
+		name            string
+		providerDefault bool
+		effort          contract.EffortLevel
+		want            contract.EffortLevel
+	}{
+		{"filled in by default", false, "", contract.EffortMedium},
+		{"left to the provider", true, "", ""},
+		{"explicit stays explicit", true, contract.EffortHigh, contract.EffortHigh},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var captured contract.ChatRequest
+			wrapper := &chatCapture{inner: &mockLLM{responses: []contract.ChatResponse{{Content: "ok"}}}, captured: &captured}
+			step := stdlib.NewToolLoopStep(wrapper, &mockTools{}, stdlib.ToolLoopOpts{
+				Model: "test", MaxIterations: 1, Effort: tc.effort, ProviderDefaultEffort: tc.providerDefault,
+			})
+			if _, err := step(context.Background(), loom.State{"messages": []contract.Message{{Role: "user", Content: "go"}}}); err != nil {
+				t.Fatal(err)
+			}
+			if captured.Effort != tc.want {
+				t.Fatalf("request effort = %q, want %q", captured.Effort, tc.want)
+			}
+		})
+	}
+}

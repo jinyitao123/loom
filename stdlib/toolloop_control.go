@@ -370,6 +370,13 @@ func toolLoopPolicyHash(opts ToolLoopOpts, state loom.State) (string, error) {
 	if value, ok := state["__system_prompt"].(string); ok && value != "" {
 		system = value
 	}
+	// An empty Effort sent as the provider default is a different request
+	// policy from an empty Effort filled in as medium, so it hashes apart;
+	// every other combination keeps its existing hash.
+	effort := opts.Effort
+	if effort == "" && opts.ProviderDefaultEffort {
+		effort = "provider_default"
+	}
 	if opts.ToolChoicePolicy != nil || opts.ToolChoicePolicyID != "" {
 		// Only loops that opt into a tool choice policy use this identity shape;
 		// existing continuation hashes below stay byte-for-byte unchanged.
@@ -382,7 +389,7 @@ func toolLoopPolicyHash(opts ToolLoopOpts, state loom.State) (string, error) {
 			Schema                      *json.RawMessage
 			CompletionVerifierID        string
 			ToolChoicePolicyID          string
-		}{3, *opts.Control, opts.Model, system, opts.MaxIterations, opts.MaxToolRepeats, opts.MaxTokens, opts.Effort, opts.OutputSchema, opts.CompletionVerifierID, opts.ToolChoicePolicyID})
+		}{3, *opts.Control, opts.Model, system, opts.MaxIterations, opts.MaxToolRepeats, opts.MaxTokens, effort, opts.OutputSchema, opts.CompletionVerifierID, opts.ToolChoicePolicyID})
 		if err != nil {
 			return "", fmt.Errorf("loom/toolloop: invalid control policy: %w", err)
 		}
@@ -397,7 +404,7 @@ func toolLoopPolicyHash(opts ToolLoopOpts, state loom.State) (string, error) {
 			Iterations, Repeats, Tokens int
 			Effort                      contract.EffortLevel
 			Schema                      *json.RawMessage
-		}{1, *opts.Control, opts.Model, system, opts.MaxIterations, opts.MaxToolRepeats, opts.MaxTokens, opts.Effort, opts.OutputSchema})
+		}{1, *opts.Control, opts.Model, system, opts.MaxIterations, opts.MaxToolRepeats, opts.MaxTokens, effort, opts.OutputSchema})
 		if err != nil {
 			return "", fmt.Errorf("loom/toolloop: invalid control policy: %w", err)
 		}
@@ -412,7 +419,7 @@ func toolLoopPolicyHash(opts ToolLoopOpts, state loom.State) (string, error) {
 		Effort                      contract.EffortLevel
 		Schema                      *json.RawMessage
 		CompletionVerifierID        string
-	}{2, *opts.Control, opts.Model, system, opts.MaxIterations, opts.MaxToolRepeats, opts.MaxTokens, opts.Effort, opts.OutputSchema, opts.CompletionVerifierID})
+	}{2, *opts.Control, opts.Model, system, opts.MaxIterations, opts.MaxToolRepeats, opts.MaxTokens, effort, opts.OutputSchema, opts.CompletionVerifierID})
 	if err != nil {
 		return "", fmt.Errorf("loom/toolloop: invalid control policy: %w", err)
 	}

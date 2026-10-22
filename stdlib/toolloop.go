@@ -97,6 +97,11 @@ type ToolLoopOpts struct {
 	OutputSchema *json.RawMessage     // 结构化输出的 JSON Schema，非 nil 时要求模型按此格式作答
 	Effort       contract.EffortLevel // v1.4: default EffortMedium
 	// Effort：推理强度档位，空值时补齐为中档（EffortMedium）。
+	// ProviderDefaultEffort keeps an empty Effort empty, so providers omit
+	// their reasoning parameter and apply their own default.
+	// ProviderDefaultEffort：为 true 时空 Effort 不再补齐，provider 不下发推理档位，由供应方自定默认值。
+	ProviderDefaultEffort bool
+
 	ToolHooks []contract.ToolHook // v1.4: per-tool pre/post hooks
 	// ToolHooks：工具级前置/后置钩子——前置可改写或拦截调用，后置用于审计观测。
 	Compaction *CompactionPolicy // v1.4: auto-summarize when context grows
@@ -272,7 +277,7 @@ func NewToolLoopStep(llm contract.LLM, tools contract.ToolDispatcher, opts ToolL
 
 		// 推理强度缺省补齐为中档。
 		effort := opts.Effort
-		if effort == "" {
+		if effort == "" && !opts.ProviderDefaultEffort {
 			effort = contract.EffortMedium
 		}
 

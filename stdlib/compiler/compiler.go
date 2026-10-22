@@ -46,6 +46,8 @@ type CompileOpts struct {
 	Profile string // active profile name
 	// 推理努力档位（映射为 reasoning effort），缺省 EffortMedium。
 	Effort contract.EffortLevel // default EffortMedium
+	// 为 true 时空 Effort 不补齐为中档，交由供应方默认值决定。
+	ProviderDefaultEffort bool // keep an empty Effort empty: the provider's default applies
 	// 运行时上下文键值对，由 prompt 组装步骤渲染进 system prompt 的"## 当前上下文"小节。
 	Context map[string]any // runtime context → "## 当前上下文"
 	// 宿主注入的工具前/后置钩子，按序挂到 chat 步骤的工具循环上。
@@ -96,7 +98,7 @@ func CompileAgent(spec *stdlib.AgentSpec, llm contract.LLM, tools contract.ToolD
 		model = "deepseek-chat" // 模型 id 缺省 deepseek-chat
 	}
 	effort := opts.Effort
-	if effort == "" {
+	if effort == "" && !opts.ProviderDefaultEffort {
 		effort = contract.EffortMedium // 推理努力档位缺省中档
 	}
 	name := opts.Name
@@ -187,6 +189,8 @@ func CompileAgent(spec *stdlib.AgentSpec, llm contract.LLM, tools contract.ToolD
 		MaxIterations: 20,
 		Effort:        effort,
 		ToolHooks:     toolHooks,
+
+		ProviderDefaultEffort: opts.ProviderDefaultEffort,
 	}
 	// 构建 chat 步骤本体：宿主提供了工厂就用工厂（可包装工具循环、捕获委派信号），
 	// 否则用标准库缺省的工具循环步骤，两者接到完全相同的参数。

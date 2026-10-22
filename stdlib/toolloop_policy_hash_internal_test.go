@@ -66,3 +66,30 @@ func TestToolLoopPolicyHashUnchangedWithoutToolChoicePolicy(t *testing.T) {
 		t.Fatal("tool choice policy id is not part of the identity")
 	}
 }
+
+func TestProviderDefaultEffortHashesApartAndKeepsExistingHashes(t *testing.T) {
+	schema := json.RawMessage(`{"type":"object"}`)
+	base := ToolLoopOpts{Model: "m", SystemPrompt: "s", MaxIterations: 4, MaxToolRepeats: 3, MaxTokens: 9,
+		OutputSchema: &schema, Control: &ToolLoopControl{ID: "loop", InitialTotalRounds: 8}}
+	hash := func(opts ToolLoopOpts) string {
+		t.Helper()
+		value, err := toolLoopPolicyHash(opts, loom.State{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return value
+	}
+	filled := hash(base)
+	providerDefault := base
+	providerDefault.ProviderDefaultEffort = true
+	if hash(providerDefault) == filled {
+		t.Fatal("an omitted effort hashed like one filled in as medium")
+	}
+	explicit := base
+	explicit.Effort = contract.EffortHigh
+	withFlag := explicit
+	withFlag.ProviderDefaultEffort = true
+	if hash(withFlag) != hash(explicit) {
+		t.Fatal("ProviderDefaultEffort changed the hash of an explicit effort")
+	}
+}
