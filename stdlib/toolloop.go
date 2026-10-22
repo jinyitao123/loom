@@ -327,7 +327,7 @@ func NewToolLoopStep(llm contract.LLM, tools contract.ToolDispatcher, opts ToolL
 			}
 
 			// 本轮询问 LLM：携带完整历史、工具清单与输出约束。
-			resp, err := llm.Chat(ctx, contract.ChatRequest{
+			resp, err := llm.Chat(contract.WithCallPurpose(ctx, contract.CallPurposeGeneration), contract.ChatRequest{
 				Model:      opts.Model,
 				Messages:   msgs,
 				Tools:      availableTools,
@@ -471,7 +471,7 @@ func NewToolLoopStep(llm contract.LLM, tools contract.ToolDispatcher, opts ToolL
 				"should be handled (for example, delegating it as a background task).", opts.MaxIterations),
 		})
 		// 最后一问：请求里刻意不带 Tools 字段——从协议层面断掉继续调用工具的可能性。
-		resp, err := llm.Chat(ctx, contract.ChatRequest{
+		resp, err := llm.Chat(contract.WithCallPurpose(ctx, contract.CallPurposeWrapUp), contract.ChatRequest{
 			Model:      opts.Model,
 			Messages:   msgs,
 			MaxTokens:  opts.MaxTokens,

@@ -175,7 +175,7 @@ func newControlledToolLoopStep(llm contract.LLM, tools contract.ToolDispatcher, 
 			if err != nil {
 				return nil, err
 			}
-			resp, err := llm.Chat(ctx, contract.ChatRequest{
+			resp, err := llm.Chat(contract.WithCallPurpose(ctx, contract.CallPurposeGeneration), contract.ChatRequest{
 				Model: opts.Model, Messages: loop.messages, Tools: availableTools,
 				MaxTokens: opts.MaxTokens, Schema: opts.OutputSchema, Effort: opts.Effort,
 				ToolChoice: choice,

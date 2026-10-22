@@ -79,7 +79,7 @@ func NewSummaryCompactionPolicy(llm contract.LLM, opts SummaryCompactionOpts) *C
 			for _, message := range messages[start:cut] {
 				transcript.WriteString(fmt.Sprintf("[%s]: %s\n", message.Role, message.Content))
 			}
-			response, err := llm.Chat(ctx, contract.ChatRequest{
+			response, err := llm.Chat(contract.WithCallPurpose(ctx, contract.CallPurposeCompaction), contract.ChatRequest{
 				Model: opts.Model,
 				Messages: []contract.Message{
 					{Role: "system", Content: prompt},
