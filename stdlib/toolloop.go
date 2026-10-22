@@ -101,6 +101,10 @@ type ToolLoopOpts struct {
 	// their reasoning parameter and apply their own default.
 	// ProviderDefaultEffort：为 true 时空 Effort 不再补齐，provider 不下发推理档位，由供应方自定默认值。
 	ProviderDefaultEffort bool
+	// WaitBudget bounds how long each model call waits for model output;
+	// nil leaves calls bounded by the context alone.
+	// WaitBudget：每次模型调用等待模型输出的阶段预算，nil 表示只受 context 约束。
+	WaitBudget *contract.WaitBudget
 
 	ToolHooks []contract.ToolHook // v1.4: per-tool pre/post hooks
 	// ToolHooks：工具级前置/后置钩子——前置可改写或拦截调用，后置用于审计观测。
@@ -330,6 +334,7 @@ func NewToolLoopStep(llm contract.LLM, tools contract.ToolDispatcher, opts ToolL
 				MaxTokens:  opts.MaxTokens,
 				Schema:     opts.OutputSchema,
 				Effort:     effort,
+				WaitBudget: opts.WaitBudget,
 				ToolChoice: choice,
 			})
 			// 调用失败：把错误文本写入状态键 __error（供下游路由器/观测使用）并同时向引擎上抛。
@@ -467,10 +472,11 @@ func NewToolLoopStep(llm contract.LLM, tools contract.ToolDispatcher, opts ToolL
 		})
 		// 最后一问：请求里刻意不带 Tools 字段——从协议层面断掉继续调用工具的可能性。
 		resp, err := llm.Chat(ctx, contract.ChatRequest{
-			Model:     opts.Model,
-			Messages:  msgs,
-			MaxTokens: opts.MaxTokens,
-			Effort:    effort,
+			Model:      opts.Model,
+			Messages:   msgs,
+			MaxTokens:  opts.MaxTokens,
+			Effort:     effort,
+			WaitBudget: opts.WaitBudget,
 		})
 		// 收尾调用也失败时，同样记录 __error 并上抛。
 		if err != nil {

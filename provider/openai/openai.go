@@ -889,9 +889,17 @@ func (c *Client) Stream(ctx context.Context, req contract.ChatRequest) (stream <
 	}
 	probe.request(&oaiReq)
 
+	// A wait budget cancels this request's own context, never the caller's,
+	// so a budget running out stays distinguishable from caller cancellation.
+	// 中文：等待预算只取消本请求自己的 context，调用方取消与预算耗尽因此可区分。
+	reqCtx, cancelReq := context.WithCancelCause(ctx)
+	watch := newWaitWatch(req.WaitBudget, cancelReq)
+	release := func() { watch.stop(); cancelReq(nil) }
+
 	// 构造请求并绑定 ctx：取消 ctx 会中断后续的流读取，使读循环自然退出。
-	httpReq, err := http.NewRequestWithContext(probe.trace(ctx), "POST", c.baseURL+c.chatPath, bytes.NewReader(body))
+	httpReq, err := http.NewRequestWithContext(probe.trace(reqCtx), "POST", c.baseURL+c.chatPath, bytes.NewReader(body))
 	if err != nil {
+		release()
 		return nil, err // URL 构造失败
 	}
 	httpReq.Header.Set("Content-Type", "application/json") // 请求体仍是 JSON
@@ -903,12 +911,18 @@ func (c *Client) Stream(ctx context.Context, req contract.ChatRequest) (stream <
 	// 发起请求；成功后响应体是一条保持打开的 SSE 长连接。
 	resp, err := c.client.Do(httpReq)
 	if err != nil {
+		release()
+		if stage := stageTimeout(reqCtx); stage != nil && ctx.Err() == nil {
+			probe.end("stage_timeout", "", false, 0)
+			return nil, stage
+		}
 		probe.end(protocolTransportEnd(ctx), "", false, 0)
 		return nil, fmt.Errorf("openai: http: %w", err)
 	}
 
 	// 非 200 说明流根本没有建立：读出错误体、关闭连接，同步返回错误。
 	if resp.StatusCode != http.StatusOK {
+		release()
 		probe.end("http_error", "", false, 0)
 		defer resp.Body.Close()
 		errBody, _ := io.ReadAll(resp.Body) // 错误详情尽力而为，读失败也不影响主错误
@@ -920,6 +934,7 @@ func (c *Client) Stream(ctx context.Context, req contract.ChatRequest) (stream <
 
 	// 后台 goroutine 承担整个 SSE 解析生命周期；本函数随即返回通道。
 	go func() {
+		defer release()         // 停止等待预算计时并释放请求 context
 		defer resp.Body.Close() // 退出时释放连接
 		defer close(ch)         // 关闭通道即向消费方宣告流结束（含异常提前结束）
 		defer probe.emit()
@@ -1028,6 +1043,9 @@ func (c *Client) Stream(ctx context.Context, req contract.ChatRequest) (stream <
 			delta := chunk.Choices[0].Delta
 			probe.content(delta.Content)
 			reasoningDelta := reasoningText(delta.ReasoningContent, delta.Reasoning)
+			if delta.Content != "" || reasoningDelta != "" || len(delta.ToolCalls) > 0 {
+				watch.progress() // 只有模型输出算作进展
+			}
 			probe.reasoning(reasoningDelta)
 			if reasoningDelta != "" {
 				reasoning.WriteString(reasoningDelta)
@@ -1064,6 +1082,12 @@ func (c *Client) Stream(ctx context.Context, req contract.ChatRequest) (stream <
 		if ctx.Err() != nil {
 			probe.end("cancel", lastFinishReason, false, 0)
 			ch <- contract.StreamChunk{Err: &StreamCloseError{CloseKind: "cancel", Err: ctx.Err()}}
+			return
+		}
+		// 等待预算耗尽：本请求被自身预算取消，调用方 context 仍然有效。
+		if stage := stageTimeout(reqCtx); stage != nil {
+			probe.end("stage_timeout", lastFinishReason, false, 0)
+			ch <- contract.StreamChunk{Err: stage}
 			return
 		}
 		if err := scanner.Err(); err != nil {

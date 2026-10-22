@@ -173,6 +173,21 @@ type ChatRequest struct {
 	// provider default and leaves the serialized request unchanged.
 	// ToolChoice 只约束本次请求的工具调用方式；nil 表示沿用提供方默认，序列化结果与旧版完全一致。
 	ToolChoice *ToolChoice `json:"tool_choice,omitempty"`
+	// WaitBudget optionally bounds how long a streamed call waits for model
+	// output; nil waits as long as the caller's context allows.
+	// WaitBudget 可选地限制流式调用等待模型输出的时长；nil 表示只受调用方 context 约束。
+	WaitBudget *WaitBudget `json:"wait_budget,omitempty"`
+}
+
+// WaitBudget bounds the stages of a streamed model call; a zero field leaves
+// that stage unbounded. Only model output (text, reasoning or tool call
+// deltas) counts as progress: transport heartbeats and usage-only frames do
+// not. A provider that cannot observe a stage ignores its bound.
+// WaitBudget 按阶段限制流式调用：零值表示该阶段不限。只有模型输出（文本、推理、工具调用增量）
+// 算作进展，传输层心跳与仅含 usage 的帧不算。无法观测某阶段的 provider 忽略该限制。
+type WaitBudget struct {
+	FirstChunkMS int64 `json:"first_chunk_ms,omitempty"` // request start to the first model output
+	IdleMS       int64 `json:"idle_ms,omitempty"`        // longest gap between model outputs once streaming
 }
 
 // ToolChoiceMode selects how a model may use the tools offered in one request.
