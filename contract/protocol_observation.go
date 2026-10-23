@@ -28,6 +28,15 @@ type ProtocolObservation struct {
 	// Content counts response text carriers. Nil means not collected; zero
 	// counts in a present value mean the carrier was observed and empty.
 	Content *ProtocolContentObservation `json:"content,omitempty"`
+	// RequestBytes is the size of the request body this attempt built.
+	RequestBytes int `json:"request_bytes,omitempty"`
+	// HTTPStatus is the provider's response status, 200 included; zero means
+	// no response arrived.
+	HTTPStatus int `json:"http_status,omitempty"`
+	// ProviderRequestID is the provider's identifier for this request, taken
+	// only from an allowlisted response header (x-request-id, request-id) and
+	// only when short and plain; empty means none was observed.
+	ProviderRequestID string `json:"provider_request_id,omitempty"`
 }
 
 // ProtocolRequestOptions records enum values only. Empty means the option was
@@ -43,6 +52,13 @@ type ProtocolRequestOptions struct {
 	// Temperature reports that a sampling temperature was sent; its value is
 	// not recorded.
 	Temperature bool `json:"temperature,omitempty"`
+	// Model is the model name written to the wire; "other" when it is not a
+	// short plain name.
+	Model string `json:"model,omitempty"`
+	// Stream reports a streamed request.
+	Stream bool `json:"stream,omitempty"`
+	// OutputLimitValue is the limit sent in OutputLimit's field.
+	OutputLimitValue int `json:"output_limit_value,omitempty"`
 }
 
 // ProtocolContentObservation counts bytes and markers without retaining text.

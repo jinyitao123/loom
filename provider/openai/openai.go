@@ -737,7 +737,7 @@ func (c *Client) Chat(ctx context.Context, req contract.ChatRequest) (*contract.
 	if err != nil {
 		return nil, fmt.Errorf("openai: marshal request: %w", err)
 	}
-	probe.request(&oaiReq)
+	probe.request(&oaiReq, len(body))
 
 	// 构造 HTTP 请求并绑定 ctx：取消/超时由调用方 context 驱动，本包不额外设限。
 	httpReq, err := http.NewRequestWithContext(probe.trace(ctx), "POST", c.baseURL+c.chatPath, bytes.NewReader(body))
@@ -756,6 +756,7 @@ func (c *Client) Chat(ctx context.Context, req contract.ChatRequest) (*contract.
 		return nil, fmt.Errorf("openai: http: %w", err)
 	}
 	defer resp.Body.Close() // 无论成败都释放连接
+	probe.response(resp)
 
 	// 先整体读出响应体：非 200 时它就是错误详情，200 时再做 JSON 解析。
 	respBody, err := io.ReadAll(resp.Body)
@@ -913,7 +914,7 @@ func (c *Client) Stream(ctx context.Context, req contract.ChatRequest) (stream <
 	if err != nil {
 		return nil, fmt.Errorf("openai: marshal request: %w", err)
 	}
-	probe.request(&oaiReq)
+	probe.request(&oaiReq, len(body))
 
 	// A wait budget cancels this request's own context, never the caller's,
 	// so a budget running out stays distinguishable from caller cancellation.
@@ -945,6 +946,7 @@ func (c *Client) Stream(ctx context.Context, req contract.ChatRequest) (stream <
 		probe.end(protocolTransportEnd(ctx), "", false, 0)
 		return nil, fmt.Errorf("openai: http: %w", err)
 	}
+	probe.response(resp)
 
 	// 非 200 说明流根本没有建立：读出错误体、关闭连接，同步返回错误。
 	if resp.StatusCode != http.StatusOK {

@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"net/http"
 	"net/http/httptrace"
 	"sort"
 	"strings"
@@ -88,22 +89,25 @@ func newProtocolCapture(ctx context.Context, protocol string) *protocolCapture {
 	}}
 }
 
-// request records the tool digest and the enum values of the wire options
-// exactly as serialized; it never copies messages or tool definitions.
-func (p *protocolCapture) request(request *oaiRequest) {
+// request records the tool digest, the body size and the wire options exactly
+// as serialized; it never copies messages or tool definitions.
+func (p *protocolCapture) request(request *oaiRequest, bodyBytes int) {
 	if p == nil || request == nil {
 		return
 	}
+	p.value.RequestBytes = bodyBytes
 	options := &contract.ProtocolRequestOptions{
+		Model:           protocolPlain(request.Model),
+		Stream:          request.Stream,
 		ReasoningEffort: protocolEnum(request.ReasoningEffort, "none", "minimal", "low", "medium", "high", "xhigh", "max"),
 		ToolChoice:      wireToolChoiceMode(request.ToolChoice),
 		Temperature:     request.Temperature != nil,
 	}
 	switch {
 	case request.MaxCompletionTokens > 0:
-		options.OutputLimit = "max_completion_tokens"
+		options.OutputLimit, options.OutputLimitValue = "max_completion_tokens", request.MaxCompletionTokens
 	case request.MaxTokens > 0:
-		options.OutputLimit = "max_tokens"
+		options.OutputLimit, options.OutputLimitValue = "max_tokens", request.MaxTokens
 	}
 	if request.Thinking != nil {
 		options.Thinking = protocolEnum(request.Thinking.Type, "enabled", "disabled")
@@ -119,6 +123,39 @@ func (p *protocolCapture) request(request *oaiRequest) {
 	}
 	p.value.RequestToolCount = len(request.Tools)
 	p.value.RequestToolsSHA256 = observationSHA256(raw)
+}
+
+// response records the status of any response that arrived and the
+// provider's request identifier from an allowlisted header; no other header
+// and no body is read.
+func (p *protocolCapture) response(response *http.Response) {
+	if p == nil || response == nil {
+		return
+	}
+	p.value.HTTPStatus = response.StatusCode
+	for _, header := range []string{"X-Request-Id", "Request-Id"} {
+		if id := protocolPlain(response.Header.Get(header)); id != "" && id != "other" {
+			p.value.ProviderRequestID = id
+			return
+		}
+	}
+}
+
+// protocolPlain keeps a short identifier made of plain characters, maps any
+// other non-empty value to "other", and keeps empty as empty.
+func protocolPlain(value string) string {
+	if value == "" {
+		return ""
+	}
+	if len(value) > 128 {
+		return "other"
+	}
+	for _, r := range value {
+		if !(r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || strings.ContainsRune("._:/@+=-", r)) {
+			return "other"
+		}
+	}
+	return value
 }
 
 func protocolEnum(value string, known ...string) string {

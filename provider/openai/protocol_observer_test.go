@@ -305,3 +305,82 @@ func TestProtocolObserverChatUnsupportedCallsAreIncomplete(t *testing.T) {
 		})
 	}
 }
+
+// Every attempt reports the facts a provider ticket needs: the status of any
+// response (200 included), the provider's request ID from an allowlisted
+// header, and the wire options and body size actually sent. Nothing else
+// from the response headers or bodies is kept.
+func TestProtocolObserverRecordsCallFacts(t *testing.T) {
+	var sentBytes int
+	var sentMu sync.Mutex
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		sentMu.Lock()
+		sentBytes = len(body)
+		sentMu.Unlock()
+		w.Header().Set("Set-Cookie", "private-cookie=1")
+		switch r.URL.Query().Get("case") {
+		case "limited":
+			w.Header().Set("X-Request-Id", "req_limited-429")
+			w.WriteHeader(http.StatusTooManyRequests)
+			_, _ = io.WriteString(w, "private-rate-limit-body")
+		case "stream":
+			w.Header().Set("Request-Id", "stream:req/01")
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = io.WriteString(w, protocolFrame(map[string]any{"content": "ok"}, "stop")+"data: [DONE]\n\n")
+		case "unplain":
+			w.Header().Set("X-Request-Id", "has spaces and private text")
+			_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"ok"},"finish_reason":"stop"}]}`)
+		default:
+			w.Header().Set("X-Request-Id", "req_abc-123")
+			_, _ = io.WriteString(w, `{"choices":[{"message":{"content":""},"finish_reason":"length"}]}`)
+		}
+	}))
+	defer server.Close()
+	observe := func(t *testing.T, name string, stream bool) contract.ProtocolObservation {
+		t.Helper()
+		values := make(chan contract.ProtocolObservation, 2)
+		ctx := openai.WithProtocolObserver(context.Background(), openai.ProtocolObserverOptions{}, func(value contract.ProtocolObservation) { values <- value })
+		client := openai.New("test-key", openai.WithBaseURL(server.URL), openai.WithChatPath("/v1/chat/completions?case="+name))
+		request := chatReq(false, 0.7)
+		request.MaxTokens = 256
+		if stream {
+			chunks, err := client.Stream(ctx, request)
+			if err == nil {
+				collectStream(t, chunks)
+			}
+		} else {
+			_, _ = client.Chat(ctx, request)
+		}
+		value := <-values
+		encoded, _ := json.Marshal(value)
+		for _, forbidden := range []string{"private-cookie", "private-rate-limit-body", "private text", "test-key"} {
+			if strings.Contains(string(encoded), forbidden) {
+				t.Fatalf("observation leaked %q: %s", forbidden, encoded)
+			}
+		}
+		return value
+	}
+	ok := observe(t, "ok", false)
+	sentMu.Lock()
+	wantBytes := sentBytes
+	sentMu.Unlock()
+	if ok.HTTPStatus != http.StatusOK || ok.ProviderRequestID != "req_abc-123" || ok.RequestBytes != wantBytes || ok.FinishReason != "length" ||
+		ok.RequestOptions == nil || ok.RequestOptions.Model != "test-model" || ok.RequestOptions.Stream ||
+		ok.RequestOptions.OutputLimit != "max_tokens" || ok.RequestOptions.OutputLimitValue != 256 || ok.Content.ContentBytes != 0 {
+		t.Fatalf("200 length observation = %+v options=%+v", ok, ok.RequestOptions)
+	}
+	if limited := observe(t, "limited", false); limited.HTTPStatus != http.StatusTooManyRequests || limited.ProviderRequestID != "req_limited-429" || limited.End != "http_error" {
+		t.Fatalf("429 observation = %+v", limited)
+	}
+	if streamed := observe(t, "stream", true); streamed.HTTPStatus != http.StatusOK || streamed.ProviderRequestID != "stream:req/01" || !streamed.RequestOptions.Stream {
+		t.Fatalf("stream observation = %+v", streamed)
+	}
+	if unplain := observe(t, "unplain", false); unplain.HTTPStatus != http.StatusOK || unplain.ProviderRequestID != "" {
+		t.Fatalf("unplain request ID kept: %+v", unplain)
+	}
+	server.Close()
+	if gone := observe(t, "ok", false); gone.HTTPStatus != 0 || gone.ProviderRequestID != "" || gone.RequestBytes == 0 {
+		t.Fatalf("no-response observation = %+v", gone)
+	}
+}
