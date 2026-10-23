@@ -155,3 +155,47 @@ func TestWaitBudgetDefersToCallerCancellationAndLateHeaders(t *testing.T) {
 		t.Fatalf("late headers ended with %v", err)
 	}
 }
+
+// A total budget ends a call that keeps producing output past it, which no
+// stage budget would end, and leaves a call that finishes in time alone.
+func TestWaitBudgetTotalBoundsSteadyGeneration(t *testing.T) {
+	steady := func(w http.ResponseWriter, r *http.Request) {
+		startStream(w)
+		for i := range 10 {
+			select {
+			case <-r.Context().Done():
+				return
+			default:
+			}
+			writeContent(w, fmt.Sprint(i))
+			time.Sleep(50 * time.Millisecond)
+		}
+		_, _ = fmt.Fprint(w, "data: {\"id\":\"x\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n")
+		w.(http.Flusher).Flush()
+	}
+	client, gone := recordedStream(t, steady)
+	stream, err := client.Stream(context.Background(), contract.ChatRequest{Model: "m",
+		WaitBudget: &contract.WaitBudget{FirstChunkMS: 200, IdleMS: 200, TotalMS: 220}, Messages: []contract.Message{{Role: "user", Content: "go"}}})
+	if err == nil {
+		_, err = drain(t, stream)
+	}
+	var stage *StageTimeoutError
+	if !errors.As(err, &stage) || stage.Stage != "total" || stage.Budget != 220*time.Millisecond {
+		t.Fatalf("error = %v, want total stage timeout", err)
+	}
+	select {
+	case <-gone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the request was not cancelled upstream")
+	}
+
+	client, _ = recordedStream(t, steady)
+	stream, err = client.Stream(context.Background(), contract.ChatRequest{Model: "m",
+		WaitBudget: &contract.WaitBudget{TotalMS: 3000}, Messages: []contract.Message{{Role: "user", Content: "go"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if content, err := drain(t, stream); err != nil || content != "0123456789" {
+		t.Fatalf("call within its total budget ended with %q, %v", content, err)
+	}
+}

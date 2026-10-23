@@ -13,8 +13,8 @@ import (
 var ErrStageTimeout = errors.New("openai: wait budget exceeded")
 
 // StageTimeoutError reports a streamed call that exceeded a WaitBudget stage
-// before the caller's own context ended. Stage is "first_chunk" or
-// "stream_idle".
+// before the caller's own context ended. Stage is "first_chunk",
+// "stream_idle" or "total".
 // 中文：流式调用在调用方 context 结束前超出了某个等待阶段的预算。
 type StageTimeoutError struct {
 	Stage  string
@@ -29,11 +29,13 @@ func (e *StageTimeoutError) Unwrap() error { return ErrStageTimeout }
 
 // waitWatch cancels a streamed request when the next model output is late:
 // first by the first-chunk budget, then by the idle budget after each output.
+// A total budget bounds the whole call however the output arrives.
 type waitWatch struct {
 	mu     sync.Mutex
 	budget *contract.WaitBudget
 	cancel context.CancelCauseFunc
 	timer  *time.Timer
+	total  *time.Timer
 	done   bool
 }
 
@@ -41,6 +43,10 @@ func newWaitWatch(budget *contract.WaitBudget, cancel context.CancelCauseFunc) *
 	watch := &waitWatch{budget: budget, cancel: cancel}
 	if budget != nil && budget.FirstChunkMS > 0 {
 		watch.arm("first_chunk", time.Duration(budget.FirstChunkMS)*time.Millisecond)
+	}
+	if budget != nil && budget.TotalMS > 0 {
+		total := time.Duration(budget.TotalMS) * time.Millisecond
+		watch.total = time.AfterFunc(total, func() { cancel(&StageTimeoutError{Stage: "total", Budget: total}) })
 	}
 	return watch
 }
@@ -75,6 +81,9 @@ func (w *waitWatch) stop() {
 	w.done = true
 	if w.timer != nil {
 		w.timer.Stop()
+	}
+	if w.total != nil {
+		w.total.Stop()
 	}
 }
 

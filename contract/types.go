@@ -188,6 +188,7 @@ type ChatRequest struct {
 type WaitBudget struct {
 	FirstChunkMS int64 `json:"first_chunk_ms,omitempty"` // request start to the first model output
 	IdleMS       int64 `json:"idle_ms,omitempty"`        // longest gap between model outputs once streaming
+	TotalMS      int64 `json:"total_ms,omitempty"`       // request start to the end of the whole call
 }
 
 // ToolChoiceMode selects how a model may use the tools offered in one request.
