@@ -605,3 +605,62 @@ func TestControlledToolLoopResumedEntryRemainsImmutable(t *testing.T) {
 		t.Fatal("resumed Step mutated its journal entry snapshot")
 	}
 }
+
+// A controlled loop asked to leave an unset effort to the provider sends none.
+// A loop paused while an unset effort was still filled in as medium resumes
+// under its checkpointed policy and keeps sending medium until it finishes.
+func TestControlledToolLoopLeavesAnUnsetEffortToTheProvider(t *testing.T) {
+	efforts := func(m *parkScriptLLM, got *[]contract.EffortLevel) {
+		for i, script := range m.scripts {
+			script := script
+			m.scripts[i] = func(request contract.ChatRequest) contract.ChatResponse {
+				*got = append(*got, request.Effort)
+				return script(request)
+			}
+		}
+	}
+	finish := func(request contract.ChatRequest) contract.ChatResponse {
+		return contract.ChatResponse{Content: "finished", StopReason: "stop"}
+	}
+
+	m, d := toolRounds(t, 1, false)
+	m.scripts = append(m.scripts, finish)
+	var fresh []contract.EffortLevel
+	efforts(m, &fresh)
+	opts := stdlib.ToolLoopOpts{MaxIterations: 3, ProviderDefaultEffort: true, Control: &stdlib.ToolLoopControl{ID: "chat", InitialTotalRounds: 3}}
+	result, err := controlGraph(t.Name()+"-fresh", m, d, opts).Run(context.Background(), controlInput(), loom.NewMemStore())
+	if err != nil {
+		t.Fatal(err)
+	}
+	controlOutcome(t, result, stdlib.ToolLoopFinalResponse, 2)
+	if !reflect.DeepEqual(fresh, []contract.EffortLevel{"", ""}) {
+		t.Fatalf("fresh loop efforts = %q, want none sent", fresh)
+	}
+
+	m, d = toolRounds(t, 2, false)
+	m.scripts = append(m.scripts, finish)
+	var legacy []contract.EffortLevel
+	efforts(m, &legacy)
+	store := loom.NewMemStore()
+	// Before the fix the step filled the unset effort in as medium.
+	before := stdlib.ToolLoopOpts{MaxIterations: 2, Effort: contract.EffortMedium, Control: &stdlib.ToolLoopControl{ID: "chat", InitialTotalRounds: 2}}
+	result, err = controlGraph(t.Name()+"-legacy", m, d, before).Run(context.Background(), controlInput(), store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	controlOutcome(t, result, stdlib.ToolLoopTotalLimit, 2)
+	after := stdlib.ToolLoopOpts{MaxIterations: 2, ProviderDefaultEffort: true, Control: &stdlib.ToolLoopControl{ID: "chat", InitialTotalRounds: 2}}
+	graph := controlGraph(t.Name()+"-legacy", m, d, after)
+	input, err := stdlib.PrepareToolLoopResume(result.State, controlGrant(t, result, "grant-1", 3))
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err = graph.Resume(context.Background(), result.RunID, input, store)
+	if err != nil {
+		t.Fatalf("resume a loop paused before the fix: %v", err)
+	}
+	controlOutcome(t, result, stdlib.ToolLoopFinalResponse, 3)
+	if !reflect.DeepEqual(legacy, []contract.EffortLevel{contract.EffortMedium, contract.EffortMedium, contract.EffortMedium}) {
+		t.Fatalf("legacy loop efforts = %q, want medium throughout", legacy)
+	}
+}

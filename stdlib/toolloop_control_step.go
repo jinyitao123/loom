@@ -18,7 +18,7 @@ func newControlledToolLoopStep(llm contract.LLM, tools contract.ToolDispatcher, 
 	if opts.MaxToolRepeats <= 0 {
 		opts.MaxToolRepeats = 3
 	}
-	if opts.Effort == "" {
+	if opts.Effort == "" && !opts.ProviderDefaultEffort {
 		opts.Effort = contract.EffortMedium
 	}
 	return func(ctx context.Context, state loom.State) (loom.State, error) {
@@ -48,6 +48,16 @@ func newControlledToolLoopStep(llm contract.LLM, tools contract.ToolDispatcher, 
 		control, present, err := readToolLoopControl(state)
 		if err != nil {
 			return nil, err
+		}
+		effort := opts.Effort
+		if present && control.PolicySHA256 != policy && effort == "" {
+			// A loop checkpointed while an unset effort was still filled in as
+			// medium was hashed, and sent, as medium; it finishes that way.
+			legacy := opts
+			legacy.Effort = contract.EffortMedium
+			if legacyPolicy, err := toolLoopPolicyHash(legacy, state); err == nil && legacyPolicy == control.PolicySHA256 {
+				policy, effort = legacyPolicy, contract.EffortMedium
+			}
 		}
 		loop := controlledToolLoop{
 			control: control, pending: []toolLoopPendingCall{}, stagedResults: []contract.ToolResult{},
@@ -177,7 +187,7 @@ func newControlledToolLoopStep(llm contract.LLM, tools contract.ToolDispatcher, 
 			}
 			resp, err := llm.Chat(contract.WithCallPurpose(ctx, contract.CallPurposeGeneration), contract.ChatRequest{
 				Model: opts.Model, Messages: loop.messages, Tools: availableTools,
-				MaxTokens: opts.MaxTokens, Schema: opts.OutputSchema, Effort: opts.Effort,
+				MaxTokens: opts.MaxTokens, Schema: opts.OutputSchema, Effort: effort,
 				ToolChoice: choice,
 			})
 			if err != nil {
