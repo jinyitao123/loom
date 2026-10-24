@@ -177,7 +177,25 @@ type ChatRequest struct {
 	// output; nil waits as long as the caller's context allows.
 	// WaitBudget 可选地限制流式调用等待模型输出的时长；nil 表示只受调用方 context 约束。
 	WaitBudget *WaitBudget `json:"wait_budget,omitempty"`
+	// TopP is the nucleus sampling bound; nil leaves the provider default.
+	// TopP 为核采样上限；nil 表示沿用提供方默认，可与显式 0 区分。
+	TopP *float64 `json:"top_p,omitempty"`
+	// Thinking switches the provider's thinking mode for this request only;
+	// empty leaves it to the provider and the client's own configuration. A
+	// provider that cannot send the switch rejects a non-empty value.
+	// Thinking 只对本次请求切换提供方的思考模式；空值沿用提供方与客户端自身配置。
+	// 无法在协议上表达该开关的 provider 必须拒绝非空值，不得静默丢弃。
+	Thinking ThinkingMode `json:"thinking,omitempty"`
 }
+
+// ThinkingMode is an explicit per-request thinking switch.
+// ThinkingMode 是按请求显式指定的思考开关。
+type ThinkingMode string
+
+const (
+	ThinkingEnabled  ThinkingMode = "enabled"
+	ThinkingDisabled ThinkingMode = "disabled"
+)
 
 // WaitBudget bounds the stages of a streamed model call; a zero field leaves
 // that stage unbounded. Only model output (text, reasoning or tool call

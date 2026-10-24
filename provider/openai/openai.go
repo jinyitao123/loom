@@ -279,6 +279,7 @@ type oaiRequest struct {
 	// the client is built WithMaxCompletionTokens.
 	MaxCompletionTokens int                `json:"max_completion_tokens,omitempty"`
 	Temperature         *float64           `json:"temperature,omitempty"`     // 采样温度；用指针区分"未设置"与显式 0
+	TopP                *float64           `json:"top_p,omitempty"`           // 核采样上限；nil 时省略
 	Stream              bool               `json:"stream,omitempty"`          // true 时服务端切换为 SSE 流式返回
 	StreamOptions       *oaiStreamOptions  `json:"stream_options,omitempty"`  // 流式附加选项（仅流式请求携带）
 	ResponseFormat      *oaiResponseFormat `json:"response_format,omitempty"` // 结构化输出模式（json_object / json_schema）
@@ -602,7 +603,15 @@ func (c *Client) toolChoiceWire(req contract.ChatRequest) (any, error) {
 // 时零改动——thinking 键绝不出现、temperature 照常透传。
 // disableWithTools=true 且请求携带 tools 时强制 disabled（M1 fail-safe：不做
 // reasoning 连续性回传，直接关闭 thinking 以避免 DeepSeek 400/空响应）。
-func (c *Client) applyThinkingControl(oaiReq *oaiRequest) {
+//
+// A thinking mode the request asks for is sent as asked and changes nothing
+// else: the caller chose its sampling and effort together with it.
+// 中文：请求显式指定的 thinking 原样下发，不裁剪 temperature、不改写 effort。
+func (c *Client) applyThinkingControl(oaiReq *oaiRequest, requested contract.ThinkingMode) {
+	if requested != "" {
+		oaiReq.Thinking = &oaiThinking{Type: string(requested)}
+		return
+	}
 	if c.thinkingDefaultMode == "" {
 		return // 未 opt-in：OpenAI/OneAPI 等端点请求体零变化
 	}
@@ -629,6 +638,21 @@ func (c *Client) applyThinkingControl(oaiReq *oaiRequest) {
 	}
 }
 
+// effectiveThinking is the thinking type applyThinkingControl sends for req,
+// empty when no thinking key is sent.
+func (c *Client) effectiveThinking(req contract.ChatRequest) string {
+	if req.Thinking != "" {
+		return string(req.Thinking)
+	}
+	if c.thinkingDefaultMode == "" {
+		return ""
+	}
+	if c.thinkingDisableWithTools && len(req.Tools) > 0 {
+		return "disabled"
+	}
+	return c.thinkingDefaultMode
+}
+
 // applyOutputLimitField moves the output limit to max_completion_tokens for a
 // client declared WithMaxCompletionTokens.
 func (c *Client) applyOutputLimitField(oaiReq *oaiRequest) {
@@ -646,6 +670,16 @@ func (c *Client) applyOutputLimitField(oaiReq *oaiRequest) {
 // 中文：json_object 模式发送前校验 messages 中存在明确的 JSON 输出指令；
 // 缺失时返回 ErrJSONModeInstructionMissing，请求不得发出（server 零命中）。
 func (c *Client) validateReasoningReplay(req contract.ChatRequest) error {
+	switch req.Thinking {
+	case "", contract.ThinkingEnabled, contract.ThinkingDisabled:
+	default:
+		return fmt.Errorf("openai: unknown thinking mode %q", req.Thinking)
+	}
+	// A client that switches thinking off for tool requests cannot replay the
+	// reasoning a tool request would need; asking for it is refused, not undone.
+	if req.Thinking == contract.ThinkingEnabled && c.thinkingDisableWithTools && len(req.Tools) > 0 {
+		return errors.New("openai: thinking enabled on a tool request for a client that disables thinking with tools")
+	}
 	if !c.reasoningContentReplay {
 		return nil
 	}
@@ -659,7 +693,7 @@ func (c *Client) validateReasoningReplay(req contract.ChatRequest) error {
 			}
 		}
 	}
-	if c.thinkingDefaultMode == "enabled" && !(c.thinkingDisableWithTools && len(req.Tools) > 0) && req.ToolChoice != nil &&
+	if c.effectiveThinking(req) == "enabled" && req.ToolChoice != nil &&
 		(req.ToolChoice.Mode == contract.ToolChoiceRequired || req.ToolChoice.Mode == contract.ToolChoiceTool) {
 		return fmt.Errorf("%w: forced tool choice with enabled thinking", ErrToolChoiceUnsupported)
 	}
@@ -707,11 +741,12 @@ func (c *Client) Chat(ctx context.Context, req contract.ChatRequest) (*contract.
 		ToolChoice:      toolChoice,                    // nil 时字段缺省
 		MaxTokens:       req.MaxTokens,                 // 输出 token 上限；0 表示交给服务端默认
 		Temperature:     req.Temperature,               // 指针：nil 表示"用服务端默认"，可与显式 0 区分
+		TopP:            req.TopP,                      // 指针：nil 表示服务端默认
 		ReasoningEffort: string(req.Effort),            // ChatRequest.Effort 透传为 reasoning_effort（推理模型专用）
 	}
-	// thinking capability：provider 显式 opt-in 才携带 thinking 键；
-	// thinking enabled 时裁剪 temperature（见 applyThinkingControl）。
-	c.applyThinkingControl(&oaiReq)
+	// thinking capability：请求显式指定时原样携带；否则 provider 显式 opt-in 才携带
+	// thinking 键，thinking enabled 时裁剪 temperature（见 applyThinkingControl）。
+	c.applyThinkingControl(&oaiReq, req.Thinking)
 	c.applyOutputLimitField(&oaiReq)
 	// 结构化输出：调用方提供了 JSON Schema 时设置 response_format。
 	if req.Schema != nil {
@@ -884,12 +919,13 @@ func (c *Client) Stream(ctx context.Context, req contract.ChatRequest) (stream <
 		ToolChoice:      toolChoice,                            // nil 时字段缺省
 		MaxTokens:       req.MaxTokens,                         // 输出上限
 		Temperature:     req.Temperature,                       // nil 表示服务端默认
+		TopP:            req.TopP,                              // nil 表示服务端默认
 		ReasoningEffort: string(req.Effort),                    // Effort 透传（omitempty，未设置不发送）
 		Stream:          true,                                  // 开启 SSE 流式返回
 		StreamOptions:   &oaiStreamOptions{IncludeUsage: true}, // 请求服务端在流末尾附带 usage 统计块
 	}
-	// thinking capability：与 Chat 完全一致的 opt-in 语义与 temperature 裁剪。
-	c.applyThinkingControl(&oaiReq)
+	// thinking capability：与 Chat 完全一致的语义与 temperature 裁剪。
+	c.applyThinkingControl(&oaiReq, req.Thinking)
 	c.applyOutputLimitField(&oaiReq)
 	// 结构化输出设置：与 Chat 相同的两种模式。
 	if req.Schema != nil {

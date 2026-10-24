@@ -52,6 +52,8 @@ type ProtocolRequestOptions struct {
 	// Temperature reports that a sampling temperature was sent; its value is
 	// not recorded.
 	Temperature bool `json:"temperature,omitempty"`
+	// TopP reports that a top_p bound was sent; its value is not recorded.
+	TopP bool `json:"top_p,omitempty"`
 	// Model is the model name written to the wire; "other" when it is not a
 	// short plain name.
 	Model string `json:"model,omitempty"`

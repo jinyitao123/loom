@@ -105,6 +105,12 @@ type ToolLoopOpts struct {
 	// nil leaves calls bounded by the context alone.
 	// WaitBudget：每次模型调用等待模型输出的阶段预算，nil 表示只受 context 约束。
 	WaitBudget *contract.WaitBudget
+	// Temperature, TopP and Thinking are sent on every model call of the loop;
+	// nil and empty leave the provider default.
+	// Temperature/TopP/Thinking：随本循环每次模型调用下发；nil 与空值沿用提供方默认。
+	Temperature *float64
+	TopP        *float64
+	Thinking    contract.ThinkingMode
 
 	ToolHooks []contract.ToolHook // v1.4: per-tool pre/post hooks
 	// ToolHooks：工具级前置/后置钩子——前置可改写或拦截调用，后置用于审计观测。
@@ -328,14 +334,15 @@ func NewToolLoopStep(llm contract.LLM, tools contract.ToolDispatcher, opts ToolL
 
 			// 本轮询问 LLM：携带完整历史、工具清单与输出约束。
 			resp, err := llm.Chat(contract.WithCallPurpose(ctx, contract.CallPurposeGeneration), contract.ChatRequest{
-				Model:      opts.Model,
-				Messages:   msgs,
-				Tools:      availableTools,
-				MaxTokens:  opts.MaxTokens,
-				Schema:     opts.OutputSchema,
-				Effort:     effort,
-				WaitBudget: opts.WaitBudget,
-				ToolChoice: choice,
+				Model:       opts.Model,
+				Messages:    msgs,
+				Tools:       availableTools,
+				MaxTokens:   opts.MaxTokens,
+				Schema:      opts.OutputSchema,
+				Effort:      effort,
+				WaitBudget:  opts.WaitBudget,
+				ToolChoice:  choice,
+				Temperature: opts.Temperature, TopP: opts.TopP, Thinking: opts.Thinking,
 			})
 			// 调用失败：把错误文本写入状态键 __error（供下游路由器/观测使用）并同时向引擎上抛。
 			if err != nil {
@@ -472,11 +479,12 @@ func NewToolLoopStep(llm contract.LLM, tools contract.ToolDispatcher, opts ToolL
 		})
 		// 最后一问：请求里刻意不带 Tools 字段——从协议层面断掉继续调用工具的可能性。
 		resp, err := llm.Chat(contract.WithCallPurpose(ctx, contract.CallPurposeWrapUp), contract.ChatRequest{
-			Model:      opts.Model,
-			Messages:   msgs,
-			MaxTokens:  opts.MaxTokens,
-			Effort:     effort,
-			WaitBudget: opts.WaitBudget,
+			Model:       opts.Model,
+			Messages:    msgs,
+			MaxTokens:   opts.MaxTokens,
+			Effort:      effort,
+			WaitBudget:  opts.WaitBudget,
+			Temperature: opts.Temperature, TopP: opts.TopP, Thinking: opts.Thinking,
 		})
 		// 收尾调用也失败时，同样记录 __error 并上抛。
 		if err != nil {

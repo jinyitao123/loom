@@ -365,7 +365,28 @@ func validControlHash(value string) bool {
 	return err == nil && len(raw) == sha256.Size
 }
 
+// toolLoopPolicyHash identifies the request policy a controlled loop resumes
+// under. Sampling and thinking settings join the identity only when one is
+// set, so loops without them keep their existing hashes.
 func toolLoopPolicyHash(opts ToolLoopOpts, state loom.State) (string, error) {
+	base, err := toolLoopBasePolicyHash(opts, state)
+	if err != nil || (opts.Temperature == nil && opts.TopP == nil && opts.Thinking == "") {
+		return base, err
+	}
+	data, err := json.Marshal(struct {
+		Base        string
+		Temperature *float64
+		TopP        *float64
+		Thinking    contract.ThinkingMode
+	}{base, opts.Temperature, opts.TopP, opts.Thinking})
+	if err != nil {
+		return "", fmt.Errorf("loom/toolloop: invalid control policy: %w", err)
+	}
+	digest := sha256.Sum256(data)
+	return hex.EncodeToString(digest[:]), nil
+}
+
+func toolLoopBasePolicyHash(opts ToolLoopOpts, state loom.State) (string, error) {
 	system := opts.SystemPrompt
 	if value, ok := state["__system_prompt"].(string); ok && value != "" {
 		system = value

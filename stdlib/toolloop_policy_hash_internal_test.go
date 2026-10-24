@@ -93,3 +93,40 @@ func TestProviderDefaultEffortHashesApartAndKeepsExistingHashes(t *testing.T) {
 		t.Fatal("ProviderDefaultEffort changed the hash of an explicit effort")
 	}
 }
+
+// Sampling and thinking settings are part of a controlled loop's identity once
+// set, and leave the identity of loops without them unchanged.
+func TestSamplingAndThinkingHashApartOnlyWhenSet(t *testing.T) {
+	base := ToolLoopOpts{Model: "m", SystemPrompt: "s", MaxIterations: 4, Effort: contract.EffortLow,
+		Control: &ToolLoopControl{ID: "loop", InitialTotalRounds: 8}}
+	hash := func(opts ToolLoopOpts) string {
+		t.Helper()
+		value, err := toolLoopPolicyHash(opts, loom.State{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return value
+	}
+	legacy, err := toolLoopBasePolicyHash(base, loom.State{})
+	if err != nil || hash(base) != legacy {
+		t.Fatalf("a loop without sampling settings changed identity: %v", err)
+	}
+	zero, half := 0.0, 0.5
+	seen := map[string]string{"none": hash(base)}
+	for name, change := range map[string]func(*ToolLoopOpts){
+		"temperature 0":   func(o *ToolLoopOpts) { o.Temperature = &zero },
+		"temperature 0.5": func(o *ToolLoopOpts) { o.Temperature = &half },
+		"top_p 0.5":       func(o *ToolLoopOpts) { o.TopP = &half },
+		"thinking":        func(o *ToolLoopOpts) { o.Thinking = contract.ThinkingDisabled },
+	} {
+		opts := base
+		change(&opts)
+		value := hash(opts)
+		for other, otherValue := range seen {
+			if otherValue == value {
+				t.Fatalf("%s hashed like %s", name, other)
+			}
+		}
+		seen[name] = value
+	}
+}

@@ -102,6 +102,7 @@ func (p *protocolCapture) request(request *oaiRequest, bodyBytes int) {
 		ReasoningEffort: protocolEnum(request.ReasoningEffort, "none", "minimal", "low", "medium", "high", "xhigh", "max"),
 		ToolChoice:      wireToolChoiceMode(request.ToolChoice),
 		Temperature:     request.Temperature != nil,
+		TopP:            request.TopP != nil,
 	}
 	switch {
 	case request.MaxCompletionTokens > 0:

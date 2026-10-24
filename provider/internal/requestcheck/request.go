@@ -14,6 +14,14 @@ func Validate(req contract.ChatRequest) error {
 	if req.Effort != "" && req.Effort != contract.EffortLow && req.Effort != contract.EffortMedium && req.Effort != contract.EffortHigh {
 		return fmt.Errorf("invalid reasoning effort %q", req.Effort)
 	}
+	// Native adapters have no wire field for these; dropping them would claim
+	// a setting that never reached the provider.
+	if req.Thinking != "" {
+		return fmt.Errorf("per-request thinking is not supported by this adapter")
+	}
+	if req.TopP != nil {
+		return fmt.Errorf("top_p is not supported by this adapter")
+	}
 	if req.Schema != nil {
 		var schema map[string]json.RawMessage
 		if json.Unmarshal(*req.Schema, &schema) != nil || schema == nil {
